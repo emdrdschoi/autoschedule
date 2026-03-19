@@ -564,7 +564,7 @@ RULE5_LABELS = ["제한없음", "3일", "4일", "5일", "6일"]
 for ni in range(len(doctors)):
     if ni not in st.session_state.rules:
         st.session_state.rules[ni] = {
-            "rule0": 1, "rule1": 1, "rule2": 1,
+            "rule0": 2, "rule1": 1, "rule2": 1,
             "rule3": 1, "rule4": 1, "rule5": 5,
             "rule6": 0, "rule7": 1, "rule8": 3,
         }
