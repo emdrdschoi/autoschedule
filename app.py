@@ -6,7 +6,7 @@ import calendar
 import json
 
 st.set_page_config(
-    page_title="의료 스케줄 최적화",
+    page_title="스케줄 최적화",
     page_icon="🏥",
     layout="wide",
     initial_sidebar_state="expanded"
