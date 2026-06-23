@@ -312,11 +312,11 @@ with st.sidebar:
                 })
                 st.session_state.rules[n] = {
                     "rule_max_shifts_per_day": 1, "rule_no_day_after_eve": 1,
-                    "rule_no_3eve_consec": 1, "rule_no_3eve_in_4days": 1, "rule_max_consec_days": 5,
-                    "rule_max_shifts_per_week": 0, "rule_no_3day_consec": 1,
+                    "rule_no_3eve_consec": 0, "rule_no_3eve_in_4days": 0, "rule_max_consec_days": 6,
+                    "rule_max_shifts_per_week": 0, "rule_no_3day_consec": 0,
                     "rule_n_block_max": 1,  # N 뭉치 최대 길이 (1=NN불가)
-                    "rule_n_rest": 1,       # N뭉치 후 의무 휴무일
-                    "rule_n_gap": 0,        # N뭉치 후 다음 N까지 최소 간격
+                    "rule_n_rest": 2,       # N뭉치 후 의무 휴무일
+                    "rule_n_gap": 3,        # N뭉치 후 다음 N까지 총 간격
                 }
                 st.session_state.shift_adj[n] = 0
                 st.rerun()
@@ -600,19 +600,19 @@ with tab2:
 # ─────────────────────────────────────────────────────────────────────────────
 RULE0_OPTIONS = [1, 2, 3, 4, 5]
 RULE0_LABELS = ["1회만", "2회 허용", "3회 허용", "공휴일만 2회", "공휴일만 3회"]
-RULE5_OPTIONS = [0, 3, 4, 5, 6]
-RULE5_LABELS = ["제한없음", "3일", "4일", "5일", "6일"]
+RULE5_OPTIONS = [0, 3, 4, 5, 6, 7]
+RULE5_LABELS = ["제한없음", "3일", "4일", "5일", "6일", "7일"]
 
 # Ensure defaults exist for each doctor
 for ni in range(len(doctors)):
     if ni not in st.session_state.rules:
         st.session_state.rules[ni] = {
-            "rule_max_shifts_per_day": 2, "rule_no_day_after_eve": 1,
-            "rule_no_3eve_consec": 1, "rule_no_3eve_in_4days": 1, "rule_max_consec_days": 5,
-            "rule_max_shifts_per_week": 0, "rule_no_3day_consec": 1,
+            "rule_max_shifts_per_day": 1, "rule_no_day_after_eve": 1,
+            "rule_no_3eve_consec": 0, "rule_no_3eve_in_4days": 0, "rule_max_consec_days": 6,
+            "rule_max_shifts_per_week": 0, "rule_no_3day_consec": 0,
             "rule_n_block_max": 1,
-            "rule_n_rest": 1,
-            "rule_n_gap": 0,
+            "rule_n_rest": 2,
+            "rule_n_gap": 3,
         }
     if ni not in st.session_state.shift_adj:
         st.session_state.shift_adj[ni] = 0

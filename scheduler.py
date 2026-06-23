@@ -256,7 +256,7 @@ def build_and_solve(params: dict[str, Any]):
                 model.AddBoolOr([shifts[(n,d,1)].Not(), shifts[(n,d+1,1)], shifts[(n,d+2,1)].Not(), shifts[(n,d+3,1)].Not()])
 
         # rule5: max consecutive working days
-        if r5 in (3,4,5,6):
+        if r5 in (3,4,5,6,7):
             for d in range(num_days - (r5 - 1)):
                 model.Add(sum(shifts[(n,d+p,s)] for p in range(r5) for s in all_shifts) < r5)
 
