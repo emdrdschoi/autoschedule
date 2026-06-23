@@ -364,32 +364,32 @@ with st.sidebar:
     # ── [기존] JSON 대신 [변경] Excel 저장/불러오기 로직 ──
     col_save, col_load = st.columns(2)
     # ── [저장 로직: 보기 편한 Excel] ──────────────────────────────────────────
+    # 1. [저장] Excel 내보내기
     if col_save.button("💾 설정 Excel 저장", use_container_width=True):
-        # 1. 표시용 데이터 준비
-        start_date = st.session_state.start_date # 시작 날짜 변수
+        start_date = st.session_state.start_date
         doctor_names = [d['name'] for d in st.session_state.doctors]
         num_days = len(st.session_state.duty_requests)
         date_list = [(start_date + timedelta(days=i)).strftime('%Y-%m-%d') for i in range(num_days)]
         
-        # 2. 데이터프레임 생성
-        df_doctors = pd.DataFrame(st.session_state.doctors)
-        
+        # 데이터 생성
         df_rules = pd.DataFrame.from_dict(st.session_state.rules, orient='index')
-        df_rules.index = doctor_names  # 인덱스를 의사 이름으로
+        df_rules.index = doctor_names
         
         df_duty = pd.DataFrame.from_dict(st.session_state.duty_requests, orient='index', columns=['D', 'E', 'N'])
-        df_duty.index = date_list      # 인덱스를 날짜로
+        df_duty.index = date_list
         
-        df_shift = pd.DataFrame(st.session_state.shift_requests, index=date_list, columns=doctor_names)
-        df_shift = df_shift.fillna('') # 빈칸은 공백으로
+        # shift_requests는 딕셔너리 {(의사idx, 날짜idx): 값} 형태이므로 표로 변환
+        shift_grid = pd.DataFrame('', index=date_list, columns=doctor_names)
+        for (doc_idx, day_idx), val in st.session_state.shift_requests.items():
+            if day_idx < len(date_list) and doc_idx < len(doctor_names):
+                shift_grid.iloc[day_idx, doc_idx] = val
 
-        # 3. 엑셀 저장
         towrite = BytesIO()
         with pd.ExcelWriter(towrite, engine='openpyxl') as writer:
-            df_doctors.to_excel(writer, sheet_name='Doctors', index=False)
+            pd.DataFrame(st.session_state.doctors).to_excel(writer, sheet_name='Doctors', index=False)
             df_rules.to_excel(writer, sheet_name='Rules')
             df_duty.to_excel(writer, sheet_name='DutyRequests')
-            df_shift.to_excel(writer, sheet_name='ShiftRequests')
+            shift_grid.to_excel(writer, sheet_name='ShiftRequests')
         
         st.download_button(
             label="📥 설정 파일 다운로드 (.xlsx)",
@@ -399,7 +399,7 @@ with st.sidebar:
             use_container_width=True
         )
 
-    # ── [불러오기 로직: 정확한 위치 기반 매핑] ─────────────────────────────────
+    # 2. [불러오기] Excel 가져오기
     uploaded_file = col_load.file_uploader("설정 Excel 불러오기", type="xlsx")
     if uploaded_file is not None and col_load.button("📤 불러오기 적용"):
         try:
@@ -409,18 +409,25 @@ with st.sidebar:
             df_duty = pd.read_excel(uploaded_file, sheet_name='DutyRequests', index_col=0)
             df_shift = pd.read_excel(uploaded_file, sheet_name='ShiftRequests', index_col=0)
             
-            # [핵심] 위치 기반으로 세션 상태 갱신
+            # 1) 의사 정보 적용
             st.session_state.doctors = df_doctors.to_dict('records')
             
-            # 순서(index) 보존하며 딕셔너리 재구성
+            # 2) Rules/Duty는 행 순서(Index) 기반으로 딕셔너리 재구성
             st.session_state.rules = {i: df_rules.iloc[i].to_dict() for i in range(len(df_rules))}
             st.session_state.duty_requests = {i: df_duty.iloc[i].tolist() for i in range(len(df_duty))}
-            st.session_state.shift_requests = df_shift.fillna('').values.tolist()
             
-            st.success("✅ 설정이 엑셀에서 성공적으로 적용되었습니다!")
+            # 3) ShiftRequests 딕셔너리 재구성 (중요: NaN을 빈 문자열로)
+            new_shift = {}
+            for d_idx in range(len(df_shift)):
+                for doc_idx in range(len(df_shift.columns)):
+                    val = df_shift.iloc[d_idx, doc_idx]
+                    new_shift[(doc_idx, d_idx)] = str(val) if pd.notna(val) else ''
+            st.session_state.shift_requests = new_shift
+            
+            st.success("✅ 설정 적용 완료!")
             st.rerun()
         except Exception as e:
-            st.error(f"불러오기 실패 (형식이 올바른지 확인하세요): {e}")
+            st.error(f"불러오기 실패: {e}")
 
 
     st.divider()
