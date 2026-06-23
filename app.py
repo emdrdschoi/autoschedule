@@ -363,65 +363,64 @@ with st.sidebar:
 
     # ── [기존] JSON 대신 [변경] Excel 저장/불러오기 로직 ──
     col_save, col_load = st.columns(2)
-    
-    # 1. 저장 로직 (Excel)
+    # ── [저장 로직: 보기 편한 Excel] ──────────────────────────────────────────
     if col_save.button("💾 설정 Excel 저장", use_container_width=True):
-        # 의사 이름 리스트 가져오기
+        # 1. 표시용 데이터 준비
+        start_date = st.session_state.start_date # 시작 날짜 변수
         doctor_names = [d['name'] for d in st.session_state.doctors]
+        num_days = len(st.session_state.duty_requests)
+        date_list = [(start_date + timedelta(days=i)).strftime('%Y-%m-%d') for i in range(num_days)]
         
-        # 규칙 데이터프레임 생성 (인덱스 대신 의사 이름을 컬럼으로 사용)
+        # 2. 데이터프레임 생성
+        df_doctors = pd.DataFrame(st.session_state.doctors)
+        
         df_rules = pd.DataFrame.from_dict(st.session_state.rules, orient='index')
-        df_rules.index = doctor_names  # 인덱스를 이름으로 변경
+        df_rules.index = doctor_names  # 인덱스를 의사 이름으로
         
-        # 요청 데이터프레임 생성 (날짜 헤더 추가)
         df_duty = pd.DataFrame.from_dict(st.session_state.duty_requests, orient='index', columns=['D', 'E', 'N'])
-        # 날짜를 인덱스 대신 'Date_0', 'Date_1'... 형태로 매핑하거나, 
-        # 원하시면 날짜 계산식으로 구체적인 날짜를 넣을 수도 있습니다.
-        df_duty.index = [f"Day_{i}" for i in range(len(df_duty))] 
+        df_duty.index = date_list      # 인덱스를 날짜로
+        
+        df_shift = pd.DataFrame(st.session_state.shift_requests, index=date_list, columns=doctor_names)
+        df_shift = df_shift.fillna('') # 빈칸은 공백으로
 
+        # 3. 엑셀 저장
         towrite = BytesIO()
         with pd.ExcelWriter(towrite, engine='openpyxl') as writer:
-            pd.DataFrame(st.session_state.doctors).to_excel(writer, sheet_name='Doctors', index=False)
+            df_doctors.to_excel(writer, sheet_name='Doctors', index=False)
             df_rules.to_excel(writer, sheet_name='Rules')
             df_duty.to_excel(writer, sheet_name='DutyRequests')
+            df_shift.to_excel(writer, sheet_name='ShiftRequests')
         
         st.download_button(
-            label="📥 Excel 파일 다운로드",
+            label="📥 설정 파일 다운로드 (.xlsx)",
             data=towrite.getvalue(),
             file_name="scheduler_config.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             use_container_width=True
         )
 
-    # 2. 불러오기 로직 (Excel)
+    # ── [불러오기 로직: 정확한 위치 기반 매핑] ─────────────────────────────────
     uploaded_file = col_load.file_uploader("설정 Excel 불러오기", type="xlsx")
     if uploaded_file is not None and col_load.button("📤 불러오기 적용"):
         try:
-            # 데이터만 읽기
+            # 데이터 읽기
             df_doctors = pd.read_excel(uploaded_file, sheet_name='Doctors')
             df_rules = pd.read_excel(uploaded_file, sheet_name='Rules', index_col=0)
             df_duty = pd.read_excel(uploaded_file, sheet_name='DutyRequests', index_col=0)
+            df_shift = pd.read_excel(uploaded_file, sheet_name='ShiftRequests', index_col=0)
             
-            # [핵심] 순서(index) 기반으로 복원
-            # 이름/날짜가 무엇이든 상관없이 데이터 순서대로 리스트화
+            # [핵심] 위치 기반으로 세션 상태 갱신
             st.session_state.doctors = df_doctors.to_dict('records')
             
-            # Rules: 이름/날짜 무시하고 0, 1, 2 순서대로 다시 매핑
-            rules_dict = {}
-            for i in range(len(df_rules)):
-                rules_dict[i] = df_rules.iloc[i].to_dict()
-            st.session_state.rules = rules_dict
+            # 순서(index) 보존하며 딕셔너리 재구성
+            st.session_state.rules = {i: df_rules.iloc[i].to_dict() for i in range(len(df_rules))}
+            st.session_state.duty_requests = {i: df_duty.iloc[i].tolist() for i in range(len(df_duty))}
+            st.session_state.shift_requests = df_shift.fillna('').values.tolist()
             
-            # Duty: 날짜 무시하고 0, 1, 2 순서대로 다시 매핑
-            duty_dict = {}
-            for i in range(len(df_duty)):
-                duty_dict[i] = df_duty.iloc[i].tolist()
-            st.session_state.duty_requests = duty_dict
-            
-            st.success("✅ Excel 설정 적용 완료!")
+            st.success("✅ 설정이 엑셀에서 성공적으로 적용되었습니다!")
             st.rerun()
         except Exception as e:
-            st.error(f"불러오기 오류: {e}")
+            st.error(f"불러오기 실패 (형식이 올바른지 확인하세요): {e}")
 
 
     st.divider()
