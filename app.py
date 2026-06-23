@@ -248,6 +248,20 @@ _init_state()
 DAY_LABELS = ['일','월','화','수','목','금','토']
 SHIFT_COLORS = {'d': 'cell-d', 'e': 'cell-e', 'n': 'cell-n', '': 'cell-off'}
 
+# 기본 규칙값 — 단일 상수로 관리 (사이드바 추가 / tab3 fallback 공통 사용)
+DEFAULT_RULES = {
+    "rule_max_shifts_per_day":  1,
+    "rule_n_block_max":         1,
+    "rule_n_rest":              2,
+    "rule_n_gap":               3,
+    "rule_no_day_after_eve":    1,
+    "rule_no_3eve_consec":      0,
+    "rule_no_3eve_in_4days":    0,
+    "rule_max_consec_days":     6,
+    "rule_max_shifts_per_week": 0,
+    "rule_no_3day_consec":      0,
+}
+
 def get_day_label(start: date, idx: int) -> str:
     d = start + timedelta(days=idx)
     return DAY_LABELS[d.weekday() % 7 if d.weekday() != 6 else 0]
@@ -310,14 +324,7 @@ with st.sidebar:
                     "name": name,
                     "shift_adj": 0,
                 })
-                st.session_state.rules[n] = {
-                    "rule_max_shifts_per_day": 1, "rule_no_day_after_eve": 1,
-                    "rule_no_3eve_consec": 0, "rule_no_3eve_in_4days": 0, "rule_max_consec_days": 6,
-                    "rule_max_shifts_per_week": 0, "rule_no_3day_consec": 0,
-                    "rule_n_block_max": 1,  # N 뭉치 최대 길이 (1=NN불가)
-                    "rule_n_rest": 2,       # N뭉치 후 의무 휴무일
-                    "rule_n_gap": 3,        # N뭉치 후 다음 N까지 총 간격
-                }
+                st.session_state.rules[n] = DEFAULT_RULES.copy()
                 st.session_state.shift_adj[n] = 0
                 st.rerun()
 
@@ -606,14 +613,7 @@ RULE5_LABELS = ["제한없음", "3일", "4일", "5일", "6일", "7일"]
 # Ensure defaults exist for each doctor
 for ni in range(len(doctors)):
     if ni not in st.session_state.rules:
-        st.session_state.rules[ni] = {
-            "rule_max_shifts_per_day": 1, "rule_no_day_after_eve": 1,
-            "rule_no_3eve_consec": 0, "rule_no_3eve_in_4days": 0, "rule_max_consec_days": 6,
-            "rule_max_shifts_per_week": 5, "rule_no_3day_consec": 0,
-            "rule_n_block_max": 1,
-            "rule_n_rest": 1,
-            "rule_n_gap": 3,
-        }
+        st.session_state.rules[ni] = DEFAULT_RULES.copy()
     if ni not in st.session_state.shift_adj:
         st.session_state.shift_adj[ni] = 0
 
