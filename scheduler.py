@@ -158,13 +158,13 @@ def build_and_solve(params: dict[str, Any]):
 
     # Per-doctor rules
     for n in all_doctors:
-        r0        = get_rule(n, "rule0", 1)
-        r2        = get_rule(n, "rule2", 1)
-        r3        = get_rule(n, "rule3", 1)
-        r4        = get_rule(n, "rule4", 1)
-        r5        = get_rule(n, "rule5", 5)
-        r6        = get_rule(n, "rule6", 0)
-        r7        = get_rule(n, "rule7", 1)
+        r0        = get_rule(n, "rule_max_shifts_per_day", 1)
+        r2        = get_rule(n, "rule_no_day_after_eve", 1)
+        r3        = get_rule(n, "rule_no_3eve_consec", 1)
+        r4        = get_rule(n, "rule_no_3eve_in_4days", 1)
+        r5        = get_rule(n, "rule_max_consec_days", 5)
+        r6        = get_rule(n, "rule_max_shifts_per_week", 0)
+        r7        = get_rule(n, "rule_no_3day_consec", 1)
         n_max     = get_rule(n, "rule_n_block_max", 1)   # Max N block length (1/2/3)
         n_rest    = get_rule(n, "rule_n_rest", 1)         # Mandatory rest days after N-block
         n_gap     = get_rule(n, "rule_n_gap", 0)          # Min gap before next N after N-block
@@ -192,62 +192,52 @@ def build_and_solve(params: dict[str, Any]):
                 model.Add(sum(shifts[(n,d+p,s)] for p in range(2) for s in all_shifts) < 4)
 
         # ── N-block constraints ───────────────────────────────────────────────
-        # 1) Max N block length
-        #    n_max=1 → NN 금지,  n_max=2 → NNN 금지,  n_max=3 → NNNN 금지
-        block_len = n_max + 1  # forbidden run length
+        # n_max  : N 연속 최대 허용 길이 (1=NN불가, 2=NNN불가, 3=NNNN불가)
+        # n_rest : N뭉치 끝난 후 완전 Off 의무일 수  (앞쪽)
+        # n_gap  : N뭉치 끝난 날로부터 총 몇 일 후 N이 가능한지 (n_gap >= n_rest)
+        #
+        # 예) n_max=2, n_rest=2, n_gap=4
+        #   N N | O O | D/E가능 D/E가능 | N가능
+        #       <--n_rest=2--> <-추가2일->
+        #       <--------n_gap=4-------->
+
+        # 1) Max N block length: (n_max+1)개 연속 N 금지
+        block_len = n_max + 1
         if block_len <= num_days:
             for d in range(num_days - block_len + 1):
                 model.Add(
                     sum(shifts[(n, d+i, 2)] for i in range(block_len)) < block_len
                 )
 
-        # 2) After an N-block ends (i.e. day d is N but day d+block is not N,
-        #    meaning the block just finished), enforce:
-        #      a) n_rest days of full rest (no D/E/N)  -- already guaranteed by
-        #         the base rule "N→next day only N or off", but n_rest > block means
-        #         extra rest beyond the block itself.
-        #      b) n_gap days before next N is allowed.
-        #
-        # Strategy: for every possible N-block end position, add the post-block
-        # constraints.  We identify "block of exactly length L ending at day e"
-        # by requiring shifts[n,e-L+1..e] all N AND shifts[n,e+1] not N (or e==num_days-1).
-        # To keep the model tractable we use a simpler sufficient condition:
-        # For each day d that is N, look back to find the block it belongs to and
-        # enforce rest/gap after the block end.
-        #
-        # Practical encoding: for each day d and block length L (1..n_max),
-        # "block of length L starting at d": N[d..d+L-1] all true, N[d-1]=False (or d=0), N[d+L]=False (or end).
-        # Then forbid work during rest period and N during gap period.
-
+        # 2) 뭉치 길이 blen(1..n_max) 로 시작하는 N-block 에 대해 rest/gap 적용
+        #    block_vars = N[d..d+blen-1] 이 모두 True 일 때:
+        #      - end+1 .. end+n_rest  → 완전 Off (D/E/N 전부 금지)
+        #      - end+n_rest+1 .. end+n_gap → N만 금지 (D/E는 허용)
         for blen in range(1, n_max + 1):
             for d in range(num_days):
-                end = d + blen - 1  # last night of the block
+                end = d + blen - 1
                 if end >= num_days:
                     break
 
-                # Conditions that identify this exact block
                 block_vars = [shifts[(n, d+i, 2)] for i in range(blen)]
 
-                # rest days after block end
-                if n_rest > 0:
-                    for r in range(1, n_rest + 1):
-                        dd = end + r
-                        if dd < num_days:
-                            for s in all_shifts:
-                                # If all block_vars are True → shifts[dd,s] must be 0
-                                model.AddBoolOr(
-                                    [v.Not() for v in block_vars] + [shifts[(n, dd, s)].Not()]
-                                )
-
-                # gap before next N (n_gap days after rest period ends)
-                if n_gap > 0:
-                    gap_start = end + n_rest + 1
-                    for g in range(n_gap):
-                        dd = gap_start + g
-                        if dd < num_days:
+                # 완전 휴무 구간: end+1 ~ end+n_rest
+                for r in range(1, n_rest + 1):
+                    dd = end + r
+                    if dd < num_days:
+                        for s in all_shifts:
                             model.AddBoolOr(
-                                [v.Not() for v in block_vars] + [shifts[(n, dd, 2)].Not()]
+                                [v.Not() for v in block_vars] + [shifts[(n, dd, s)].Not()]
                             )
+
+                # N만 금지 구간: end+n_rest+1 ~ end+n_gap
+                # (n_gap이 n_rest보다 클 때만 의미 있음)
+                for g in range(n_rest + 1, n_gap + 1):
+                    dd = end + g
+                    if dd < num_days:
+                        model.AddBoolOr(
+                            [v.Not() for v in block_vars] + [shifts[(n, dd, 2)].Not()]
+                        )
 
         # rule2: no D after E
         if r2:

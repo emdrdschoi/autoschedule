@@ -311,9 +311,9 @@ with st.sidebar:
                     "shift_adj": 0,
                 })
                 st.session_state.rules[n] = {
-                    "rule0": 1, "rule2": 1,
-                    "rule3": 1, "rule4": 1, "rule5": 5,
-                    "rule6": 0, "rule7": 1,
+                    "rule_max_shifts_per_day": 1, "rule_no_day_after_eve": 1,
+                    "rule_no_3eve_consec": 1, "rule_no_3eve_in_4days": 1, "rule_max_consec_days": 5,
+                    "rule_max_shifts_per_week": 0, "rule_no_3day_consec": 1,
                     "rule_n_block_max": 1,  # N 뭉치 최대 길이 (1=NN불가)
                     "rule_n_rest": 1,       # N뭉치 후 의무 휴무일
                     "rule_n_gap": 0,        # N뭉치 후 다음 N까지 최소 간격
@@ -364,24 +364,33 @@ with st.sidebar:
     st.divider()
     st.markdown('<div class="section-label">💾 설정 저장/불러오기</div>', unsafe_allow_html=True)
 
-    # ── [기존] JSON 대신 [변경] Excel 저장/불러오기 로직 ──
+    # UI 순서와 동일한 rule 컬럼 정의 (저장/불러오기 공통)
+    RULE_COL_ORDER = [
+        "rule_max_shifts_per_day", "rule_n_block_max", "rule_n_rest", "rule_n_gap",
+        "rule_no_day_after_eve", "rule_no_3eve_consec", "rule_no_3eve_in_4days", "rule_max_consec_days", "rule_max_shifts_per_week", "rule_no_3day_consec",
+    ]
+
     col_save, col_load = st.columns(2)
-    # ── [저장 로직: 보기 편한 Excel] ──────────────────────────────────────────
+
     # 1. [저장] Excel 내보내기
     if col_save.button("💾 설정 Excel 저장", use_container_width=True):
         start_date = st.session_state.start_date
         doctor_names = [d['name'] for d in st.session_state.doctors]
         num_days = len(st.session_state.duty_requests)
         date_list = [(start_date + timedelta(days=i)).strftime('%Y-%m-%d') for i in range(num_days)]
-        
-        # 데이터 생성
-        df_rules = pd.DataFrame.from_dict(st.session_state.rules, orient='index')
-        df_rules.index = doctor_names
-        
+
+        # Rules: RULE_COL_ORDER 순서로 컬럼 정렬
+        rules_rows = []
+        for ni in range(len(doctor_names)):
+            r = st.session_state.rules.get(ni, {})
+            row = {key: r.get(key, '') for key in RULE_COL_ORDER}
+            rules_rows.append(row)
+        df_rules = pd.DataFrame(rules_rows, index=doctor_names)
+        df_rules.index.name = 'Name'
+
         df_duty = pd.DataFrame.from_dict(st.session_state.duty_requests, orient='index', columns=['D', 'E', 'N'])
         df_duty.index = date_list
-        
-        # shift_requests는 딕셔너리 {(의사idx, 날짜idx): 값} 형태이므로 표로 변환
+
         shift_grid = pd.DataFrame('', index=date_list, columns=doctor_names)
         for (doc_idx, day_idx), val in st.session_state.shift_requests.items():
             if day_idx < len(date_list) and doc_idx < len(doctor_names):
@@ -393,7 +402,7 @@ with st.sidebar:
             df_rules.to_excel(writer, sheet_name='Rules')
             df_duty.to_excel(writer, sheet_name='DutyRequests')
             shift_grid.to_excel(writer, sheet_name='ShiftRequests')
-        
+
         st.download_button(
             label="📥 설정 파일 다운로드 (.xlsx)",
             data=towrite.getvalue(),
@@ -406,27 +415,39 @@ with st.sidebar:
     uploaded_file = col_load.file_uploader("설정 Excel 불러오기", type="xlsx")
     if uploaded_file is not None and col_load.button("📤 불러오기 적용"):
         try:
-            # 데이터 읽기
             df_doctors = pd.read_excel(uploaded_file, sheet_name='Doctors')
             df_rules = pd.read_excel(uploaded_file, sheet_name='Rules', index_col=0)
             df_duty = pd.read_excel(uploaded_file, sheet_name='DutyRequests', index_col=0)
             df_shift = pd.read_excel(uploaded_file, sheet_name='ShiftRequests', index_col=0)
-            
-            # 1) 의사 정보 적용
+
+            # 1) 의사 정보
             st.session_state.doctors = df_doctors.to_dict('records')
-            
-            # 2) Rules/Duty는 행 순서(Index) 기반으로 딕셔너리 재구성
-            st.session_state.rules = {i: df_rules.iloc[i].to_dict() for i in range(len(df_rules))}
+
+            # 2) Rules: 컬럼명 기반으로 읽어서 RULE_COL_ORDER 키로 매핑
+            new_rules = {}
+            for i in range(len(df_rules)):
+                row = df_rules.iloc[i]
+                new_rules[i] = {key: int(row[key]) if key in row.index and pd.notna(row[key]) else 0
+                                for key in RULE_COL_ORDER}
+            st.session_state.rules = new_rules
+
+            # shift_adj 도 Doctors 시트에서 복원
+            st.session_state.shift_adj = {
+                i: int(df_doctors.iloc[i].get('shift_adj', 0))
+                for i in range(len(df_doctors))
+            }
+
+            # 3) DutyRequests
             st.session_state.duty_requests = {i: df_duty.iloc[i].tolist() for i in range(len(df_duty))}
-            
-            # 3) ShiftRequests 딕셔너리 재구성 (중요: NaN을 빈 문자열로)
+
+            # 4) ShiftRequests
             new_shift = {}
             for d_idx in range(len(df_shift)):
                 for doc_idx in range(len(df_shift.columns)):
                     val = df_shift.iloc[d_idx, doc_idx]
                     new_shift[(doc_idx, d_idx)] = str(val) if pd.notna(val) else ''
             st.session_state.shift_requests = new_shift
-            
+
             st.success("✅ 설정 적용 완료!")
             st.rerun()
         except Exception as e:
@@ -586,9 +607,9 @@ RULE5_LABELS = ["제한없음", "3일", "4일", "5일", "6일"]
 for ni in range(len(doctors)):
     if ni not in st.session_state.rules:
         st.session_state.rules[ni] = {
-            "rule0": 2, "rule2": 1,
-            "rule3": 1, "rule4": 1, "rule5": 5,
-            "rule6": 0, "rule7": 1,
+            "rule_max_shifts_per_day": 2, "rule_no_day_after_eve": 1,
+            "rule_no_3eve_consec": 1, "rule_no_3eve_in_4days": 1, "rule_max_consec_days": 5,
+            "rule_max_shifts_per_week": 0, "rule_no_3day_consec": 1,
             "rule_n_block_max": 1,
             "rule_n_rest": 1,
             "rule_n_gap": 0,
@@ -603,16 +624,16 @@ with tab3:
     doc_names = [d["name"] for d in doctors]
 
     RULE_DEFS = [
-        ("rule0",           "하루 근무 횟수",                     "select", RULE0_OPTIONS, RULE0_LABELS),
-        ("rule_n_block_max","N 뭉치 최대 길이 (1=NN불가, 2=NNN불가)", "select", [1,2,3], ["1개(NN불가)","2개(NNN불가)","3개(NNNN불가)"]),
-        ("rule_n_rest",     "N뭉치 후 의무 휴무일 수",              "number", 0, 5),
-        ("rule_n_gap",      "N뭉치 후 다음 N까지 최소 간격 (휴무 이후 추가)", "number", 0, 10),
-        ("rule2",           "Evening 후 Day 금지",                 "bool",   None, None),
-        ("rule3",           "Evening 3연속 금지",                  "bool",   None, None),
-        ("rule4",           "4일내 Evening 3회 금지",              "bool",   None, None),
-        ("rule5",           "연속 근무 금지 (일수)",                "select", RULE5_OPTIONS, RULE5_LABELS),
-        ("rule6",           "7일내 최대 근무수 (0=무제한)",         "number", 0, 7),
-        ("rule7",           "Day 3연속 금지",                      "bool",   None, None),
+        ("rule_max_shifts_per_day",           "하루 근무 횟수",                          "select", RULE0_OPTIONS, RULE0_LABELS),
+        ("rule_n_block_max","N 뭉치 최대 길이",                        "select", [1,2,3], ["1개(NN불가)","2개(NNN불가)","3개(NNNN불가)"]),
+        ("rule_n_rest",     "N뭉치 후 완전 Off 의무일 (앞쪽)",          "number", 0, 5),
+        ("rule_n_gap",      "N뭉치 후 다음 N까지 총 간격 (≥완전Off일)", "number", 0, 10),
+        ("rule_no_day_after_eve",           "Evening 후 Day 금지",                     "bool",   None, None),
+        ("rule_no_3eve_consec",           "Evening 3연속 금지",                      "bool",   None, None),
+        ("rule_no_3eve_in_4days",           "4일내 Evening 3회 금지",                  "bool",   None, None),
+        ("rule_max_consec_days",           "연속 근무 금지 (일수)",                    "select", RULE5_OPTIONS, RULE5_LABELS),
+        ("rule_max_shifts_per_week",           "7일내 최대 근무수 (0=무제한)",             "number", 0, 7),
+        ("rule_no_3day_consec",           "Day 3연속 금지",                          "bool",   None, None),
     ]
 
     # Header row (rule name + doctor columns)
@@ -735,10 +756,37 @@ with tab4:
 
         export_df = pd.DataFrame(export_rows).set_index('Name')
 
+        # Rules export — RULE_DEFS 순서대로 컬럼 정렬
+        RULE_COL_ORDER = [
+            "rule_max_shifts_per_day", "rule_n_block_max", "rule_n_rest", "rule_n_gap",
+            "rule_no_day_after_eve", "rule_no_3eve_consec", "rule_no_3eve_in_4days", "rule_max_consec_days", "rule_max_shifts_per_week", "rule_no_3day_consec",
+        ]
+        RULE_COL_LABELS = {
+            "rule_max_shifts_per_day":            "하루 근무 횟수",
+            "rule_n_block_max": "N뭉치 최대 길이",
+            "rule_n_rest":      "N뭉치 후 완전Off 의무일",
+            "rule_n_gap":       "N뭉치 후 다음N까지 총 간격",
+            "rule_no_day_after_eve":            "Evening 후 Day 금지",
+            "rule_no_3eve_consec":            "Evening 3연속 금지",
+            "rule_no_3eve_in_4days":            "4일내 Evening 3회 금지",
+            "rule_max_consec_days":            "연속 근무 금지(일수)",
+            "rule_max_shifts_per_week":            "7일내 최대 근무수",
+            "rule_no_3day_consec":            "Day 3연속 금지",
+        }
+        rules_rows = []
+        for ni, doc in enumerate(doctors):
+            r = st.session_state.rules.get(ni, {})
+            row = {"이름": doc["name"], "shift_adj": st.session_state.shift_adj.get(ni, 0)}
+            for key in RULE_COL_ORDER:
+                row[RULE_COL_LABELS[key]] = r.get(key, "")
+            rules_rows.append(row)
+        rules_df = pd.DataFrame(rules_rows)
+
         towrite = BytesIO()
         with pd.ExcelWriter(towrite, engine='openpyxl') as writer:
             export_df.to_excel(writer, sheet_name='Schedule')
             summary.to_excel(writer, sheet_name='Summary', index=False)
+            rules_df.to_excel(writer, sheet_name='Rules', index=False)
             if metrics and sol_idx < len(metrics):
                 pd.DataFrame([metrics[sol_idx]]).to_excel(writer, sheet_name='Metrics', index=False)
         towrite.seek(0)
