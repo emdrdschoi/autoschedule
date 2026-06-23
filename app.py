@@ -361,55 +361,49 @@ with st.sidebar:
     st.divider()
     st.markdown('<div class="section-label">💾 설정 저장/불러오기</div>', unsafe_allow_html=True)
 
+    # ── [기존] JSON 대신 [변경] Excel 저장/불러오기 로직 ──
     col_save, col_load = st.columns(2)
-    if col_save.button("💾 설정 저장", use_container_width=True, key="btn_save_config"):
-        config_data = {
-            "doctors": st.session_state.doctors,
-            "day_types": st.session_state.day_types,
-            "duty_requests": st.session_state.duty_requests,
-            "shift_requests": {f"{k[0]},{k[1]}": v for k, v in st.session_state.shift_requests.items()},
-            "rules": st.session_state.rules,
-            "shift_adj": st.session_state.shift_adj,
-            "num_days": st.session_state.num_days,
-            "start_date": str(st.session_state.start_date),
-        }
-        import json
-        config_json = json.dumps(config_data, ensure_ascii=False, indent=2)
+
+    # 1. 저장 로직 (Excel)
+    if col_save.button("💾 설정 Excel 저장", use_container_width=True):
+        # 데이터프레임 변환
+        df_doctors = pd.DataFrame(st.session_state.doctors)
+        df_rules = pd.DataFrame.from_dict(st.session_state.rules, orient='index')
+        df_duty = pd.DataFrame.from_dict(st.session_state.duty_requests, orient='index', columns=['D', 'E', 'N'])
+        
+        towrite = BytesIO()
+        with pd.ExcelWriter(towrite, engine='openpyxl') as writer:
+            df_doctors.to_excel(writer, sheet_name='Doctors', index=False)
+            df_rules.to_excel(writer, sheet_name='Rules') # index가 의사 번호
+            df_duty.to_excel(writer, sheet_name='DutyRequests') # index가 날짜 번호
+        
         st.download_button(
-            label="📥 다운로드",
-            data=config_json,
-            file_name="scheduler_config.json",
-            mime="application/json",
-            use_container_width=True,
-            key="download_config"
+            label="📥 Excel 파일 다운로드",
+            data=towrite.getvalue(),
+            file_name="scheduler_config.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            use_container_width=True
         )
 
-    uploaded_file = col_load.file_uploader("설정 파일 불러오기", type="json", key="upload_config")
-    if uploaded_file is not None and col_load.button("📤 불러오기 적용", key="btn_load_config"):
+    # 2. 불러오기 로직 (Excel)
+    uploaded_file = col_load.file_uploader("설정 Excel 불러오기", type="xlsx")
+    if uploaded_file is not None and col_load.button("📤 불러오기 적용"):
         try:
-            import json
-            config_data = json.loads(uploaded_file.getvalue().decode('utf-8'))
-
-            # Load configuration
-            st.session_state.doctors = config_data.get("doctors", [])
-            st.session_state.day_types = config_data.get("day_types", {})
-            st.session_state.duty_requests = config_data.get("duty_requests", {})
-            st.session_state.shift_requests = config_data.get("shift_requests", {})
-            st.session_state.rules = config_data.get("rules", {})
-            st.session_state.shift_adj = config_data.get("shift_adj", {})
-            st.session_state.num_days = config_data.get("num_days", 28)
-            st.session_state.start_date = date.fromisoformat(config_data.get("start_date", str(date.today().replace(day=1))))
-
-            # Clear solutions when loading new config
-            st.session_state.solutions = []
-            st.session_state.summaries = []
-            st.session_state.sol_idx = 0
-            st.session_state.solved = False
-
-            st.success("✅ 설정을 성공적으로 불러왔습니다!")
+            # 각 시트별로 데이터 읽기
+            df_doctors = pd.read_excel(uploaded_file, sheet_name='Doctors')
+            df_rules = pd.read_excel(uploaded_file, sheet_name='Rules', index_col=0)
+            df_duty = pd.read_excel(uploaded_file, sheet_name='DutyRequests', index_col=0)
+            
+            # 세션 상태 업데이트 (데이터 타입 변환)
+            st.session_state.doctors = df_doctors.to_dict('records')
+            st.session_state.rules = {int(k): v for k, v in df_rules.to_dict('index').items()}
+            st.session_state.duty_requests = {int(k): row.tolist() for k, row in df_duty.iterrows()}
+            
+            st.success("✅ Excel 설정 적용 완료!")
             st.rerun()
         except Exception as e:
-            st.error(f"설정 파일 불러오기 실패: {e}")
+            st.error(f"불러오기 오류: {e}")
+
 
     st.divider()
 
