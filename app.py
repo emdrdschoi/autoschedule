@@ -311,9 +311,12 @@ with st.sidebar:
                     "shift_adj": 0,
                 })
                 st.session_state.rules[n] = {
-                    "rule0": 1, "rule1": 1, "rule2": 1,
+                    "rule0": 1, "rule2": 1,
                     "rule3": 1, "rule4": 1, "rule5": 5,
-                    "rule6": 0, "rule7": 1, "rule8": 2,
+                    "rule6": 0, "rule7": 1,
+                    "rule_n_block_max": 1,  # N 뭉치 최대 길이 (1=NN불가)
+                    "rule_n_rest": 1,       # N뭉치 후 의무 휴무일
+                    "rule_n_gap": 0,        # N뭉치 후 다음 N까지 최소 간격
                 }
                 st.session_state.shift_adj[n] = 0
                 st.rerun()
@@ -583,9 +586,12 @@ RULE5_LABELS = ["제한없음", "3일", "4일", "5일", "6일"]
 for ni in range(len(doctors)):
     if ni not in st.session_state.rules:
         st.session_state.rules[ni] = {
-            "rule0": 2, "rule1": 1, "rule2": 1,
+            "rule0": 2, "rule2": 1,
             "rule3": 1, "rule4": 1, "rule5": 5,
-            "rule6": 0, "rule7": 1, "rule8": 3,
+            "rule6": 0, "rule7": 1,
+            "rule_n_block_max": 1,
+            "rule_n_rest": 1,
+            "rule_n_gap": 0,
         }
     if ni not in st.session_state.shift_adj:
         st.session_state.shift_adj[ni] = 0
@@ -597,15 +603,16 @@ with tab3:
     doc_names = [d["name"] for d in doctors]
 
     RULE_DEFS = [
-        ("rule0", "하루 근무 횟수", "select", RULE0_OPTIONS, RULE0_LABELS),
-        ("rule1", "야간 후 휴무일 수(0이면 2N가능)", "number", 0, 3),
-        ("rule2", "Evening 후 Day 금지", "bool", None, None),
-        ("rule3", "Evening 3연속 금지", "bool", None, None),
-        ("rule4", "4일내 Evening 3회 금지", "bool", None, None),
-        ("rule5", "연속 근무 금지 (일수)", "select", RULE5_OPTIONS, RULE5_LABELS),
-        ("rule6", "7일내 최대 근무수 (0=무제한)", "number", 0, 7),
-        ("rule7", "Day 3연속 금지", "bool", None, None),
-        ("rule8", "야간 후 n일간 N금지 (0=제한없음)", "number", 0, 5),
+        ("rule0",           "하루 근무 횟수",                     "select", RULE0_OPTIONS, RULE0_LABELS),
+        ("rule_n_block_max","N 뭉치 최대 길이 (1=NN불가, 2=NNN불가)", "select", [1,2,3], ["1개(NN불가)","2개(NNN불가)","3개(NNNN불가)"]),
+        ("rule_n_rest",     "N뭉치 후 의무 휴무일 수",              "number", 0, 5),
+        ("rule_n_gap",      "N뭉치 후 다음 N까지 최소 간격 (휴무 이후 추가)", "number", 0, 10),
+        ("rule2",           "Evening 후 Day 금지",                 "bool",   None, None),
+        ("rule3",           "Evening 3연속 금지",                  "bool",   None, None),
+        ("rule4",           "4일내 Evening 3회 금지",              "bool",   None, None),
+        ("rule5",           "연속 근무 금지 (일수)",                "select", RULE5_OPTIONS, RULE5_LABELS),
+        ("rule6",           "7일내 최대 근무수 (0=무제한)",         "number", 0, 7),
+        ("rule7",           "Day 3연속 금지",                      "bool",   None, None),
     ]
 
     # Header row (rule name + doctor columns)

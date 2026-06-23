@@ -120,10 +120,9 @@ def build_and_solve(params: dict[str, Any]):
     # holidays (list of day indices)
     holiday = [d for d, t in day_types.items() if t in ('토', '일', '공')]
 
-    # rules[n][i]
-    RULE_KEYS = ["rule0","rule1","rule2","rule3","rule4","rule5","rule6","rule7","rule8"]
-    def get_rule(n, i):
-        return int(rules_raw.get(n, {}).get(RULE_KEYS[i], 0))
+    # rules[n][key]
+    def get_rule(n, key, default=0):
+        return int(rules_raw.get(n, {}).get(key, default))
 
     # ── Averages ─────────────────────────────────────────────────────────────
     total_duty = sum(sum(duty_requests[d]) for d in all_days)
@@ -159,15 +158,16 @@ def build_and_solve(params: dict[str, Any]):
 
     # Per-doctor rules
     for n in all_doctors:
-        r0 = get_rule(n, 0)
-        r1 = get_rule(n, 1)
-        r2 = get_rule(n, 2)
-        r3 = get_rule(n, 3)
-        r4 = get_rule(n, 4)
-        r5 = get_rule(n, 5)
-        r6 = get_rule(n, 6)
-        r7 = get_rule(n, 7)
-        r8 = get_rule(n, 8)
+        r0        = get_rule(n, "rule0", 1)
+        r2        = get_rule(n, "rule2", 1)
+        r3        = get_rule(n, "rule3", 1)
+        r4        = get_rule(n, "rule4", 1)
+        r5        = get_rule(n, "rule5", 5)
+        r6        = get_rule(n, "rule6", 0)
+        r7        = get_rule(n, "rule7", 1)
+        n_max     = get_rule(n, "rule_n_block_max", 1)   # Max N block length (1/2/3)
+        n_rest    = get_rule(n, "rule_n_rest", 1)         # Mandatory rest days after N-block
+        n_gap     = get_rule(n, "rule_n_gap", 0)          # Min gap before next N after N-block
 
         # rule0: max shifts per day
         if r0 == 1:
@@ -191,44 +191,63 @@ def build_and_solve(params: dict[str, Any]):
             for d in range(num_days - 1):
                 model.Add(sum(shifts[(n,d+p,s)] for p in range(2) for s in all_shifts) < 4)
 
-        # rule1: days off after night
-        if r1 == 0:
-            for d in range(num_days - 2):
-                model.AddBoolOr([shifts[(n,d,2)].Not(), shifts[(n,d+1,2)].Not(), shifts[(n,d+2,2)].Not()])
-            for d in range(num_days - 3):
-                for s in all_shifts:
-                    model.AddBoolOr([shifts[(n,d,2)].Not(), shifts[(n,d+1,2)], shifts[(n,d+2,s)].Not()])
-            if r8 == 3:
-                for d in range(num_days - 4):
-                    for s in all_shifts:
-                        model.AddBoolOr([shifts[(n,d,2)].Not(), shifts[(n,d+1,2)], shifts[(n,d+3,s)].Not()])
-        else:
-            for d in all_days:
-                for i in range(r1):
-                    if d + i + 1 < num_days:
-                        for s in all_shifts:
-                            model.Add(shifts[(n,d+i+1,s)] == 0).OnlyEnforceIf(shifts[(n,d,2)])
+        # ── N-block constraints ───────────────────────────────────────────────
+        # 1) Max N block length
+        #    n_max=1 → NN 금지,  n_max=2 → NNN 금지,  n_max=3 → NNNN 금지
+        block_len = n_max + 1  # forbidden run length
+        if block_len <= num_days:
+            for d in range(num_days - block_len + 1):
+                model.Add(
+                    sum(shifts[(n, d+i, 2)] for i in range(block_len)) < block_len
+                )
 
-        # rule8: ban night within n days after night
-        if r8 > 0:
-            rb = r8
-            if r1 == 0:
-                # For r1==0, ban N for rb days after NN (consecutive nights)
-                for d in all_days:
-                    if d + 1 < num_days:
-                        start = d + 2
-                        for i in range(rb):
-                            dd = start + i
-                            if dd < num_days:
-                                model.Add(shifts[(n,dd,2)] == 0).OnlyEnforceIf(shifts[(n,d,2)]).OnlyEnforceIf(shifts[(n,d+1,2)])
-            else:
-                # For r1 > 0, ban N for rb days after any N
-                for d in all_days:
-                    start = d + 1
-                    for i in range(rb):
-                        dd = start + i
+        # 2) After an N-block ends (i.e. day d is N but day d+block is not N,
+        #    meaning the block just finished), enforce:
+        #      a) n_rest days of full rest (no D/E/N)  -- already guaranteed by
+        #         the base rule "N→next day only N or off", but n_rest > block means
+        #         extra rest beyond the block itself.
+        #      b) n_gap days before next N is allowed.
+        #
+        # Strategy: for every possible N-block end position, add the post-block
+        # constraints.  We identify "block of exactly length L ending at day e"
+        # by requiring shifts[n,e-L+1..e] all N AND shifts[n,e+1] not N (or e==num_days-1).
+        # To keep the model tractable we use a simpler sufficient condition:
+        # For each day d that is N, look back to find the block it belongs to and
+        # enforce rest/gap after the block end.
+        #
+        # Practical encoding: for each day d and block length L (1..n_max),
+        # "block of length L starting at d": N[d..d+L-1] all true, N[d-1]=False (or d=0), N[d+L]=False (or end).
+        # Then forbid work during rest period and N during gap period.
+
+        for blen in range(1, n_max + 1):
+            for d in range(num_days):
+                end = d + blen - 1  # last night of the block
+                if end >= num_days:
+                    break
+
+                # Conditions that identify this exact block
+                block_vars = [shifts[(n, d+i, 2)] for i in range(blen)]
+
+                # rest days after block end
+                if n_rest > 0:
+                    for r in range(1, n_rest + 1):
+                        dd = end + r
                         if dd < num_days:
-                            model.Add(shifts[(n,dd,2)] == 0).OnlyEnforceIf(shifts[(n,d,2)])
+                            for s in all_shifts:
+                                # If all block_vars are True → shifts[dd,s] must be 0
+                                model.AddBoolOr(
+                                    [v.Not() for v in block_vars] + [shifts[(n, dd, s)].Not()]
+                                )
+
+                # gap before next N (n_gap days after rest period ends)
+                if n_gap > 0:
+                    gap_start = end + n_rest + 1
+                    for g in range(n_gap):
+                        dd = gap_start + g
+                        if dd < num_days:
+                            model.AddBoolOr(
+                                [v.Not() for v in block_vars] + [shifts[(n, dd, 2)].Not()]
+                            )
 
         # rule2: no D after E
         if r2:
