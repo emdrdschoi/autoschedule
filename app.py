@@ -363,19 +363,27 @@ with st.sidebar:
 
     # ── [기존] JSON 대신 [변경] Excel 저장/불러오기 로직 ──
     col_save, col_load = st.columns(2)
-
+    
     # 1. 저장 로직 (Excel)
     if col_save.button("💾 설정 Excel 저장", use_container_width=True):
-        # 데이터프레임 변환
-        df_doctors = pd.DataFrame(st.session_state.doctors)
-        df_rules = pd.DataFrame.from_dict(st.session_state.rules, orient='index')
-        df_duty = pd.DataFrame.from_dict(st.session_state.duty_requests, orient='index', columns=['D', 'E', 'N'])
+        # 의사 이름 리스트 가져오기
+        doctor_names = [d['name'] for d in st.session_state.doctors]
         
+        # 규칙 데이터프레임 생성 (인덱스 대신 의사 이름을 컬럼으로 사용)
+        df_rules = pd.DataFrame.from_dict(st.session_state.rules, orient='index')
+        df_rules.index = doctor_names  # 인덱스를 이름으로 변경
+        
+        # 요청 데이터프레임 생성 (날짜 헤더 추가)
+        df_duty = pd.DataFrame.from_dict(st.session_state.duty_requests, orient='index', columns=['D', 'E', 'N'])
+        # 날짜를 인덱스 대신 'Date_0', 'Date_1'... 형태로 매핑하거나, 
+        # 원하시면 날짜 계산식으로 구체적인 날짜를 넣을 수도 있습니다.
+        df_duty.index = [f"Day_{i}" for i in range(len(df_duty))] 
+
         towrite = BytesIO()
         with pd.ExcelWriter(towrite, engine='openpyxl') as writer:
-            df_doctors.to_excel(writer, sheet_name='Doctors', index=False)
-            df_rules.to_excel(writer, sheet_name='Rules') # index가 의사 번호
-            df_duty.to_excel(writer, sheet_name='DutyRequests') # index가 날짜 번호
+            pd.DataFrame(st.session_state.doctors).to_excel(writer, sheet_name='Doctors', index=False)
+            df_rules.to_excel(writer, sheet_name='Rules')
+            df_duty.to_excel(writer, sheet_name='DutyRequests')
         
         st.download_button(
             label="📥 Excel 파일 다운로드",
@@ -389,15 +397,26 @@ with st.sidebar:
     uploaded_file = col_load.file_uploader("설정 Excel 불러오기", type="xlsx")
     if uploaded_file is not None and col_load.button("📤 불러오기 적용"):
         try:
-            # 각 시트별로 데이터 읽기
+            # 데이터만 읽기
             df_doctors = pd.read_excel(uploaded_file, sheet_name='Doctors')
             df_rules = pd.read_excel(uploaded_file, sheet_name='Rules', index_col=0)
             df_duty = pd.read_excel(uploaded_file, sheet_name='DutyRequests', index_col=0)
             
-            # 세션 상태 업데이트 (데이터 타입 변환)
+            # [핵심] 순서(index) 기반으로 복원
+            # 이름/날짜가 무엇이든 상관없이 데이터 순서대로 리스트화
             st.session_state.doctors = df_doctors.to_dict('records')
-            st.session_state.rules = {int(k): v for k, v in df_rules.to_dict('index').items()}
-            st.session_state.duty_requests = {int(k): row.tolist() for k, row in df_duty.iterrows()}
+            
+            # Rules: 이름/날짜 무시하고 0, 1, 2 순서대로 다시 매핑
+            rules_dict = {}
+            for i in range(len(df_rules)):
+                rules_dict[i] = df_rules.iloc[i].to_dict()
+            st.session_state.rules = rules_dict
+            
+            # Duty: 날짜 무시하고 0, 1, 2 순서대로 다시 매핑
+            duty_dict = {}
+            for i in range(len(df_duty)):
+                duty_dict[i] = df_duty.iloc[i].tolist()
+            st.session_state.duty_requests = duty_dict
             
             st.success("✅ Excel 설정 적용 완료!")
             st.rerun()
