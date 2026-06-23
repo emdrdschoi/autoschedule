@@ -609,9 +609,9 @@ for ni in range(len(doctors)):
         st.session_state.rules[ni] = {
             "rule_max_shifts_per_day": 1, "rule_no_day_after_eve": 1,
             "rule_no_3eve_consec": 0, "rule_no_3eve_in_4days": 0, "rule_max_consec_days": 6,
-            "rule_max_shifts_per_week": 0, "rule_no_3day_consec": 0,
+            "rule_max_shifts_per_week": 5, "rule_no_3day_consec": 0,
             "rule_n_block_max": 1,
-            "rule_n_rest": 2,
+            "rule_n_rest": 1,
             "rule_n_gap": 3,
         }
     if ni not in st.session_state.shift_adj:
