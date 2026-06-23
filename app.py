@@ -258,7 +258,7 @@ DEFAULT_RULES = {
     "rule_no_3eve_consec":      0,
     "rule_no_3eve_in_4days":    0,
     "rule_max_consec_days":     6,
-    "rule_max_shifts_per_week": 0,
+    "rule_max_shifts_per_week": 6,
     "rule_no_3day_consec":      0,
 }
 
