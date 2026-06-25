@@ -535,7 +535,7 @@ with st.sidebar:
             else:
                 # Normal mode
                 col1, col2, col3 = st.columns([3, 1, 1])
-                col1.caption(f"[{i}] {doc['name']} · G{int(doc.get('grade', DEFAULT_DOCTOR_GRADE))}")
+                col1.caption(f"{doc['name']}")
                 if col2.button("수정", key=f"edit_{i}"):
                     st.session_state["editing_doctor"] = i
                     st.rerun()
