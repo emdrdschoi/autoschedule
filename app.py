@@ -4,19 +4,6 @@ from datetime import datetime, date, timedelta
 from io import BytesIO
 import calendar
 import json
-import locale
-import streamlit as st
-
-# 시스템 로케일을 한국어로 설정
-try:
-    locale.setlocale(locale.LC_TIME, 'ko_KR.UTF-8')
-except:
-    # 윈도우 환경이거나 ko_KR.UTF-8이 없는 경우를 대비한 대체 코드
-    try:
-        locale.setlocale(locale.LC_TIME, 'ko_KR')
-    except:
-        pass # 설정 실패 시 시스템 기본값 사용
-
     
 st.set_page_config(
     page_title="스케줄 최적화",
@@ -549,7 +536,7 @@ with st.sidebar:
                 # Normal mode
                 col1, col2, col3 = st.columns([3, 1, 1])
                 col1.caption(f"{doc['name']}")
-                if col2.button("수정", key=f"edit_{i}"):
+                if col2.button("edit", key=f"edit_{i}"):
                     st.session_state["editing_doctor"] = i
                     st.rerun()
                 if col3.button("✕", key=f"del_{i}"):
