@@ -416,8 +416,8 @@ def build_schedule_excel_bytes(
         "rule_no_day_after_eve": "Evening 후 Day 금지",
         "rule_no_3eve_consec": "Evening 3연속 금지",
         "rule_no_3eve_in_4days": "4일내 Evening 3회 금지",
-        "rule_max_consec_days": "연속 근무 금지(일수)",
-        "rule_max_shifts_per_week": "7일내 최대 근무수",
+        "rule_max_consec_days": "최대 연속 근무일수",
+        "rule_max_shifts_per_week": "7일 구간 최대 근무수",
         "rule_no_3day_consec": "Day 3연속 금지",
     }
 
@@ -547,10 +547,10 @@ with st.sidebar:
     st.divider()
     st.markdown('<div class="section-label">🔧 솔버 설정</div>', unsafe_allow_html=True)
     solver_mode = st.selectbox("모드", ["최적해 1개 (main)", "다중 솔루션 탐색 (main_alt)"], key="solver_mode")
-    time_max = st.slider("최대 탐색 시간 (초)", 10, 600, 60, key="time_max")
+    time_max = st.slider("최대 탐색 시간 (초)", 10, 300, 60, key="time_max")
     if solver_mode.startswith("다중"):
-        sol_limit = st.number_input("최대 솔루션 수", 1, 9999, 5, key="sol_limit")
-        adv_limit = st.number_input("최소 편차에 추가 허용 편차", 0, 9999, 0, key="adv_limit")
+        sol_limit = st.number_input("최대 솔루션 수", 1, 20, 5, key="sol_limit")
+        adv_limit = st.number_input("최소 편차에 추가 허용 편차", 0, 20, 0, key="adv_limit")
         st.markdown("*여기를 늘리면 최저 편차(최적값)보다 조금 더 높은 편차도 포함하여 더 많은 해를 탐색합니다.*")
     else:
         sol_limit = 1
@@ -831,7 +831,7 @@ with tab2:
 RULE0_OPTIONS = [1, 2, 3, 4, 5]
 RULE0_LABELS = ["1회만", "2회 허용", "3회 허용", "공휴일만 2회", "공휴일만 3회"]
 RULE5_OPTIONS = [0, 3, 4, 5, 6, 7]
-RULE5_LABELS = ["제한없음", "3일", "4일", "5일", "6일", "7일"]
+RULE5_LABELS = ["제한없음", "최대 3일", "최대 4일", "최대 5일", "최대 6일", "최대 7일"]
 
 # Ensure defaults exist for each doctor
 for ni in range(len(doctors)):
@@ -920,8 +920,8 @@ with tab3:
         ("rule_no_day_after_eve",    "Evening 후 Day 금지",                     "bool",   None, None),
         ("rule_no_3eve_consec",      "Evening 3연속 금지",                      "bool",   None, None),
         ("rule_no_3eve_in_4days",    "4일내 Evening 3회 금지",                  "bool",   None, None),
-        ("rule_max_consec_days",     "연속 근무 금지 (일수)",                    "select", RULE5_OPTIONS, RULE5_LABELS),
-        ("rule_max_shifts_per_week", "7일내 최대 근무수 (0=무제한)",             "number", 0, 7),
+        ("rule_max_consec_days",     "최대 연속 근무일수",                    "select", RULE5_OPTIONS, RULE5_LABELS),
+        ("rule_max_shifts_per_week", "7일 구간 최대 근무수 (0=무제한)",             "number", 0, 7),
         ("rule_no_3day_consec",      "Day 3연속 금지",                          "bool",   None, None),
     ]
 

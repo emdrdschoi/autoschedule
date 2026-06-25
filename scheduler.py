@@ -301,14 +301,24 @@ def build_and_solve(params: dict[str, Any]):
                 model.AddBoolOr([shifts[(n,d,1)].Not(), shifts[(n,d+1,1)], shifts[(n,d+2,1)].Not(), shifts[(n,d+3,1)].Not()])
 
         # rule5: max consecutive working days
-        if r5 in (3,4,5,6,7):
-            for d in range(num_days - (r5 - 1)):
-                model.Add(sum(shifts[(n,d+p,s)] for p in range(r5) for s in all_shifts) < r5)
+        # r5 means "up to r5 consecutive working days are allowed".
+        # Therefore we forbid any (r5 + 1)-day window in which all days are worked.
+        # Example: r5=6 allows 6 consecutive working days, but not 7.
+        if r5 in (3,4,5,6,7) and num_days >= r5 + 1:
+            for d in range(num_days - r5):
+                worked_days = []
+                for p in range(r5 + 1):
+                    worked = model.NewBoolVar(f"worked_{n}_{d}_{p}")
+                    model.AddMaxEquality(worked, [shifts[(n, d+p, s)] for s in all_shifts])
+                    worked_days.append(worked)
+                model.Add(sum(worked_days) <= r5)
 
-        # rule6: max shifts in 7 days
-        if r6 > 0:
-            for d in range(num_days - 7):
-                model.Add(sum(shifts[(n,d+p,s)] for p in range(7) for s in all_shifts) < r6)
+        # rule6: max shifts in any 7-day window
+        # r6 means "up to r6 shifts are allowed in a 7-day window".
+        # Example: r6=6 allows 6 shifts, but not 7.
+        if r6 > 0 and num_days >= 7:
+            for d in range(num_days - 6):
+                model.Add(sum(shifts[(n,d+p,s)] for p in range(7) for s in all_shifts) <= r6)
 
         # rule7: no DDD
         if r7:
