@@ -374,6 +374,77 @@ def grade_rules_from_df(df: pd.DataFrame) -> dict:
                 rules[key] = int(row.get("value"))
     return rules
 
+
+def build_schedule_excel_bytes(
+    *,
+    doctors,
+    num_days: int,
+    start_date: date,
+    sol: dict,
+    summary_display: pd.DataFrame,
+    metrics: list,
+    sol_idx: int,
+    display_order: list[int],
+) -> bytes:
+    """Build the result Excel file lazily, only when the user requests export."""
+    date_cols = []
+    for di in range(num_days):
+        d = start_date + timedelta(days=di)
+        lbl = get_day_label(start_date, di)
+        date_cols.append(f"{d.strftime('%m/%d')} ({lbl})")
+
+    export_rows = []
+    for ni in display_order:
+        doc = doctors[ni]
+        row = {"Name": doc["name"], "Grade": int(doc.get("grade", DEFAULT_DOCTOR_GRADE))}
+        for di, col in enumerate(date_cols):
+            val = sol.get((ni, di), "")
+            row[col] = val.upper() if val else ""
+        export_rows.append(row)
+    export_df = pd.DataFrame(export_rows).set_index("Name")
+
+    rule_col_order = [
+        "rule_max_shifts_per_day", "rule_n_block_max", "rule_n_rest", "rule_n_gap",
+        "rule_no_day_after_eve", "rule_no_3eve_consec", "rule_no_3eve_in_4days",
+        "rule_max_consec_days", "rule_max_shifts_per_week", "rule_no_3day_consec",
+    ]
+    rule_col_labels = {
+        "rule_max_shifts_per_day": "하루 근무 횟수",
+        "rule_n_block_max": "N뭉치 최대 길이",
+        "rule_n_rest": "N뭉치 후 완전Off 의무일",
+        "rule_n_gap": "N뭉치 후 다음N까지 총 간격",
+        "rule_no_day_after_eve": "Evening 후 Day 금지",
+        "rule_no_3eve_consec": "Evening 3연속 금지",
+        "rule_no_3eve_in_4days": "4일내 Evening 3회 금지",
+        "rule_max_consec_days": "연속 근무 금지(일수)",
+        "rule_max_shifts_per_week": "7일내 최대 근무수",
+        "rule_no_3day_consec": "Day 3연속 금지",
+    }
+
+    rules_rows = []
+    for ni, doc in enumerate(doctors):
+        r = st.session_state.rules.get(ni, {})
+        row = {
+            "이름": doc["name"],
+            "grade": int(doc.get("grade", DEFAULT_DOCTOR_GRADE)),
+            "shift_adj": st.session_state.shift_adj.get(ni, 0),
+        }
+        for key in rule_col_order:
+            row[rule_col_labels[key]] = r.get(key, "")
+        rules_rows.append(row)
+    rules_df = pd.DataFrame(rules_rows)
+
+    towrite = BytesIO()
+    with pd.ExcelWriter(towrite, engine="openpyxl") as writer:
+        export_df.to_excel(writer, sheet_name="Schedule")
+        summary_display.to_excel(writer, sheet_name="Summary", index=False)
+        rules_df.to_excel(writer, sheet_name="Rules", index=False)
+        grade_rules_to_df(st.session_state.grade_rules).to_excel(writer, sheet_name="GradeRules", index=False)
+        if metrics and sol_idx < len(metrics):
+            pd.DataFrame([metrics[sol_idx]]).to_excel(writer, sheet_name="Metrics", index=False)
+    towrite.seek(0)
+    return towrite.getvalue()
+
 def get_day_label(start: date, idx: int) -> str:
     d = start + timedelta(days=idx)
     return DAY_LABELS[d.weekday() % 7 if d.weekday() != 6 else 0]
@@ -961,6 +1032,7 @@ if st.session_state.get("trigger_solve"):
                 st.session_state.metrics = metrics
                 st.session_state.sol_idx = 0
                 st.session_state.solved = True
+                st.session_state.pop("prepared_excel_export", None)
                 st.toast(f"✅ {len(solutions)}개의 솔루션을 찾았습니다!", icon="✅")
             except Exception as e:
                 st.toast(f"❌ 오류 발생: {e}", icon="❌")
@@ -992,23 +1064,6 @@ with tab4:
         name_to_grade = {doc["name"]: int(doc.get("grade", DEFAULT_DOCTOR_GRADE)) for doc in doctors}
         name_to_display_order = {doctors[ni]["name"]: order for order, ni in enumerate(display_order)}
 
-        # Excel 내보내기용 데이터 준비
-        date_cols = []
-        for di in range(num_days):
-            d = start_date + timedelta(days=di)
-            lbl = get_day_label(start_date, di)
-            date_cols.append(f"{d.strftime('%m/%d')} ({lbl})")
-
-        export_rows = []
-        for ni in display_order:
-            doc = doctors[ni]
-            row = {"Name": doc['name'], "Grade": int(doc.get("grade", DEFAULT_DOCTOR_GRADE))}
-            for di, col in enumerate(date_cols):
-                row[col] = sol.get((ni, di), '').upper() if sol.get((ni, di), '') else ''
-            export_rows.append(row)
-
-        export_df = pd.DataFrame(export_rows).set_index('Name')
-
         summary_display = summary.copy()
         if "Grade" not in summary_display.columns:
             summary_display.insert(1, "Grade", summary_display["Name"].map(name_to_grade).fillna(DEFAULT_DOCTOR_GRADE).astype(int))
@@ -1019,41 +1074,7 @@ with tab4:
             .drop(columns=["_display_order"])
         )
 
-        # Rules export — RULE_DEFS 순서대로 컬럼 정렬
-        RULE_COL_ORDER = [
-            "rule_max_shifts_per_day", "rule_n_block_max", "rule_n_rest", "rule_n_gap",
-            "rule_no_day_after_eve", "rule_no_3eve_consec", "rule_no_3eve_in_4days", "rule_max_consec_days", "rule_max_shifts_per_week", "rule_no_3day_consec",
-        ]
-        RULE_COL_LABELS = {
-            "rule_max_shifts_per_day":            "하루 근무 횟수",
-            "rule_n_block_max": "N뭉치 최대 길이",
-            "rule_n_rest":      "N뭉치 후 완전Off 의무일",
-            "rule_n_gap":       "N뭉치 후 다음N까지 총 간격",
-            "rule_no_day_after_eve":            "Evening 후 Day 금지",
-            "rule_no_3eve_consec":            "Evening 3연속 금지",
-            "rule_no_3eve_in_4days":            "4일내 Evening 3회 금지",
-            "rule_max_consec_days":            "연속 근무 금지(일수)",
-            "rule_max_shifts_per_week":            "7일내 최대 근무수",
-            "rule_no_3day_consec":            "Day 3연속 금지",
-        }
-        rules_rows = []
-        for ni, doc in enumerate(doctors):
-            r = st.session_state.rules.get(ni, {})
-            row = {"이름": doc["name"], "grade": int(doc.get("grade", DEFAULT_DOCTOR_GRADE)), "shift_adj": st.session_state.shift_adj.get(ni, 0)}
-            for key in RULE_COL_ORDER:
-                row[RULE_COL_LABELS[key]] = r.get(key, "")
-            rules_rows.append(row)
-        rules_df = pd.DataFrame(rules_rows)
-
-        towrite = BytesIO()
-        with pd.ExcelWriter(towrite, engine='openpyxl') as writer:
-            export_df.to_excel(writer, sheet_name='Schedule')
-            summary_display.to_excel(writer, sheet_name='Summary', index=False)
-            rules_df.to_excel(writer, sheet_name='Rules', index=False)
-            grade_rules_to_df(st.session_state.grade_rules).to_excel(writer, sheet_name='GradeRules', index=False)
-            if metrics and sol_idx < len(metrics):
-                pd.DataFrame([metrics[sol_idx]]).to_excel(writer, sheet_name='Metrics', index=False)
-        towrite.seek(0)
+        # Excel export는 화면 이동 때마다 만들지 않고, 아래의 "Excel 준비" 버튼을 눌렀을 때만 생성합니다.
 
         # Summary stats
         st.markdown('<div class="section-label">근무 통계</div>', unsafe_allow_html=True)
@@ -1150,14 +1171,37 @@ with tab4:
             st.session_state.sol_idx = int(jump) - 1
             st.rerun()
 
-        nav_col5.download_button(
-            "Excel 내보내기",
-            data=towrite.getvalue(),
-            file_name=f"schedule_{sol_idx+1}.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            use_container_width=True,
-            key="download_excel"
-        )
+        prepared = st.session_state.get("prepared_excel_export")
+        prepared_matches_current = prepared and prepared.get("sol_idx") == sol_idx
+
+        if nav_col5.button("Excel 준비", use_container_width=True, key=f"prepare_excel_{sol_idx}"):
+            excel_bytes = build_schedule_excel_bytes(
+                doctors=doctors,
+                num_days=num_days,
+                start_date=start_date,
+                sol=sol,
+                summary_display=summary_display,
+                metrics=metrics,
+                sol_idx=sol_idx,
+                display_order=display_order,
+            )
+            st.session_state.prepared_excel_export = {
+                "sol_idx": sol_idx,
+                "filename": f"schedule_{sol_idx+1}.xlsx",
+                "bytes": excel_bytes,
+            }
+            prepared = st.session_state.prepared_excel_export
+            prepared_matches_current = True
+
+        if prepared_matches_current:
+            nav_col5.download_button(
+                "다운로드",
+                data=prepared["bytes"],
+                file_name=prepared["filename"],
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True,
+                key=f"download_excel_{sol_idx}",
+            )
 
         st.divider()
         st.markdown('<div class="section-label">범례</div>', unsafe_allow_html=True)
