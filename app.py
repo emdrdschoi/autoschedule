@@ -169,7 +169,7 @@ html, body, [class*="css"] {
     font-family: var(--mono);
     font-weight: 600;
     font-size: 0.85rem;
-    padding: 0.5rem 1.5rem;
+    padding: 0.3rem 0.8rem;
     transition: opacity 0.15s;
 }
 .stButton > button:hover { opacity: 0.85; }
@@ -536,7 +536,7 @@ with st.sidebar:
                 # Normal mode
                 col1, col2, col3 = st.columns([3, 1, 1])
                 col1.caption(f"{doc['name']}")
-                if col2.button("edit", key=f"edit_{i}"):
+                if col2.button("수정", key=f"edit_{i}"):
                     st.session_state["editing_doctor"] = i
                     st.rerun()
                 if col3.button("✕", key=f"del_{i}"):
