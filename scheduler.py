@@ -150,12 +150,6 @@ def build_and_solve(params: dict[str, Any]):
 
     # ── Hard constraints ──────────────────────────────────────────────────────
 
-    # Night → next day only N or off (no D or E after N)
-    for n in all_doctors:
-        for d in range(num_days - 1):
-            model.AddBoolOr([shifts[(n,d,2)].Not(), shifts[(n,d+1,0)].Not()])
-            model.AddBoolOr([shifts[(n,d,2)].Not(), shifts[(n,d+1,1)].Not()])
-
     # Per-doctor rules
     for n in all_doctors:
         r0        = get_rule(n, "rule_max_shifts_per_day", 1)
@@ -193,13 +187,11 @@ def build_and_solve(params: dict[str, Any]):
 
         # ── N-block constraints ───────────────────────────────────────────────
         # n_max  : N 연속 최대 허용 길이 (1=NN불가, 2=NNN불가, 3=NNNN불가)
-        # n_rest : N뭉치 끝난 후 완전 Off 의무일 수  (앞쪽)
-        # n_gap  : N뭉치 끝난 날로부터 총 몇 일 후 N이 가능한지 (n_gap >= n_rest)
+        # n_rest : N뭉치 끝난 후 완전 Off 의무일 수
+        # n_gap  : N뭉치 끝난 날로부터 총 며칠 후 N이 가능한지 (n_gap >= n_rest)
         #
-        # 예) n_max=2, n_rest=2, n_gap=4
-        #   N N | O O | D/E가능 D/E가능 | N가능
-        #       <--n_rest=2--> <-추가2일->
-        #       <--------n_gap=4-------->
+        # 예) n_max=2, n_rest=2, n_gap=3
+        #   N N | O O | D/E가능 | N가능  (3일째부터 N)
 
         # 1) Max N block length: (n_max+1)개 연속 N 금지
         block_len = n_max + 1
@@ -209,35 +201,37 @@ def build_and_solve(params: dict[str, Any]):
                     sum(shifts[(n, d+i, 2)] for i in range(block_len)) < block_len
                 )
 
-        # 2) 뭉치 길이 blen(1..n_max) 로 시작하는 N-block 에 대해 rest/gap 적용
-        #    block_vars = N[d..d+blen-1] 이 모두 True 일 때:
-        #      - end+1 .. end+n_rest  → 완전 Off (D/E/N 전부 금지)
-        #      - end+n_rest+1 .. end+n_gap → N만 금지 (D/E는 허용)
-        for blen in range(1, n_max + 1):
-            for d in range(num_days):
-                end = d + blen - 1
-                if end >= num_days:
+        # 2) 뭉치 끝 지점(e) 감지: N[e]=True AND (e==마지막날 OR N[e+1]=False)
+        #    → end+1..end+n_rest: 완전 Off
+        #    → end+n_rest+1..end+n_gap: N만 금지
+        #
+        #    "N[e]=T and N[e+1]=F → 제약" 을
+        #    CP-SAT 로: AddBoolOr([N[e].Not, N[e+1], shifts[dd,s].Not])
+        #    마지막 날(e=num_days-1): AddBoolOr([N[e].Not, shifts[dd,s].Not])
+
+        for e in range(num_days):  # e = 뭉치 마지막 날 후보
+            # 완전 휴무
+            for r in range(1, n_rest + 1):
+                dd = e + r
+                if dd >= num_days:
                     break
+                for s in all_shifts:
+                    if e + 1 < num_days:
+                        # N[e]=T and N[e+1]=F → shifts[dd,s]=F
+                        model.AddBoolOr([shifts[(n,e,2)].Not(), shifts[(n,e+1,2)], shifts[(n,dd,s)].Not()])
+                    else:
+                        # 마지막날 N이면 무조건
+                        model.AddBoolOr([shifts[(n,e,2)].Not(), shifts[(n,dd,s)].Not()])
 
-                block_vars = [shifts[(n, d+i, 2)] for i in range(blen)]
-
-                # 완전 휴무 구간: end+1 ~ end+n_rest
-                for r in range(1, n_rest + 1):
-                    dd = end + r
-                    if dd < num_days:
-                        for s in all_shifts:
-                            model.AddBoolOr(
-                                [v.Not() for v in block_vars] + [shifts[(n, dd, s)].Not()]
-                            )
-
-                # N만 금지 구간: end+n_rest+1 ~ end+n_gap
-                # (n_gap이 n_rest보다 클 때만 의미 있음)
-                for g in range(n_rest + 1, n_gap + 1):
-                    dd = end + g
-                    if dd < num_days:
-                        model.AddBoolOr(
-                            [v.Not() for v in block_vars] + [shifts[(n, dd, 2)].Not()]
-                        )
+            # N만 금지
+            for g in range(n_rest + 1, n_gap + 1):
+                dd = e + g
+                if dd >= num_days:
+                    break
+                if e + 1 < num_days:
+                    model.AddBoolOr([shifts[(n,e,2)].Not(), shifts[(n,e+1,2)], shifts[(n,dd,2)].Not()])
+                else:
+                    model.AddBoolOr([shifts[(n,e,2)].Not(), shifts[(n,dd,2)].Not()])
 
         # rule2: no D after E
         if r2:

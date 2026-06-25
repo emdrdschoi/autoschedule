@@ -89,25 +89,43 @@ html, body, [class*="css"] {
 /* Schedule grid */
 .schedule-grid {
     font-family: var(--mono);
-    font-size: 0.78rem;
+    font-size: 0.68rem;
     border-collapse: collapse;
-    width: 100%;
+    width: auto;
+    table-layout: auto;
 }
 .schedule-grid th {
     background: var(--surface2);
     color: var(--text-dim);
-    padding: 6px 10px;
+    padding: 2px 3px;
     font-weight: 600;
     text-align: center;
     border: 1px solid var(--border);
-    font-size: 0.7rem;
-    letter-spacing: 0.05em;
+    font-size: 0.6rem;
+    white-space: nowrap;
+    min-width: 24px;
+    max-width: 32px;
 }
 .schedule-grid td {
-    padding: 5px 8px;
+    padding: 2px 3px;
     border: 1px solid var(--border);
     text-align: center;
     background: var(--surface);
+    font-size: 0.7rem;
+    font-weight: 700;
+    white-space: nowrap;
+    min-width: 24px;
+    max-width: 32px;
+}
+.schedule-grid td.name-col {
+    text-align: left;
+    font-weight: 600;
+    color: var(--text);
+    padding: 2px 6px;
+    white-space: nowrap;
+    min-width: unset;
+    max-width: unset;
+    font-size: 0.68rem;
 }
 .schedule-grid tr:hover td { background: var(--surface2); }
 .th-holiday { color: var(--accent2) !important; }
@@ -293,7 +311,7 @@ def max_avr(x):
         return int(x)
     return int(x) + 1
 
-CHUNK = 15  # Number of days per chunk for display
+CHUNK = 7  # Number of days per chunk for display
 
 
 # ── SIDEBAR ──────────────────────────────────────────────────────────────────
@@ -444,8 +462,13 @@ with st.sidebar:
                 for i in range(len(df_doctors))
             }
 
-            # 3) DutyRequests
-            st.session_state.duty_requests = {i: df_duty.iloc[i].tolist() for i in range(len(df_duty))}
+            # 3) DutyRequests — 길이만 참조, 시작날짜는 사이드바 기준
+            loaded_duty = {i: [int(df_duty.iloc[i]['D']), int(df_duty.iloc[i]['E']), int(df_duty.iloc[i]['N'])]
+                           for i in range(len(df_duty))}
+            st.session_state.duty_requests = loaded_duty
+            st.session_state.num_days = len(loaded_duty)
+            # day_types는 사이드바 start_date 기준으로 재생성
+            st.session_state.day_types = auto_day_types(st.session_state.start_date, st.session_state.num_days)
 
             # 4) ShiftRequests
             new_shift = {}
@@ -455,7 +478,7 @@ with st.sidebar:
                     new_shift[(doc_idx, d_idx)] = str(val) if pd.notna(val) else ''
             st.session_state.shift_requests = new_shift
 
-            st.success("✅ 설정 적용 완료!")
+            st.toast("✅ 설정 적용 완료!", icon="✅")
             st.rerun()
         except Exception as e:
             st.error(f"불러오기 실패: {e}")
@@ -486,8 +509,8 @@ if not doctors:
 if not st.session_state.day_types or len(st.session_state.day_types) != num_days:
     st.session_state.day_types = auto_day_types(start_date, num_days)
 
-if not st.session_state.duty_requests or len(st.session_state.duty_requests) != num_days:
-    st.session_state.duty_requests = {i: [1, 1, 1] for i in range(num_days)}
+if not st.session_state.duty_requests or len(st.session_state.duty_requests) != st.session_state.num_days:
+    st.session_state.duty_requests = {i: [1, 1, 1] for i in range(st.session_state.num_days)}
 
 tab1, tab2, tab3, tab4 = st.tabs(["📅 근무 요청 / 날짜 설정", "📋 Duty 설정", "⚙ 개인 규칙", "📊 결과"])
 
@@ -506,7 +529,7 @@ with tab1:
 
     for chunk_start in range(0, num_days, CHUNK):
         chunk_end = min(chunk_start + CHUNK, num_days)
-        cols = st.columns(CHUNK + 1)  # Always 16 columns (1 + 15)
+        cols = st.columns(CHUNK + 1)  # Always 8 columns (1 + 7)
 
         # First row: Day types
         cols[0].markdown(f"<span style='font-family:var(--mono);font-size:0.7rem;color:var(--text-dim);font-weight:600'>날짜유형</span>", unsafe_allow_html=True)
@@ -560,7 +583,7 @@ with tab2:
     st.caption("각 날짜마다 Day / Evening / Night 에 필요한 의사 수를 설정합니다.")
 
     for chunk_start in range(0, num_days, CHUNK):
-        cols = st.columns(CHUNK + 1)  # Always 16 columns (1 + 15)
+        cols = st.columns(CHUNK + 1)  # Always 8 columns (1 + 7)
         cols[0].markdown("<span style='font-family:var(--mono);font-size:0.7rem;color:var(--text-dim)'>Duty</span>", unsafe_allow_html=True)
 
         # Header row
@@ -619,68 +642,81 @@ for ni in range(len(doctors)):
 
 with tab3:
     st.markdown('<div class="section-label">개인별 근무 규칙 설정</div>', unsafe_allow_html=True)
-    st.caption("표에서 각 의사별로 근무 규칙을 한 번에 설정할 수 있습니다.")
+    st.caption("7명씩 나눠서 표시됩니다. 규칙명 옆으로 의사별 설정을 입력하세요.")
 
     doc_names = [d["name"] for d in doctors]
+    DOC_CHUNK = 7
 
     RULE_DEFS = [
-        ("rule_max_shifts_per_day",           "하루 근무 횟수",                          "select", RULE0_OPTIONS, RULE0_LABELS),
-        ("rule_n_block_max","N 뭉치 최대 길이",                        "select", [1,2,3], ["1개(NN불가)","2개(NNN불가)","3개(NNNN불가)"]),
-        ("rule_n_rest",     "N뭉치 후 완전 Off 의무일 (앞쪽)",          "number", 0, 5),
-        ("rule_n_gap",      "N뭉치 후 다음 N까지 총 간격 (≥완전Off일)", "number", 0, 10),
-        ("rule_no_day_after_eve",           "Evening 후 Day 금지",                     "bool",   None, None),
-        ("rule_no_3eve_consec",           "Evening 3연속 금지",                      "bool",   None, None),
-        ("rule_no_3eve_in_4days",           "4일내 Evening 3회 금지",                  "bool",   None, None),
-        ("rule_max_consec_days",           "연속 근무 금지 (일수)",                    "select", RULE5_OPTIONS, RULE5_LABELS),
-        ("rule_max_shifts_per_week",           "7일내 최대 근무수 (0=무제한)",             "number", 0, 7),
-        ("rule_no_3day_consec",           "Day 3연속 금지",                          "bool",   None, None),
+        ("rule_max_shifts_per_day",  "하루 근무 횟수",                          "select", RULE0_OPTIONS, RULE0_LABELS),
+        ("rule_n_block_max",         "N 뭉치 최대 길이",                        "select", [1,2,3], ["1개(NN불가)","2개(NNN불가)","3개(NNNN불가)"]),
+        ("rule_n_rest",              "N뭉치 후 완전 Off 의무일",                "number", 0, 5),
+        ("rule_n_gap",               "N뭉치 후 다음 N까지 총 간격",             "number", 0, 10),
+        ("rule_no_day_after_eve",    "Evening 후 Day 금지",                     "bool",   None, None),
+        ("rule_no_3eve_consec",      "Evening 3연속 금지",                      "bool",   None, None),
+        ("rule_no_3eve_in_4days",    "4일내 Evening 3회 금지",                  "bool",   None, None),
+        ("rule_max_consec_days",     "연속 근무 금지 (일수)",                    "select", RULE5_OPTIONS, RULE5_LABELS),
+        ("rule_max_shifts_per_week", "7일내 최대 근무수 (0=무제한)",             "number", 0, 7),
+        ("rule_no_3day_consec",      "Day 3연속 금지",                          "bool",   None, None),
     ]
 
-    # Header row (rule name + doctor columns)
-    header_cols = st.columns(len(doc_names) + 1)
-    header_cols[0].markdown("**규칙**")
-    for ni, name in enumerate(doc_names):
-        header_cols[ni + 1].markdown(f"**{name}**")
+    for chunk_start in range(0, len(doc_names), DOC_CHUNK):
+        chunk_end = min(chunk_start + DOC_CHUNK, len(doc_names))
+        chunk_names = doc_names[chunk_start:chunk_end]
+        chunk_size = len(chunk_names)
 
-    # shift_adj row
-    row_cols = st.columns(len(doc_names) + 1)
-    row_cols[0].markdown("근무 조정값 (평균 근무수 +-n개)")
-    for ni in range(len(doc_names)):
-        cur = int(st.session_state.shift_adj.get(ni, 0))
-        new_val = row_cols[ni + 1].number_input(
-            f"shift_adj_{ni}", min_value=-10, max_value=10,
-            value=cur, label_visibility="collapsed"
+        st.markdown(
+            f"<div style='font-family:var(--mono);font-size:0.75rem;color:var(--accent);margin:1rem 0 0.4rem'>"
+            f"의사 {chunk_start+1} ~ {chunk_end}</div>",
+            unsafe_allow_html=True
         )
-        st.session_state.shift_adj[ni] = int(new_val)
 
-    # rule rows
-    for key, label, rtype, opt1, opt2 in RULE_DEFS:
-        row_cols = st.columns(len(doc_names) + 1)
-        row_cols[0].markdown(label)
-        for ni in range(len(doc_names)):
-            rules = st.session_state.rules.get(ni, {})
-            if rtype == "select":
-                opts, labels = opt1, opt2
-                cur = int(rules.get(key, opts[0]))
-                idx = opts.index(cur) if cur in opts else 0
-                new_val = row_cols[ni + 1].selectbox(
-                    f"rule_{key}_{ni}", options=labels, index=idx, label_visibility="collapsed"
-                )
-                st.session_state.rules[ni][key] = opts[labels.index(new_val)]
-            elif rtype == "number":
-                cur = int(rules.get(key, opt1))
-                new_val = row_cols[ni + 1].number_input(
-                    f"rule_{key}_{ni}", min_value=opt1, max_value=opt2,
-                    value=cur, label_visibility="collapsed"
-                )
-                st.session_state.rules[ni][key] = int(new_val)
-            elif rtype == "bool":
-                cur = bool(rules.get(key, 0))
-                new_val = row_cols[ni + 1].checkbox(
-                    "", value=cur, label_visibility="collapsed",
-                    key=f"rule_{key}_{ni}"
-                )
-                st.session_state.rules[ni][key] = 1 if new_val else 0
+        # 헤더
+        header_cols = st.columns([2] + [1] * chunk_size)
+        header_cols[0].markdown("<span style='font-family:var(--mono);font-size:0.75rem;color:var(--text-dim)'>규칙</span>", unsafe_allow_html=True)
+        for ci, name in enumerate(chunk_names):
+            header_cols[ci+1].markdown(f"<span style='font-family:var(--mono);font-size:0.78rem;font-weight:600;color:var(--accent)'>{name}</span>", unsafe_allow_html=True)
+
+        # shift_adj
+        adj_cols = st.columns([2] + [1] * chunk_size)
+        adj_cols[0].markdown("<span style='font-size:0.75rem'>근무 조정값</span>", unsafe_allow_html=True)
+        for ci, ni in enumerate(range(chunk_start, chunk_end)):
+            cur = int(st.session_state.shift_adj.get(ni, 0))
+            new_val = adj_cols[ci+1].number_input(
+                f"adj_{ni}", min_value=-10, max_value=10,
+                value=cur, label_visibility="collapsed", key=f"shift_adj_{ni}"
+            )
+            st.session_state.shift_adj[ni] = int(new_val)
+
+        # 규칙 rows
+        for key, label, rtype, opt1, opt2 in RULE_DEFS:
+            row_cols = st.columns([2] + [1] * chunk_size)
+            row_cols[0].markdown(f"<span style='font-size:0.75rem'>{label}</span>", unsafe_allow_html=True)
+            for ci, ni in enumerate(range(chunk_start, chunk_end)):
+                rules = st.session_state.rules.get(ni, DEFAULT_RULES.copy())
+                if rtype == "select":
+                    opts, labels = opt1, opt2
+                    cur = int(rules.get(key, opts[0]))
+                    idx = opts.index(cur) if cur in opts else 0
+                    new_val = row_cols[ci+1].selectbox(
+                        f"r_{key}_{ni}", options=labels, index=idx, label_visibility="collapsed"
+                    )
+                    st.session_state.rules[ni][key] = opts[labels.index(new_val)]
+                elif rtype == "number":
+                    cur = int(rules.get(key, opt1))
+                    new_val = row_cols[ci+1].number_input(
+                        f"r_{key}_{ni}", min_value=opt1, max_value=opt2,
+                        value=cur, label_visibility="collapsed"
+                    )
+                    st.session_state.rules[ni][key] = int(new_val)
+                elif rtype == "bool":
+                    cur = bool(rules.get(key, 0))
+                    new_val = row_cols[ci+1].checkbox(
+                        "", value=cur, key=f"r_{key}_{ni}", label_visibility="collapsed"
+                    )
+                    st.session_state.rules[ni][key] = 1 if new_val else 0
+
+        st.divider()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -717,9 +753,9 @@ if st.session_state.get("trigger_solve"):
                 st.session_state.metrics = metrics
                 st.session_state.sol_idx = 0
                 st.session_state.solved = True
-                st.success(f"✅ {len(solutions)}개의 솔루션을 찾았습니다! (adv ≤ {params['adv_limit']})")
+                st.toast(f"✅ {len(solutions)}개의 솔루션을 찾았습니다!", icon="✅")
             except Exception as e:
-                st.error(f"오류 발생: {e}")
+                st.toast(f"❌ 오류 발생: {e}", icon="❌")
                 import traceback
                 st.code(traceback.format_exc())
 
@@ -819,28 +855,26 @@ with tab4:
         holiday_days = [d for d, t in st.session_state.day_types.items() if t in ('토','일','공')]
 
         # Build HTML table
-        header_row = "<tr><th>이름</th>"
+        header_row = "<tr><th style='text-align:left;white-space:nowrap;padding:2px 6px'>이름</th>"
         for di in range(num_days):
             d = start_date + timedelta(days=di)
             lbl = get_day_label(start_date, di)
             is_hol = di in holiday_days
             cls = ' class="th-holiday"' if is_hol else ''
-            header_row += f"<th{cls}>{d.strftime('%m/%d')}<br><span style='font-weight:400;font-size:0.65rem'>{lbl}</span></th>"
+            header_row += f"<th{cls}>{d.strftime('%m/%d')}<br><span style='font-weight:400;font-size:0.58rem'>{lbl}</span></th>"
         header_row += "</tr>"
 
         body_rows = ""
         for ni, doc in enumerate(doctors):
-            body_rows += f"<tr><td style='text-align:left;font-weight:600;color:var(--text);padding:5px 10px'>{doc['name']}</td>"
+            body_rows += f"<tr><td class='name-col'>{doc['name']}</td>"
             for di in range(num_days):
                 val = sol.get((ni, di), '')
                 req = st.session_state.shift_requests.get((ni, di), '')
                 is_hol = di in holiday_days
                 hol_style = "border-left: 2px solid #e05c5c44;" if is_hol else ""
                 cell_cls = SHIFT_COLORS.get(val, 'cell-off')
-                req_style = "outline: 1px solid #e05c5c;" if req and val else ""
-
                 shift_html = val.upper() if val else "·"
-                body_rows += f"<td class='{cell_cls}' style='{hol_style}{req_style}'>{shift_html}</td>"
+                body_rows += f"<td class='{cell_cls}' style='{hol_style}'>{shift_html}</td>"
             body_rows += "</tr>"
 
         table_html = f"""
