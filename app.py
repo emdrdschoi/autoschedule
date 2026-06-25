@@ -515,10 +515,13 @@ with st.sidebar:
         df_duty = pd.DataFrame.from_dict(st.session_state.duty_requests, orient='index', columns=['D', 'E', 'N'])
         df_duty.index = date_list
 
-        shift_grid = pd.DataFrame('', index=date_list, columns=doctor_names)
+        # ShiftRequests: 행=의사, 열=날짜 구조로 저장
+        # 다른 시트처럼 첫 번째 열이 의사 이름이 되도록 하여 복사/붙여넣기를 쉽게 한다.
+        shift_grid = pd.DataFrame('', index=doctor_names, columns=date_list)
+        shift_grid.index.name = 'Name'
         for (doc_idx, day_idx), val in st.session_state.shift_requests.items():
             if day_idx < len(date_list) and doc_idx < len(doctor_names):
-                shift_grid.iloc[day_idx, doc_idx] = val
+                shift_grid.iloc[doc_idx, day_idx] = val
 
         df_grade_rules = grade_rules_to_df(st.session_state.grade_rules)
 
@@ -587,11 +590,19 @@ with st.sidebar:
             st.session_state.day_types = auto_day_types(st.session_state.start_date, st.session_state.num_days)
 
             # 4) ShiftRequests
+            # 새 형식만 지원: 행=의사(Name), 열=날짜.
+            # 행 이름으로 의사를 매칭하므로 시트에서 의사 행 순서를 바꿔도 안전하다.
+            name_to_doc_idx = {doc['name']: i for i, doc in enumerate(st.session_state.doctors)}
             new_shift = {}
-            for d_idx in range(len(df_shift)):
-                for doc_idx in range(len(df_shift.columns)):
-                    val = df_shift.iloc[d_idx, doc_idx]
-                    new_shift[(doc_idx, d_idx)] = str(val) if pd.notna(val) else ''
+            max_days = min(len(df_shift.columns), st.session_state.num_days)
+            for row_name, row in df_shift.iterrows():
+                doc_name = str(row_name).strip()
+                if doc_name not in name_to_doc_idx:
+                    continue
+                doc_idx = name_to_doc_idx[doc_name]
+                for day_idx in range(max_days):
+                    val = row.iloc[day_idx]
+                    new_shift[(doc_idx, day_idx)] = str(val).strip() if pd.notna(val) else ''
             st.session_state.shift_requests = new_shift
 
             st.toast("✅ 설정 적용 완료!", icon="✅")
