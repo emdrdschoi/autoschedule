@@ -831,7 +831,7 @@ with tab2:
 RULE0_OPTIONS = [1, 2, 3, 4, 5]
 RULE0_LABELS = ["1회만", "2회 허용", "3회 허용", "공휴일만 2회", "공휴일만 3회"]
 RULE5_OPTIONS = [0, 3, 4, 5, 6, 7]
-RULE5_LABELS = ["제한없음", "최대 3일", "최대 4일", "최대 5일", "최대 6일", "최대 7일"]
+RULE5_LABELS = ["제한없음", "3일", "4일", "5일", "6일", "7일"]
 
 # Ensure defaults exist for each doctor
 for ni in range(len(doctors)):
@@ -920,7 +920,7 @@ with tab3:
         ("rule_no_day_after_eve",    "Evening 후 Day 금지",                     "bool",   None, None),
         ("rule_no_3eve_consec",      "Evening 3연속 금지",                      "bool",   None, None),
         ("rule_no_3eve_in_4days",    "4일내 Evening 3회 금지",                  "bool",   None, None),
-        ("rule_max_consec_days",     "최대 연속 근무일수",                    "select", RULE5_OPTIONS, RULE5_LABELS),
+        ("rule_max_consec_days", "최대 연속 근무일수", "number", 0, 30),
         ("rule_max_shifts_per_week", "7일 구간 최대 근무수 (0=무제한)",             "number", 0, 7),
         ("rule_no_3day_consec",      "Day 3연속 금지",                          "bool",   None, None),
     ]
