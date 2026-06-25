@@ -135,6 +135,25 @@ html, body, [class*="css"] {
 .cell-off { color: var(--text-dim); }
 .cell-request { outline: 1px solid var(--accent2); }
 
+.grade-separator td {
+    background: var(--surface2) !important;
+    color: var(--accent);
+    font-family: var(--mono);
+    font-size: 0.68rem;
+    font-weight: 700;
+    letter-spacing: 0.08em;
+    text-align: left !important;
+    padding: 4px 8px !important;
+    border-top: 2px solid var(--accent) !important;
+    border-bottom: 1px solid var(--border) !important;
+}
+.grade-name-badge {
+    color: var(--text-dim);
+    font-size: 0.62rem;
+    font-weight: 600;
+    margin-left: 0.35rem;
+}
+
 /* Stats table */
 .stats-table { width: 100%; font-family: var(--mono); font-size: 0.8rem; border-collapse: collapse; }
 .stats-table th { color: var(--text-dim); font-size: 0.68rem; letter-spacing: 0.1em; text-align: center; padding: 6px; border-bottom: 1px solid var(--border); }
@@ -250,6 +269,17 @@ def _init_state():
         "shift_requests1": {},    # {(n,d): str (원하는) or ''}
         "rules": {},              # {n: {rule_key: value}}
         "shift_adj": {},          # {n: int}
+        "grade_rules": {          # Global grade/balancing policy; not per-doctor
+            "senior_min_grade": 2,
+            "senior_min_count": 1,
+            "junior_max_grade": 1,
+            "junior_soft_max_count": 1,
+            "junior_penalty_weight": 1,
+            "weight_de_dev": 1,
+            "weight_holiday_dev": 3,
+            "weight_total_dev": 5,
+            "weight_n_dev": 5,
+        },
         "solutions": [],
         "summaries": [],
         "sol_idx": 0,
@@ -279,6 +309,70 @@ DEFAULT_RULES = {
     "rule_max_shifts_per_week": 6,
     "rule_no_3day_consec":      0,
 }
+
+DEFAULT_DOCTOR_GRADE = 2
+DEFAULT_GRADE_RULES = {
+    "senior_min_grade": 2,       # grade >= this is treated as senior
+    "senior_min_count": 1,       # hard: at least this many seniors per duty
+    "junior_max_grade": 1,       # grade <= this is treated as junior
+    "junior_soft_max_count": 1,  # soft: try not to exceed this many juniors per duty
+    "junior_penalty_weight": 1,  # soft penalty weight per excess junior assignment
+    "weight_de_dev": 1,          # objective weight for D/E imbalance
+    "weight_holiday_dev": 3,     # objective weight for holiday imbalance
+    "weight_total_dev": 5,       # objective weight for total-duty imbalance
+    "weight_n_dev": 5,           # objective weight for night-duty imbalance
+}
+GRADE_RULE_LABELS = {
+    "senior_min_grade": "고년차 기준 grade 이상",
+    "senior_min_count": "각 duty별 고년차 최소 인원 (hard)",
+    "junior_max_grade": "저년차 기준 grade 이하",
+    "junior_soft_max_count": "각 duty별 저년차 권장 최대 인원 (soft)",
+    "junior_penalty_weight": "저년차 초과 penalty 가중치",
+    "weight_de_dev": "D/E 편차 가중치",
+    "weight_holiday_dev": "휴일 편차 가중치",
+    "weight_total_dev": "총 근무 편차 가중치",
+    "weight_n_dev": "N 편차 가중치",
+}
+
+def normalize_doctors():
+    """Backfill grade/shift_adj for old config files and current sessions."""
+    for doc in st.session_state.doctors:
+        if "grade" not in doc or pd.isna(doc.get("grade")):
+            doc["grade"] = DEFAULT_DOCTOR_GRADE
+        else:
+            doc["grade"] = int(doc.get("grade", DEFAULT_DOCTOR_GRADE))
+        if "shift_adj" not in doc or pd.isna(doc.get("shift_adj")):
+            doc["shift_adj"] = 0
+        else:
+            doc["shift_adj"] = int(doc.get("shift_adj", 0))
+
+def normalize_grade_rules():
+    """Ensure global GradeRules exist and are integers."""
+    if "grade_rules" not in st.session_state or not isinstance(st.session_state.grade_rules, dict):
+        st.session_state.grade_rules = DEFAULT_GRADE_RULES.copy()
+    for key, default in DEFAULT_GRADE_RULES.items():
+        val = st.session_state.grade_rules.get(key, default)
+        try:
+            st.session_state.grade_rules[key] = int(val)
+        except (TypeError, ValueError):
+            st.session_state.grade_rules[key] = default
+
+def grade_rules_to_df(grade_rules: dict) -> pd.DataFrame:
+    return pd.DataFrame([
+        {"key": key, "value": int(grade_rules.get(key, default)), "description": GRADE_RULE_LABELS.get(key, "")}
+        for key, default in DEFAULT_GRADE_RULES.items()
+    ])
+
+def grade_rules_from_df(df: pd.DataFrame) -> dict:
+    rules = DEFAULT_GRADE_RULES.copy()
+    if df is None or df.empty:
+        return rules
+    if {"key", "value"}.issubset(df.columns):
+        for _, row in df.iterrows():
+            key = str(row.get("key", "")).strip()
+            if key in rules and pd.notna(row.get("value")):
+                rules[key] = int(row.get("value"))
+    return rules
 
 def get_day_label(start: date, idx: int) -> str:
     d = start + timedelta(days=idx)
@@ -313,6 +407,10 @@ def max_avr(x):
 
 CHUNK = 7  # Number of days per chunk for display
 
+# Normalize early so sidebar save/display also works with older sessions.
+normalize_doctors()
+normalize_grade_rules()
+
 
 # ── SIDEBAR ──────────────────────────────────────────────────────────────────
 with st.sidebar:
@@ -341,6 +439,7 @@ with st.sidebar:
                 st.session_state.doctors.append({
                     "name": name,
                     "shift_adj": 0,
+                    "grade": DEFAULT_DOCTOR_GRADE,
                 })
                 st.session_state.rules[n] = DEFAULT_RULES.copy()
                 st.session_state.shift_adj[n] = 0
@@ -365,7 +464,7 @@ with st.sidebar:
             else:
                 # Normal mode
                 col1, col2, col3 = st.columns([3, 1, 1])
-                col1.caption(f"[{i}] {doc['name']}")
+                col1.caption(f"[{i}] {doc['name']} · G{int(doc.get('grade', DEFAULT_DOCTOR_GRADE))}")
                 if col2.button("수정", key=f"edit_{i}"):
                     st.session_state["editing_doctor"] = i
                     st.rerun()
@@ -421,10 +520,13 @@ with st.sidebar:
             if day_idx < len(date_list) and doc_idx < len(doctor_names):
                 shift_grid.iloc[day_idx, doc_idx] = val
 
+        df_grade_rules = grade_rules_to_df(st.session_state.grade_rules)
+
         towrite = BytesIO()
         with pd.ExcelWriter(towrite, engine='openpyxl') as writer:
             pd.DataFrame(st.session_state.doctors).to_excel(writer, sheet_name='Doctors', index=False)
             df_rules.to_excel(writer, sheet_name='Rules')
+            df_grade_rules.to_excel(writer, sheet_name='GradeRules', index=False)
             df_duty.to_excel(writer, sheet_name='DutyRequests')
             shift_grid.to_excel(writer, sheet_name='ShiftRequests')
 
@@ -440,27 +542,41 @@ with st.sidebar:
     uploaded_file = col_load.file_uploader("설정 Excel 불러오기", type="xlsx")
     if uploaded_file is not None and col_load.button("📤 불러오기 적용"):
         try:
-            df_doctors = pd.read_excel(uploaded_file, sheet_name='Doctors')
-            df_rules = pd.read_excel(uploaded_file, sheet_name='Rules', index_col=0)
-            df_duty = pd.read_excel(uploaded_file, sheet_name='DutyRequests', index_col=0)
-            df_shift = pd.read_excel(uploaded_file, sheet_name='ShiftRequests', index_col=0)
+            xls = pd.ExcelFile(uploaded_file)
+            df_doctors = pd.read_excel(xls, sheet_name='Doctors')
+            df_rules = pd.read_excel(xls, sheet_name='Rules', index_col=0)
+            df_duty = pd.read_excel(xls, sheet_name='DutyRequests', index_col=0)
+            df_shift = pd.read_excel(xls, sheet_name='ShiftRequests', index_col=0)
+            df_grade_rules = pd.read_excel(xls, sheet_name='GradeRules') if 'GradeRules' in xls.sheet_names else pd.DataFrame()
 
-            # 1) 의사 정보
-            st.session_state.doctors = df_doctors.to_dict('records')
+            # 1) 의사 정보: 기존 설정 파일에 grade가 없으면 기본 grade로 보정
+            new_doctors = []
+            for _, row in df_doctors.iterrows():
+                name = str(row.get('name', '')).strip()
+                if not name:
+                    continue
+                grade = int(row.get('grade', DEFAULT_DOCTOR_GRADE)) if pd.notna(row.get('grade', None)) else DEFAULT_DOCTOR_GRADE
+                adj = int(row.get('shift_adj', 0)) if pd.notna(row.get('shift_adj', None)) else 0
+                new_doctors.append({"name": name, "shift_adj": adj, "grade": grade})
+            st.session_state.doctors = new_doctors
 
             # 2) Rules: 컬럼명 기반으로 읽어서 RULE_COL_ORDER 키로 매핑
             new_rules = {}
             for i in range(len(df_rules)):
                 row = df_rules.iloc[i]
-                new_rules[i] = {key: int(row[key]) if key in row.index and pd.notna(row[key]) else 0
+                new_rules[i] = {key: int(row[key]) if key in row.index and pd.notna(row[key]) else DEFAULT_RULES.get(key, 0)
                                 for key in RULE_COL_ORDER}
             st.session_state.rules = new_rules
 
             # shift_adj 도 Doctors 시트에서 복원
             st.session_state.shift_adj = {
-                i: int(df_doctors.iloc[i].get('shift_adj', 0))
-                for i in range(len(df_doctors))
+                i: int(st.session_state.doctors[i].get('shift_adj', 0))
+                for i in range(len(st.session_state.doctors))
             }
+
+            # GradeRules: 전체 grade 정책 복원. 없는 옛 설정 파일은 기본값 사용.
+            st.session_state.grade_rules = grade_rules_from_df(df_grade_rules)
+            normalize_grade_rules()
 
             # 3) DutyRequests — 길이만 참조, 시작날짜는 사이드바 기준
             loaded_duty = {i: [int(df_duty.iloc[i]['D']), int(df_duty.iloc[i]['E']), int(df_duty.iloc[i]['N'])]
@@ -483,7 +599,6 @@ with st.sidebar:
         except Exception as e:
             st.error(f"불러오기 실패: {e}")
 
-
     st.divider()
 
     # Schedule generation button
@@ -496,6 +611,9 @@ with st.sidebar:
 
 # ── MAIN AREA ────────────────────────────────────────────────────────────────
 st.markdown('<div class="main-header"><h1>🏥 SHIFT SCHEDULER</h1><p>의료진 근무표 최적화 시스템 · OR-Tools CP-SAT, by DSCHOI </p></div>', unsafe_allow_html=True)
+
+normalize_doctors()
+normalize_grade_rules()
 
 doctors = st.session_state.doctors
 num_days = st.session_state.num_days
@@ -512,7 +630,7 @@ if not st.session_state.day_types or len(st.session_state.day_types) != num_days
 if not st.session_state.duty_requests or len(st.session_state.duty_requests) != st.session_state.num_days:
     st.session_state.duty_requests = {i: [1, 1, 1] for i in range(st.session_state.num_days)}
 
-tab1, tab2, tab3, tab4 = st.tabs(["📅 근무 요청 / 날짜 설정", "📋 Duty 설정", "⚙ 개인 규칙", "📊 결과"])
+tab1, tab2, tab3, tab4 = st.tabs(["📅 근무 요청 / 날짜 설정", "📋 Duty 설정", "⚙ 개인 규칙 / Grade", "📊 결과"])
 
 # ─────────────────────────────────────────────────────────────────────────────
 # TAB 1: Shift requests + Day types
@@ -641,8 +759,73 @@ for ni in range(len(doctors)):
         st.session_state.shift_adj[ni] = 0
 
 with tab3:
-    st.markdown('<div class="section-label">개인별 근무 규칙 설정</div>', unsafe_allow_html=True)
-    st.caption("7명씩 나눠서 표시됩니다. 규칙명 옆으로 의사별 설정을 입력하세요.")
+    st.markdown('<div class="section-label">Grade 정책 설정</div>', unsafe_allow_html=True)
+    st.caption("Grade는 개인 속성이고, 고년차/저년차 기준과 objective 가중치는 전체 스케줄에 적용되는 전역 rule입니다.")
+
+    gr = st.session_state.grade_rules
+    gcol1, gcol2, gcol3, gcol4, gcol5 = st.columns(5)
+    gr["senior_min_grade"] = int(gcol1.number_input(
+        "고년차 기준 grade ≥", min_value=1, max_value=5,
+        value=int(gr.get("senior_min_grade", DEFAULT_GRADE_RULES["senior_min_grade"])),
+        key="grade_senior_min_grade"
+    ))
+    gr["senior_min_count"] = int(gcol2.number_input(
+        "Duty별 고년차 최소", min_value=0, max_value=10,
+        value=int(gr.get("senior_min_count", DEFAULT_GRADE_RULES["senior_min_count"])),
+        key="grade_senior_min_count"
+    ))
+    gr["junior_max_grade"] = int(gcol3.number_input(
+        "저년차 기준 grade ≤", min_value=1, max_value=5,
+        value=int(gr.get("junior_max_grade", DEFAULT_GRADE_RULES["junior_max_grade"])),
+        key="grade_junior_max_grade"
+    ))
+    gr["junior_soft_max_count"] = int(gcol4.number_input(
+        "Duty별 저년차 권장 최대", min_value=0, max_value=10,
+        value=int(gr.get("junior_soft_max_count", DEFAULT_GRADE_RULES["junior_soft_max_count"])),
+        key="grade_junior_soft_max_count"
+    ))
+    gr["junior_penalty_weight"] = int(gcol5.number_input(
+        "저년차 초과 penalty", min_value=0, max_value=100,
+        value=int(gr.get("junior_penalty_weight", DEFAULT_GRADE_RULES["junior_penalty_weight"])),
+        key="grade_junior_penalty_weight"
+    ))
+
+    st.markdown('<div class="section-label">편차 가중치 설정</div>', unsafe_allow_html=True)
+    st.caption("Objective = D/E 편차×가중치 + 휴일 편차×가중치 + 총근무 편차×가중치 + N 편차×가중치 + 저년차 초과×가중치")
+    wcol1, wcol2, wcol3, wcol4 = st.columns(4)
+    gr["weight_de_dev"] = int(wcol1.number_input(
+        "D/E 편차 가중치", min_value=0, max_value=100,
+        value=int(gr.get("weight_de_dev", DEFAULT_GRADE_RULES["weight_de_dev"])),
+        key="weight_de_dev"
+    ))
+    gr["weight_holiday_dev"] = int(wcol2.number_input(
+        "휴일 편차 가중치", min_value=0, max_value=100,
+        value=int(gr.get("weight_holiday_dev", DEFAULT_GRADE_RULES["weight_holiday_dev"])),
+        key="weight_holiday_dev"
+    ))
+    gr["weight_total_dev"] = int(wcol3.number_input(
+        "총 근무 편차 가중치", min_value=0, max_value=100,
+        value=int(gr.get("weight_total_dev", DEFAULT_GRADE_RULES["weight_total_dev"])),
+        key="weight_total_dev"
+    ))
+    gr["weight_n_dev"] = int(wcol4.number_input(
+        "N 편차 가중치", min_value=0, max_value=100,
+        value=int(gr.get("weight_n_dev", DEFAULT_GRADE_RULES["weight_n_dev"])),
+        key="weight_n_dev"
+    ))
+    st.session_state.grade_rules = gr
+    st.markdown(
+        f"<div style='font-size:0.82rem; color:var(--text-dim);'>"
+        f"Hard: 각 duty마다 <b>grade ≥ {gr['senior_min_grade']}</b> 인원이 최소 <b>{gr['senior_min_count']}</b>명 필요합니다. "
+        f"Soft: <b>grade ≤ {gr['junior_max_grade']}</b> 인원이 duty별 <b>{gr['junior_soft_max_count']}</b>명을 초과하면 "
+        f"초과 1건당 <b>{gr['junior_penalty_weight']}</b>점 penalty를 줍니다."
+        f"</div>",
+        unsafe_allow_html=True
+    )
+
+    st.divider()
+    st.markdown('<div class="section-label">개인별 Grade & 근무 규칙 설정</div>', unsafe_allow_html=True)
+    st.caption("7명씩 나눠서 표시됩니다. Grade와 규칙명 옆으로 의사별 설정을 입력하세요.")
 
     doc_names = [d["name"] for d in doctors]
     DOC_CHUNK = 7
@@ -677,16 +860,28 @@ with tab3:
         for ci, name in enumerate(chunk_names):
             header_cols[ci+1].markdown(f"<span style='font-family:var(--mono);font-size:0.78rem;font-weight:600;color:var(--accent)'>{name}</span>", unsafe_allow_html=True)
 
+        # grade
+        grade_cols = st.columns([2] + [1] * chunk_size)
+        grade_cols[0].markdown("<span style='font-size:0.75rem'>Grade</span>", unsafe_allow_html=True)
+        for ci, ni in enumerate(range(chunk_start, chunk_end)):
+            cur_grade = int(doctors[ni].get("grade", DEFAULT_DOCTOR_GRADE))
+            new_grade = grade_cols[ci+1].number_input(
+                f"grade_{ni}", min_value=1, max_value=5,
+                value=cur_grade, label_visibility="collapsed", key=f"doc_grade_{ni}"
+            )
+            doctors[ni]["grade"] = int(new_grade)
+
         # shift_adj
         adj_cols = st.columns([2] + [1] * chunk_size)
         adj_cols[0].markdown("<span style='font-size:0.75rem'>근무 조정값</span>", unsafe_allow_html=True)
         for ci, ni in enumerate(range(chunk_start, chunk_end)):
-            cur = int(st.session_state.shift_adj.get(ni, 0))
+            cur = int(st.session_state.shift_adj.get(ni, doctors[ni].get("shift_adj", 0)))
             new_val = adj_cols[ci+1].number_input(
                 f"adj_{ni}", min_value=-10, max_value=10,
                 value=cur, label_visibility="collapsed", key=f"shift_adj_{ni}"
             )
             st.session_state.shift_adj[ni] = int(new_val)
+            doctors[ni]["shift_adj"] = int(new_val)
 
         # 규칙 rows
         for key, label, rtype, opt1, opt2 in RULE_DEFS:
@@ -741,6 +936,8 @@ if st.session_state.get("trigger_solve"):
                     "shift_requests": {f"{k[0]},{k[1]}": v for k, v in st.session_state.shift_requests.items()},
                     "rules": {str(k): v for k, v in st.session_state.rules.items()},
                     "shift_adj": {str(k): v for k, v in st.session_state.shift_adj.items()},
+                    "grades": {str(i): int(d.get("grade", DEFAULT_DOCTOR_GRADE)) for i, d in enumerate(doctors)},
+                    "grade_rules": {k: int(v) for k, v in st.session_state.grade_rules.items()},
                     "solver_mode": st.session_state.solver_mode,
                     "time_max": st.session_state.time_max,
                     "sol_limit": int(st.session_state.get("sol_limit", 1)),
@@ -776,6 +973,14 @@ with tab4:
         sol = solutions[sol_idx]
         summary = summaries[sol_idx]
 
+        # 화면/Excel 표시 순서: grade 높은 순서로 묶고, 같은 grade 안에서는 기존 입력 순서 유지
+        display_order = sorted(
+            range(len(doctors)),
+            key=lambda ni: (-int(doctors[ni].get("grade", DEFAULT_DOCTOR_GRADE)), ni)
+        )
+        name_to_grade = {doc["name"]: int(doc.get("grade", DEFAULT_DOCTOR_GRADE)) for doc in doctors}
+        name_to_display_order = {doctors[ni]["name"]: order for order, ni in enumerate(display_order)}
+
         # Excel 내보내기용 데이터 준비
         date_cols = []
         for di in range(num_days):
@@ -784,13 +989,24 @@ with tab4:
             date_cols.append(f"{d.strftime('%m/%d')} ({lbl})")
 
         export_rows = []
-        for ni, doc in enumerate(doctors):
-            row = {"Name": doc['name']}
+        for ni in display_order:
+            doc = doctors[ni]
+            row = {"Name": doc['name'], "Grade": int(doc.get("grade", DEFAULT_DOCTOR_GRADE))}
             for di, col in enumerate(date_cols):
                 row[col] = sol.get((ni, di), '').upper() if sol.get((ni, di), '') else ''
             export_rows.append(row)
 
         export_df = pd.DataFrame(export_rows).set_index('Name')
+
+        summary_display = summary.copy()
+        if "Grade" not in summary_display.columns:
+            summary_display.insert(1, "Grade", summary_display["Name"].map(name_to_grade).fillna(DEFAULT_DOCTOR_GRADE).astype(int))
+        summary_display["_display_order"] = summary_display["Name"].map(name_to_display_order).fillna(9999).astype(int)
+        summary_display = (
+            summary_display
+            .sort_values(["Grade", "_display_order"], ascending=[False, True], kind="stable")
+            .drop(columns=["_display_order"])
+        )
 
         # Rules export — RULE_DEFS 순서대로 컬럼 정렬
         RULE_COL_ORDER = [
@@ -812,7 +1028,7 @@ with tab4:
         rules_rows = []
         for ni, doc in enumerate(doctors):
             r = st.session_state.rules.get(ni, {})
-            row = {"이름": doc["name"], "shift_adj": st.session_state.shift_adj.get(ni, 0)}
+            row = {"이름": doc["name"], "grade": int(doc.get("grade", DEFAULT_DOCTOR_GRADE)), "shift_adj": st.session_state.shift_adj.get(ni, 0)}
             for key in RULE_COL_ORDER:
                 row[RULE_COL_LABELS[key]] = r.get(key, "")
             rules_rows.append(row)
@@ -821,8 +1037,9 @@ with tab4:
         towrite = BytesIO()
         with pd.ExcelWriter(towrite, engine='openpyxl') as writer:
             export_df.to_excel(writer, sheet_name='Schedule')
-            summary.to_excel(writer, sheet_name='Summary', index=False)
+            summary_display.to_excel(writer, sheet_name='Summary', index=False)
             rules_df.to_excel(writer, sheet_name='Rules', index=False)
+            grade_rules_to_df(st.session_state.grade_rules).to_excel(writer, sheet_name='GradeRules', index=False)
             if metrics and sol_idx < len(metrics):
                 pd.DataFrame([metrics[sol_idx]]).to_excel(writer, sheet_name='Metrics', index=False)
         towrite.seek(0)
@@ -831,19 +1048,26 @@ with tab4:
         st.markdown('<div class="section-label">근무 통계</div>', unsafe_allow_html=True)
         try:
             st.dataframe(
-                summary.style.background_gradient(subset=['Total'], cmap='Blues')
+                summary_display.style.background_gradient(subset=['Total'], cmap='Blues')
                              .background_gradient(subset=['N'], cmap='Purples')
                              .background_gradient(subset=['Holiday'], cmap='Oranges'),
                 use_container_width=True, hide_index=True
             )
         except ImportError:
-            st.dataframe(summary, use_container_width=True, hide_index=True)
+            st.dataframe(summary_display, use_container_width=True, hide_index=True)
 
         # 편차 정보 (k (DE), k1 (holiday), k2 (N), k3 (total))
         if metrics and sol_idx < len(metrics):
             m = metrics[sol_idx]
             st.markdown(
-                f"<div style='font-size:0.85rem; color:var(--text-dim);'>** 편차*가중치 합={m.get('adv')} | **k (D/E 편차):** {m.get('k')} | **k1 (휴일 편차):** {m.get('k1')} | **k2 (N 편차):** {m.get('k2')} | **k3 (총 근무 편차):** {m.get('k3')}</div>",
+                f"<div style='font-size:0.85rem; color:var(--text-dim);'>"
+                f"** 편차*가중치 합={m.get('adv')} | **balance penalty:** {m.get('balance_penalty', 'NA')} "
+                f"| **k D/E:** {m.get('k')}×{m.get('weight_de_dev', gr.get('weight_de_dev', 1))} "
+                f"| **k1 휴일:** {m.get('k1')}×{m.get('weight_holiday_dev', gr.get('weight_holiday_dev', 3))} "
+                f"| **k2 총근무:** {m.get('k2')}×{m.get('weight_total_dev', gr.get('weight_total_dev', 5))} "
+                f"| **k3 N:** {m.get('k3')}×{m.get('weight_n_dev', gr.get('weight_n_dev', 5))} "
+                f"| **저년차 초과:** {m.get('junior_excess', 0)}×{m.get('junior_penalty_weight', gr.get('junior_penalty_weight', 1))} "
+                f"= **{m.get('junior_penalty', 0)}**</div>",
                 unsafe_allow_html=True
             )
 
@@ -855,7 +1079,7 @@ with tab4:
         holiday_days = [d for d, t in st.session_state.day_types.items() if t in ('토','일','공')]
 
         # Build HTML table
-        header_row = "<tr><th style='text-align:left;white-space:nowrap;padding:2px 6px'>이름</th>"
+        header_row = "<tr><th style='text-align:left;white-space:nowrap;padding:2px 6px'>이름 / Grade</th>"
         for di in range(num_days):
             d = start_date + timedelta(days=di)
             lbl = get_day_label(start_date, di)
@@ -865,8 +1089,22 @@ with tab4:
         header_row += "</tr>"
 
         body_rows = ""
-        for ni, doc in enumerate(doctors):
-            body_rows += f"<tr><td class='name-col'>{doc['name']}</td>"
+        current_grade = None
+        total_cols = num_days + 1
+        for ni in display_order:
+            doc = doctors[ni]
+            grade = int(doc.get("grade", DEFAULT_DOCTOR_GRADE))
+            if grade != current_grade:
+                current_grade = grade
+                body_rows += (
+                    f"<tr class='grade-separator'>"
+                    f"<td colspan='{total_cols}'>Grade {grade}</td>"
+                    f"</tr>"
+                )
+            body_rows += (
+                f"<tr><td class='name-col'>{doc['name']}"
+                f"<span class='grade-name-badge'>G{grade}</span></td>"
+            )
             for di in range(num_days):
                 val = sol.get((ni, di), '')
                 req = st.session_state.shift_requests.get((ni, di), '')

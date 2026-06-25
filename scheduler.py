@@ -62,6 +62,8 @@ def build_and_solve(params: dict[str, Any]):
         shift_requests: dict {"n,d" -> cell_str}
         rules         : dict {str(n) -> {rule_key: value}}
         shift_adj     : dict {str(n) -> int}
+        grades        : dict {str(n) -> int}
+        grade_rules   : dict with senior/junior policy
         solver_mode   : str
         time_max      : int
         sol_limit     : int
@@ -83,6 +85,23 @@ def build_and_solve(params: dict[str, Any]):
     sr_raw       = params["shift_requests"]   # {"n,d": cell_str}
     rules_raw    = {int(k): v for k, v in params["rules"].items()}
     shift_adj    = {int(k): int(v) for k, v in params["shift_adj"].items()}
+    grades       = {int(k): int(v) for k, v in params.get("grades", {}).items()}
+    grade_rules_raw = params.get("grade_rules", {}) or {}
+    default_grade_rules = {
+        "senior_min_grade": 2,
+        "senior_min_count": 1,
+        "junior_max_grade": 1,
+        "junior_soft_max_count": 1,
+        "junior_penalty_weight": 1,
+        "weight_de_dev": 1,
+        "weight_holiday_dev": 3,
+        "weight_total_dev": 5,
+        "weight_n_dev": 5,
+    }
+    grade_rules = {
+        key: int(grade_rules_raw.get(key, default))
+        for key, default in default_grade_rules.items()
+    }
     solver_mode  = params["solver_mode"]
     time_max     = int(params["time_max"])
     sol_limit    = int(params["sol_limit"])
@@ -94,10 +113,42 @@ def build_and_solve(params: dict[str, Any]):
     all_days    = range(num_days)
     all_shifts  = range(num_shifts)
 
+    # Existing/old configs may not have grade values. Default grade 2 keeps legacy schedules feasible.
+    for n in all_doctors:
+        grades.setdefault(n, 2)
+
+    senior_min_grade = grade_rules["senior_min_grade"]
+    senior_min_count = grade_rules["senior_min_count"]
+    junior_max_grade = grade_rules["junior_max_grade"]
+    junior_soft_max_count = grade_rules["junior_soft_max_count"]
+    junior_penalty_weight = grade_rules["junior_penalty_weight"]
+    weight_de_dev = grade_rules["weight_de_dev"]
+    weight_holiday_dev = grade_rules["weight_holiday_dev"]
+    weight_total_dev = grade_rules["weight_total_dev"]
+    weight_n_dev = grade_rules["weight_n_dev"]
+
+    senior_doctors = [n for n in all_doctors if grades.get(n, 2) >= senior_min_grade]
+    junior_doctors = [n for n in all_doctors if grades.get(n, 2) <= junior_max_grade]
+
     day_names_list = [_get_day_label(start_date, d) for d in all_days]
 
     # duty_requests[d][s]
     duty_requests = [[duty_req_raw.get(d, [1,1,1])[s] for s in all_shifts] for d in all_days]
+
+    # Validate senior hard rule before building the full model.
+    if senior_min_count > 0:
+        if len(senior_doctors) < senior_min_count:
+            raise RuntimeError(
+                f"고년차 hard rule 불가능: grade >= {senior_min_grade} 인원이 {len(senior_doctors)}명인데, "
+                f"각 duty마다 최소 {senior_min_count}명이 필요합니다."
+            )
+        for d in all_days:
+            for s in all_shifts:
+                if duty_requests[d][s] > 0 and senior_min_count > duty_requests[d][s]:
+                    raise RuntimeError(
+                        f"고년차 hard rule 불가능: day {d+1}, shift {['D','E','N'][s]} 필요 인원은 "
+                        f"{duty_requests[d][s]}명인데 고년차 최소 {senior_min_count}명으로 설정되어 있습니다."
+                    )
 
     # shift_requests[n][d][s] = 1 if doctor n cannot work shift s on day d
     shift_requests  = [[[0]*3 for _ in all_days] for _ in all_doctors]
@@ -269,6 +320,13 @@ def build_and_solve(params: dict[str, Any]):
         for s in all_shifts:
             model.Add(sum(shifts[(n,d,s)] for n in all_doctors) == duty_requests[d][s])
 
+    # Grade hard rule: each active duty must include enough senior doctors.
+    if senior_min_count > 0:
+        for d in all_days:
+            for s in all_shifts:
+                if duty_requests[d][s] > 0:
+                    model.Add(sum(shifts[(n,d,s)] for n in senior_doctors) >= senior_min_count)
+
     # Cannot-work constraints
     for n in all_doctors:
         for d in all_days:
@@ -282,6 +340,21 @@ def build_and_solve(params: dict[str, Any]):
             for s in all_shifts:
                 if shift_requests1[n][d][s] == 1:
                     model.Add(shifts[(n,d,s)] == 1)
+
+    # Grade soft rule: spread junior doctors. Excess juniors are allowed but penalized.
+    junior_excess_vars = []
+    if junior_penalty_weight > 0 and junior_doctors:
+        for d in all_days:
+            for s in all_shifts:
+                if duty_requests[d][s] <= 0:
+                    continue
+                max_excess = max(0, duty_requests[d][s] - junior_soft_max_count)
+                if max_excess <= 0:
+                    continue
+                junior_count = sum(shifts[(n,d,s)] for n in junior_doctors)
+                excess = model.NewIntVar(0, max_excess, f"junior_excess_{d}_{s}")
+                model.Add(excess >= junior_count - junior_soft_max_count)
+                junior_excess_vars.append(excess)
 
     # ── Soft balancing (deviation minimization) ───────────────────────────────
     k  = model.NewIntVar(0, 6, 'k_DE')
@@ -332,7 +405,15 @@ def build_and_solve(params: dict[str, Any]):
         model.Add(hol_worked <= _max_avr(avr_holiday + adj * hol_rate) + dev_hol[1])
 
     # ── Objective ─────────────────────────────────────────────────────────────
-    adv = k + k1*3 + k2*5 + k3*5
+    junior_excess_total = sum(junior_excess_vars) if junior_excess_vars else 0
+    junior_penalty = junior_excess_total * junior_penalty_weight
+    balance_penalty = (
+        k * weight_de_dev
+        + k1 * weight_holiday_dev
+        + k2 * weight_total_dev
+        + k3 * weight_n_dev
+    )
+    adv = balance_penalty + junior_penalty
     is_multi = "다중" in solver_mode
 
     # In main mode, minimize adv; in multi mode, treat adv as a constraint only.
@@ -370,7 +451,11 @@ def build_and_solve(params: dict[str, Any]):
             tue_n = sum(sol_fn(shifts[(n,d,2)]) for d in all_days if day_names_list[d] == '화')
             fri_n = sum(sol_fn(shifts[(n,d,2)]) for d in all_days if day_names_list[d] == '금')
             rows.append({
-                'Name': names[n], 'D': d_cnt, 'E': e_cnt, 'N': n_cnt,
+                'Name': names[n],
+                'Grade': grades.get(n, 2),
+                'Senior': 'Y' if grades.get(n, 2) >= senior_min_grade else '',
+                'Junior': 'Y' if grades.get(n, 2) <= junior_max_grade else '',
+                'D': d_cnt, 'E': e_cnt, 'N': n_cnt,
                 'Total': tot, 'Holiday': hol,
                 'Tue_N': tue_n, 'Fri_N': fri_n,
                 '주간평균hr': round((d_cnt*8 + e_cnt*9 + n_cnt*8) / num_days * 7, 2),
@@ -378,6 +463,9 @@ def build_and_solve(params: dict[str, Any]):
         return sol, pd.DataFrame(rows)
 
     metrics = []
+
+    def _metric_value(expr_or_int):
+        return int(expr_or_int) if isinstance(expr_or_int, int) else solver.Value(expr_or_int)
 
     status = solver.Solve(model)
     if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE, cp_model.UNKNOWN):
@@ -393,6 +481,18 @@ def build_and_solve(params: dict[str, Any]):
             "k1": solver.Value(k1),
             "k2": solver.Value(k2),
             "k3": solver.Value(k3),
+            "junior_excess": _metric_value(junior_excess_total),
+            "junior_penalty": _metric_value(junior_penalty),
+            "senior_min_grade": senior_min_grade,
+            "senior_min_count": senior_min_count,
+            "junior_max_grade": junior_max_grade,
+            "junior_soft_max_count": junior_soft_max_count,
+            "junior_penalty_weight": junior_penalty_weight,
+            "weight_de_dev": weight_de_dev,
+            "weight_holiday_dev": weight_holiday_dev,
+            "weight_total_dev": weight_total_dev,
+            "weight_n_dev": weight_n_dev,
+            "balance_penalty": solver.Value(balance_penalty),
         })
     else:
         model.Add(adv <= adv_limit)
@@ -413,6 +513,18 @@ def build_and_solve(params: dict[str, Any]):
                     "k1": self.Value(k1),
                     "k2": self.Value(k2),
                     "k3": self.Value(k3),
+                    "junior_excess": self.Value(junior_excess_total) if junior_excess_vars else 0,
+                    "junior_penalty": self.Value(junior_penalty) if junior_excess_vars else 0,
+                    "senior_min_grade": senior_min_grade,
+                    "senior_min_count": senior_min_count,
+                    "junior_max_grade": junior_max_grade,
+                    "junior_soft_max_count": junior_soft_max_count,
+                    "junior_penalty_weight": junior_penalty_weight,
+                    "weight_de_dev": weight_de_dev,
+                    "weight_holiday_dev": weight_holiday_dev,
+                    "weight_total_dev": weight_total_dev,
+                    "weight_n_dev": weight_n_dev,
+                    "balance_penalty": self.Value(balance_penalty),
                 })
                 self._count += 1
                 if self._count >= sol_limit:
