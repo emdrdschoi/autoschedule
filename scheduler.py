@@ -85,6 +85,11 @@ def build_and_solve(params: dict[str, Any]):
     sr_raw       = params["shift_requests"]   # {"n,d": cell_str}
     rules_raw    = {int(k): v for k, v in params["rules"].items()}
     shift_adj    = {int(k): int(v) for k, v in params["shift_adj"].items()}
+    # shift_counts: {n: {"D": -1|int, "E": -1|int, "N": -1|int}}, -1 = auto balance
+    shift_counts_raw = params.get("shift_counts", {})
+    shift_counts = {}
+    for k, v in shift_counts_raw.items():
+        shift_counts[int(k)] = {sk: int(sv) for sk, sv in v.items()}
     grades       = {int(k): int(v) for k, v in params.get("grades", {}).items()}
     grade_rules_raw = params.get("grade_rules", {}) or {}
     default_grade_rules = {
@@ -181,13 +186,39 @@ def build_and_solve(params: dict[str, Any]):
     total_holiday_demand = sum(
         duty_requests[d][s] for d in holiday for s in all_shifts
     )
+
+    s_rate   = [total_s[s] / total_duty if total_duty else 0 for s in all_shifts]
+    hol_rate = total_holiday_demand / total_duty if total_duty else 0
+
+    # ── Shift별 독립 평균 계산 ────────────────────────────────────────────────
+    # D/E/N 각각: fix된 사람 제외 후 나머지 인원 기준으로 평균 계산
+    # Holiday: fix 여부 무관 전체 인원 기준 유지
+    # shift_counts: {n: {"D": -1|int, "E": -1|int, "N": -1|int}}, -1 = free
+
+    def _shift_avr(shift_idx: int, shift_key: str):
+        """fix 안 된 인원 기준으로 해당 shift 평균 계산."""
+        fixed_sum = sum(
+            shift_counts.get(n, {}).get(shift_key, -1)
+            for n in all_doctors
+            if shift_counts.get(n, {}).get(shift_key, -1) >= 0
+        )
+        free_ns = [
+            n for n in all_doctors
+            if shift_counts.get(n, {}).get(shift_key, -1) < 0
+        ]
+        if not free_ns:
+            return 0.0, []
+        free_adj = sum(shift_adj.get(n, 0) for n in free_ns)
+        avr = (total_s[shift_idx] - fixed_sum - free_adj * s_rate[shift_idx]) / len(free_ns)
+        return avr, free_ns
+
+    avr_d, free_d_doctors = _shift_avr(0, "D")
+    avr_e, free_e_doctors = _shift_avr(1, "E")
+    avr_n, free_n_doctors = _shift_avr(2, "N")
+
+    # Total 평균: 세 shift 평균 합 (인원별로 자기가 free인 shift 평균의 합)
+    # Holiday 평균: 전체 인원 기준 유지
     adj_sum = sum(shift_adj.get(n, 0) for n in all_doctors)
-
-    s_rate     = [total_s[s] / total_duty if total_duty else 0 for s in all_shifts]
-    hol_rate   = total_holiday_demand / total_duty if total_duty else 0
-
-    avr_duty    = (total_duty - adj_sum) / num_doctors
-    avr_s       = [(total_s[s] - adj_sum * s_rate[s]) / num_doctors for s in all_shifts]
     avr_holiday = (total_holiday_demand - adj_sum * hol_rate) / num_doctors
 
     # ── Build model ───────────────────────────────────────────────────────────
@@ -373,16 +404,26 @@ def build_and_solve(params: dict[str, Any]):
     k3 = model.NewIntVar(0, 6, 'k3_N')
 
     for n in all_doctors:
-        adj = shift_adj.get(n, 0)
+        adj     = shift_adj.get(n, 0)
+        sc      = shift_counts.get(n, {})
+        fixed_d = sc.get("D", -1)
+        fixed_e = sc.get("E", -1)
+        fixed_n = sc.get("N", -1)
+        is_fully_fixed = (fixed_d >= 0 and fixed_e >= 0 and fixed_n >= 0)
 
         num_s = [sum(shifts[(n,d,s)] for d in all_days) for s in all_shifts]
         num_total = sum(num_s)
         hol_worked = sum(shifts[(n,d,s)] for d in holiday for s in all_shifts)
 
-        dev_de   = [model.NewIntVar(0, 6, f'dde_{n}_{x}') for x in range(2)]
-        dev_hol  = [model.NewIntVar(0, 6, f'dhol_{n}_{x}') for x in range(2)]
-        dev_tot  = [model.NewIntVar(0, 6, f'dtot_{n}_{x}') for x in range(2)]
-        dev_N    = [model.NewIntVar(0, 6, f'dN_{n}_{x}') for x in range(2)]
+        # ── 고정 개수 hard constraint ─────────────────────────────────────────
+        if fixed_d >= 0: model.Add(num_s[0] == fixed_d)
+        if fixed_e >= 0: model.Add(num_s[1] == fixed_e)
+        if fixed_n >= 0: model.Add(num_s[2] == fixed_n)
+
+        dev_de  = [model.NewIntVar(0, 6, f'dde_{n}_{x}') for x in range(2)]
+        dev_hol = [model.NewIntVar(0, 6, f'dhol_{n}_{x}') for x in range(2)]
+        dev_tot = [model.NewIntVar(0, 6, f'dtot_{n}_{x}') for x in range(2)]
+        dev_N   = [model.NewIntVar(0, 6, f'dN_{n}_{x}') for x in range(2)]
 
         sum_de  = model.NewIntVar(0, 12, f'sde_{n}')
         sum_hol = model.NewIntVar(0, 12, f'shol_{n}')
@@ -394,25 +435,46 @@ def build_and_solve(params: dict[str, Any]):
         model.Add(sum_tot == dev_tot[0] + dev_tot[1]); model.Add(sum_tot <= k2)
         model.Add(sum_N   == dev_N[0]   + dev_N[1]);   model.Add(sum_N   <= k3)
 
-        # total
-        model.Add(int(avr_duty + adj) - dev_tot[0] <= num_total)
-        model.Add(num_total <= _max_avr(avr_duty + adj) + dev_tot[1])
+        if is_fully_fixed:
+            # 전체 fix → deviation 전부 0, 평준화 제외 (holiday만 유지)
+            for dv in [dev_de, dev_tot, dev_N]:
+                model.Add(dv[0] == 0); model.Add(dv[1] == 0)
+            # holiday는 fix 여부 무관 전체 인원 기준
+            model.Add(int(avr_holiday + adj * hol_rate) - dev_hol[0] <= hol_worked)
+            model.Add(hol_worked <= _max_avr(avr_holiday + adj * hol_rate) + dev_hol[1])
+        else:
+            # D — 각 shift별 독립 평균 (avr_d/avr_e/avr_n)
+            if fixed_d >= 0:
+                model.Add(dev_de[0] == 0); model.Add(dev_de[1] == 0)
+            else:
+                model.Add(int(avr_d + adj * s_rate[0]) - dev_de[0] <= num_s[0])
+                model.Add(num_s[0] <= _max_avr(avr_d + adj * s_rate[0]) + dev_de[1])
 
-        # D
-        model.Add(int(avr_s[0] + adj * s_rate[0]) - dev_de[0] <= num_s[0])
-        model.Add(num_s[0] <= _max_avr(avr_s[0] + adj * s_rate[0]) + dev_de[1])
+            # E (dev_de 공유)
+            if fixed_e < 0:
+                model.Add(int(avr_e + adj * s_rate[1]) - dev_de[0] <= num_s[1])
+                model.Add(num_s[1] <= _max_avr(avr_e + adj * s_rate[1]) + dev_de[1])
 
-        # E
-        model.Add(int(avr_s[1] + adj * s_rate[1]) - dev_de[0] <= num_s[1])
-        model.Add(num_s[1] <= _max_avr(avr_s[1] + adj * s_rate[1]) + dev_de[1])
+            # N
+            if fixed_n >= 0:
+                model.Add(dev_N[0] == 0); model.Add(dev_N[1] == 0)
+            else:
+                model.Add(int(avr_n + adj * s_rate[2]) - dev_N[0] <= num_s[2])
+                model.Add(num_s[2] <= _max_avr(avr_n + adj * s_rate[2]) + dev_N[1])
 
-        # N
-        model.Add(int(avr_s[2] + adj * s_rate[2]) - dev_N[0] <= num_s[2])
-        model.Add(num_s[2] <= _max_avr(avr_s[2] + adj * s_rate[2]) + dev_N[1])
+            # Total — 이 사람의 free/fix shift 평균 합
+            avr_total_n = (
+                (avr_d if fixed_d < 0 else fixed_d) +
+                (avr_e if fixed_e < 0 else fixed_e) +
+                (avr_n if fixed_n < 0 else fixed_n)
+            )
+            model.Add(int(avr_total_n + adj) - dev_tot[0] <= num_total)
+            model.Add(num_total <= _max_avr(avr_total_n + adj) + dev_tot[1])
 
-        # Holiday
-        model.Add(int(avr_holiday + adj * hol_rate) - dev_hol[0] <= hol_worked)
-        model.Add(hol_worked <= _max_avr(avr_holiday + adj * hol_rate) + dev_hol[1])
+            # Holiday — fix 무관 전체 인원 기준
+            model.Add(int(avr_holiday + adj * hol_rate) - dev_hol[0] <= hol_worked)
+            model.Add(hol_worked <= _max_avr(avr_holiday + adj * hol_rate) + dev_hol[1])
+
 
     # ── Objective ─────────────────────────────────────────────────────────────
     junior_excess_total = sum(junior_excess_vars) if junior_excess_vars else 0
@@ -426,9 +488,10 @@ def build_and_solve(params: dict[str, Any]):
     adv = balance_penalty + junior_penalty
     is_multi = "다중" in solver_mode
 
-    # In main mode, minimize adv; in multi mode, treat adv as a constraint only.
-    if not is_multi:
-        model.Minimize(adv)
+    # Always solve once with objective minimization first.
+    # In multi mode, this first pass finds the best objective value, then we enumerate
+    # solutions with adv <= best_adv + adv_limit.
+    model.Minimize(adv)
 
     # ── Solve ─────────────────────────────────────────────────────────────────
     solver = cp_model.CpSolver()
@@ -474,25 +537,22 @@ def build_and_solve(params: dict[str, Any]):
 
     metrics = []
 
-    def _metric_value(expr_or_int):
-        return int(expr_or_int) if isinstance(expr_or_int, int) else solver.Value(expr_or_int)
-
     status = solver.Solve(model)
-    if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE, cp_model.UNKNOWN):
+    if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
         raise RuntimeError("최적해가 없습니다.")
 
-    if not is_multi:
-        sol, summ = _extract(solver.Value)
-        solutions.append(sol)
-        summaries.append(summ)
-        metrics.append({
-            "adv": solver.Value(adv),
-            "k": solver.Value(k),
-            "k1": solver.Value(k1),
-            "k2": solver.Value(k2),
-            "k3": solver.Value(k3),
-            "junior_excess": _metric_value(junior_excess_total),
-            "junior_penalty": _metric_value(junior_penalty),
+    best_adv = solver.Value(adv)
+    allowed_adv = best_adv + adv_limit if is_multi else best_adv
+
+    def _metric_dict(value_fn):
+        return {
+            "adv": value_fn(adv),
+            "k": value_fn(k),
+            "k1": value_fn(k1),
+            "k2": value_fn(k2),
+            "k3": value_fn(k3),
+            "junior_excess": value_fn(junior_excess_total) if junior_excess_vars else 0,
+            "junior_penalty": value_fn(junior_penalty) if junior_excess_vars else 0,
             "senior_min_grade": senior_min_grade,
             "senior_min_count": senior_min_count,
             "junior_max_grade": junior_max_grade,
@@ -502,10 +562,28 @@ def build_and_solve(params: dict[str, Any]):
             "weight_holiday_dev": weight_holiday_dev,
             "weight_total_dev": weight_total_dev,
             "weight_n_dev": weight_n_dev,
-            "balance_penalty": solver.Value(balance_penalty),
-        })
+            "balance_penalty": value_fn(balance_penalty),
+            "best_adv": best_adv,
+            "allowed_adv": allowed_adv,
+            "adv_extra_allowed": adv_limit if is_multi else 0,
+            "optimization_status": solver.StatusName(status),
+        }
+
+    if not is_multi:
+        sol, summ = _extract(solver.Value)
+        solutions.append(sol)
+        summaries.append(summ)
+        metrics.append(_metric_dict(solver.Value))
     else:
-        model.Add(adv <= adv_limit)
+        # 2-stage multi-solution search:
+        #   step 1: minimize adv and record best_adv
+        #   step 2: enumerate schedules with adv <= best_adv + adv_limit
+        model.Add(adv <= allowed_adv)
+        try:
+            model.ClearObjective()
+        except AttributeError:
+            pass
+
         solver.parameters.enumerate_all_solutions = True
 
         class _CB(cp_model.CpSolverSolutionCallback):
@@ -517,25 +595,7 @@ def build_and_solve(params: dict[str, Any]):
                 sol, summ = _extract(self.Value)
                 solutions.append(sol)
                 summaries.append(summ)
-                metrics.append({
-                    "adv": self.Value(adv),
-                    "k": self.Value(k),
-                    "k1": self.Value(k1),
-                    "k2": self.Value(k2),
-                    "k3": self.Value(k3),
-                    "junior_excess": self.Value(junior_excess_total) if junior_excess_vars else 0,
-                    "junior_penalty": self.Value(junior_penalty) if junior_excess_vars else 0,
-                    "senior_min_grade": senior_min_grade,
-                    "senior_min_count": senior_min_count,
-                    "junior_max_grade": junior_max_grade,
-                    "junior_soft_max_count": junior_soft_max_count,
-                    "junior_penalty_weight": junior_penalty_weight,
-                    "weight_de_dev": weight_de_dev,
-                    "weight_holiday_dev": weight_holiday_dev,
-                    "weight_total_dev": weight_total_dev,
-                    "weight_n_dev": weight_n_dev,
-                    "balance_penalty": self.Value(balance_penalty),
-                })
+                metrics.append(_metric_dict(self.Value))
                 self._count += 1
                 if self._count >= sol_limit:
                     self.StopSearch()
@@ -544,6 +604,9 @@ def build_and_solve(params: dict[str, Any]):
         solver.Solve(model, cb)
 
         if not solutions:
-            raise RuntimeError("조건을 만족하는 솔루션이 없습니다. adv_limit 또는 규칙을 완화해 보세요.")
+            raise RuntimeError(
+                f"조건을 만족하는 다중 솔루션이 없습니다. 최적 편차={best_adv}, "
+                f"허용 상한={allowed_adv}입니다. 추가 허용 편차 또는 탐색 시간을 늘려 보세요."
+            )
 
     return solutions, summaries, metrics

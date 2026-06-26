@@ -2,6 +2,7 @@ import streamlit as st
 import pandas as pd
 from datetime import datetime, date, timedelta
 from io import BytesIO
+from pathlib import Path
 import calendar
 import json
     
@@ -269,6 +270,7 @@ def _init_state():
         "shift_requests1": {},    # {(n,d): str (원하는) or ''}
         "rules": {},              # {n: {rule_key: value}}
         "shift_adj": {},          # {n: int}
+        "shift_counts": {},       # {n: {"D": None|int, "E": None|int, "N": None|int}}
         "grade_rules": {          # Global grade/balancing policy; not per-doctor
             "senior_min_grade": 2,
             "senior_min_count": 1,
@@ -373,6 +375,24 @@ def grade_rules_from_df(df: pd.DataFrame) -> dict:
             if key in rules and pd.notna(row.get("value")):
                 rules[key] = int(row.get("value"))
     return rules
+
+
+def read_readme_text() -> str:
+    """Load README.md from the same directory as app.py for the in-app guide."""
+    readme_path = Path(__file__).with_name("README.md")
+    try:
+        return readme_path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return "README.md 파일을 app.py와 같은 폴더에 두면 이곳에 사용 설명서가 표시됩니다."
+    except Exception as exc:
+        return f"README.md를 읽는 중 오류가 발생했습니다: {exc}"
+
+
+def render_readme_guide(expanded: bool = False):
+    """Render the user guide near the top of the Streamlit app."""
+    st.markdown('<div class="section-label">📘 사용 가이드</div>', unsafe_allow_html=True)
+    with st.expander("처음 사용하는 경우: 전체 사용법 / README 보기", expanded=expanded):
+        st.markdown(read_readme_text())
 
 
 def build_schedule_excel_bytes(
@@ -549,8 +569,8 @@ with st.sidebar:
     solver_mode = st.selectbox("모드", ["최적해 1개 (main)", "다중 솔루션 탐색 (main_alt)"], key="solver_mode")
     time_max = st.slider("최대 탐색 시간 (초)", 10, 300, 60, key="time_max")
     if solver_mode.startswith("다중"):
-        sol_limit = st.number_input("최대 솔루션 수", 1, 20, 5, key="sol_limit")
-        adv_limit = st.number_input("최소 편차에 추가 허용 편차", 0, 20, 0, key="adv_limit")
+        sol_limit = st.number_input("최대 솔루션 수", 1, 100, 5, key="sol_limit")
+        adv_limit = st.number_input("최소 편차에 추가 허용 편차", 0, 100, 0, key="adv_limit")
         st.markdown("*여기를 늘리면 최저 편차(최적값)보다 조금 더 높은 편차도 포함하여 더 많은 해를 탐색합니다.*")
     else:
         sol_limit = 1
@@ -574,11 +594,15 @@ with st.sidebar:
         num_days = len(st.session_state.duty_requests)
         date_list = [(start_date + timedelta(days=i)).strftime('%Y-%m-%d') for i in range(num_days)]
 
-        # Rules: RULE_COL_ORDER 순서로 컬럼 정렬
+        # Rules: RULE_COL_ORDER 순서 + D/E/N 고정 개수
         rules_rows = []
         for ni in range(len(doctor_names)):
-            r = st.session_state.rules.get(ni, {})
+            r  = st.session_state.rules.get(ni, {})
+            sc = st.session_state.shift_counts.get(ni, {"D": -1, "E": -1, "N": -1})
             row = {key: r.get(key, '') for key in RULE_COL_ORDER}
+            row["fixed_D"] = sc.get("D", -1)
+            row["fixed_E"] = sc.get("E", -1)
+            row["fixed_N"] = sc.get("N", -1)
             rules_rows.append(row)
         df_rules = pd.DataFrame(rules_rows, index=doctor_names)
         df_rules.index.name = 'Name'
@@ -634,13 +658,20 @@ with st.sidebar:
                 new_doctors.append({"name": name, "shift_adj": adj, "grade": grade})
             st.session_state.doctors = new_doctors
 
-            # 2) Rules: 컬럼명 기반으로 읽어서 RULE_COL_ORDER 키로 매핑
+            # 2) Rules + shift_counts: 컬럼명 기반으로 읽어서 RULE_COL_ORDER 키로 매핑
             new_rules = {}
+            new_shift_counts = {}
             for i in range(len(df_rules)):
                 row = df_rules.iloc[i]
                 new_rules[i] = {key: int(row[key]) if key in row.index and pd.notna(row[key]) else DEFAULT_RULES.get(key, 0)
                                 for key in RULE_COL_ORDER}
+                new_shift_counts[i] = {
+                    "D": int(row["fixed_D"]) if "fixed_D" in row.index and pd.notna(row["fixed_D"]) else -1,
+                    "E": int(row["fixed_E"]) if "fixed_E" in row.index and pd.notna(row["fixed_E"]) else -1,
+                    "N": int(row["fixed_N"]) if "fixed_N" in row.index and pd.notna(row["fixed_N"]) else -1,
+                }
             st.session_state.rules = new_rules
+            st.session_state.shift_counts = new_shift_counts
 
             # shift_adj 도 Doctors 시트에서 복원
             st.session_state.shift_adj = {
@@ -700,6 +731,8 @@ normalize_grade_rules()
 doctors = st.session_state.doctors
 num_days = st.session_state.num_days
 start_date = st.session_state.start_date
+
+render_readme_guide(expanded=(not bool(doctors)))
 
 if not doctors:
     st.info("← 왼쪽 사이드바에서 의사를 추가해 주세요.")
@@ -965,6 +998,25 @@ with tab3:
             st.session_state.shift_adj[ni] = int(new_val)
             doctors[ni]["shift_adj"] = int(new_val)
 
+        # D/E/N 고정 개수 (-1 = 평준화)
+        st.markdown(
+            "<span style='font-family:var(--mono);font-size:0.68rem;color:var(--text-dim)'>"
+            "▸ D/E/N 고정 개수 (-1 = 자동 평준화)</span>",
+            unsafe_allow_html=True
+        )
+        for shift_key, shift_label in [("D", "D 고정"), ("E", "E 고정"), ("N", "N 고정")]:
+            sc_cols = st.columns([2] + [1] * chunk_size)
+            sc_cols[0].markdown(f"<span style='font-size:0.75rem'>{shift_label}</span>", unsafe_allow_html=True)
+            for ci, ni in enumerate(range(chunk_start, chunk_end)):
+                if ni not in st.session_state.shift_counts:
+                    st.session_state.shift_counts[ni] = {"D": -1, "E": -1, "N": -1}
+                cur = int(st.session_state.shift_counts[ni].get(shift_key, -1))
+                new_val = sc_cols[ci+1].number_input(
+                    f"sc_{shift_key}_{ni}", min_value=-1, max_value=60,
+                    value=cur, label_visibility="collapsed", key=f"sc_{shift_key}_{ni}"
+                )
+                st.session_state.shift_counts[ni][shift_key] = int(new_val)
+
         # 규칙 rows
         for key, label, rtype, opt1, opt2 in RULE_DEFS:
             row_cols = st.columns([2] + [1] * chunk_size)
@@ -1018,6 +1070,7 @@ if st.session_state.get("trigger_solve"):
                     "shift_requests": {f"{k[0]},{k[1]}": v for k, v in st.session_state.shift_requests.items()},
                     "rules": {str(k): v for k, v in st.session_state.rules.items()},
                     "shift_adj": {str(k): v for k, v in st.session_state.shift_adj.items()},
+                    "shift_counts": {str(k): v for k, v in st.session_state.shift_counts.items()},
                     "grades": {str(i): int(d.get("grade", DEFAULT_DOCTOR_GRADE)) for i, d in enumerate(doctors)},
                     "grade_rules": {k: int(v) for k, v in st.session_state.grade_rules.items()},
                     "solver_mode": st.session_state.solver_mode,
@@ -1093,7 +1146,10 @@ with tab4:
             m = metrics[sol_idx]
             st.markdown(
                 f"<div style='font-size:0.85rem; color:var(--text-dim);'>"
-                f"** 편차*가중치 합={m.get('adv')} | **balance penalty:** {m.get('balance_penalty', 'NA')} "
+                f"** 편차*가중치 합={m.get('adv')} "
+                f"| **최적 편차:** {m.get('best_adv', m.get('adv'))} "
+                f"| **허용 상한:** {m.get('allowed_adv', m.get('adv'))} "
+                f"| **balance penalty:** {m.get('balance_penalty', 'NA')} "
                 f"| **k D/E:** {m.get('k')}×{m.get('weight_de_dev', gr.get('weight_de_dev', 1))} "
                 f"| **k1 휴일:** {m.get('k1')}×{m.get('weight_holiday_dev', gr.get('weight_holiday_dev', 3))} "
                 f"| **k2 총근무:** {m.get('k2')}×{m.get('weight_total_dev', gr.get('weight_total_dev', 5))} "
