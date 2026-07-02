@@ -102,6 +102,7 @@ def build_and_solve(params: dict[str, Any]):
         "weight_holiday_dev": 3,
         "weight_total_dev": 5,
         "weight_n_dev": 5,
+        "weight_grade_dev": 3,   # duty별 grade 평균 편차 가중치
     }
     grade_rules = {
         key: int(grade_rules_raw.get(key, default))
@@ -127,10 +128,11 @@ def build_and_solve(params: dict[str, Any]):
     junior_max_grade = grade_rules["junior_max_grade"]
     junior_soft_max_count = grade_rules["junior_soft_max_count"]
     junior_penalty_weight = grade_rules["junior_penalty_weight"]
-    weight_de_dev = grade_rules["weight_de_dev"]
+    weight_de_dev      = grade_rules["weight_de_dev"]
     weight_holiday_dev = grade_rules["weight_holiday_dev"]
-    weight_total_dev = grade_rules["weight_total_dev"]
-    weight_n_dev = grade_rules["weight_n_dev"]
+    weight_total_dev   = grade_rules["weight_total_dev"]
+    weight_n_dev       = grade_rules["weight_n_dev"]
+    weight_grade_dev   = grade_rules["weight_grade_dev"]
 
     senior_doctors = [n for n in all_doctors if grades.get(n, 2) >= senior_min_grade]
     junior_doctors = [n for n in all_doctors if grades.get(n, 2) <= junior_max_grade]
@@ -397,6 +399,69 @@ def build_and_solve(params: dict[str, Any]):
                 model.Add(excess >= junior_count - junior_soft_max_count)
                 junior_excess_vars.append(excess)
 
+    # ── Grade 평균 편차 (duty별) ─────────────────────────────────────────────
+    # 기존 D/E/N 편차와 동일한 방식:
+    # "각 duty의 grade 평균이 전체 평균에서 최대 k4만큼 벗어날 수 있다"
+    #
+    # 10배 스케일로 정수화 (k4=5 → 실제 편차 0.5)
+    # grade_avg(d,s) × 10 = grade_sum(d,s) × 10 / r
+    # 전체 평균 × 10 = total_grade × 10 / num_doctors (정수 근사)
+    # CP-SAT: 양변에 r × num_doctors 곱해서 정수 비교
+    # grade_sum × num_doctors × 10  vs  total_grade × r × 10
+    # → grade_sum × num_doctors  vs  total_grade × r  (10 약분)
+    # 편차 upper bound: grade_sum × num_doctors ≤ total_grade × r + k4 × r
+    # 편차 lower bound: grade_sum × num_doctors ≥ total_grade × r - k4 × r
+    # 즉 k4 단위 = num_doctors × 1/10 grade (10배 스케일)
+
+    # 더 직관적으로: 양변을 num_doctors로 나누면
+    # grade_sum / r ≤ total_grade/num_doctors + k4/10
+    # k4=5 이면 평균 grade에서 ±0.5 허용
+
+    max_grade   = max(grades.get(n, 2) for n in all_doctors) if num_doctors > 0 else 3
+    total_grade = sum(grades.get(n, 2) for n in all_doctors)
+    # 10배 스케일 전체 평균 (정수 근사)
+    avr_grade_10 = (total_grade * 10) // num_doctors if num_doctors > 0 else 20
+
+    # k4 범위: 최대 ±max_grade (10배 스케일이므로 ×10)
+    k4 = model.NewIntVar(0, max_grade * 10, 'k4_grade_dev')
+
+    if weight_grade_dev > 0 and num_doctors > 0:
+        for d in all_days:
+            for s in all_shifts:
+                r = duty_requests[d][s]
+                if r <= 0:
+                    continue
+
+                # grade_sum × 10 / r 가 avr_grade_10 ± k4 이내
+                # CP-SAT: 양변 × r → grade_sum × 10 이 avr_grade_10×r ± k4×r 이내
+                grade_sum_10 = sum(shifts[(n,d,s)] * grades.get(n, 2) * 10 for n in all_doctors)
+
+                # avr_grade_10 × r - k4 × r ≤ grade_sum_10 ≤ avr_grade_10 × r + k4 × r
+                # → grade_sum_10 ≤ (avr_grade_10 + k4) × r
+                # → grade_sum_10 ≥ (avr_grade_10 - k4) × r
+                #
+                # CP-SAT AddBoolOr 방식 대신 직접 부등식:
+                # 단, k4가 변수이므로 선형 표현 필요
+                # grade_sum_10 - avr_grade_10 * r ≤ k4 * r
+                # avr_grade_10 * r - grade_sum_10 ≤ k4 * r
+
+                max_gs10 = max_grade * 10 * r
+                gs10_var = model.NewIntVar(0, max_gs10, f"gs10_{d}_{s}")
+                model.Add(gs10_var == grade_sum_10)
+
+                dev_up = model.NewIntVar(0, max_gs10, f"gup_{d}_{s}")
+                dev_dn = model.NewIntVar(0, max_gs10, f"gdn_{d}_{s}")
+                model.Add(dev_up - dev_dn == gs10_var - avr_grade_10 * r)
+
+                # k4 × r ≥ dev_up  and  k4 × r ≥ dev_dn
+                # → k4 이 "grade 평균 편차의 최대값 (×10 스케일)"
+                # r로 나눠야 하지만 CP-SAT 정수 → r 곱한 채로 k4에 반영
+                # 대신 k4를 r배 스케일로 정의하지 않고,
+                # 편차를 r로 나눈 값이 k4 이하가 되도록:
+                # dev_up ≤ k4 × r  (즉 dev_up/r ≤ k4)
+                model.Add(dev_up <= k4 * r)
+                model.Add(dev_dn <= k4 * r)
+
     # ── Soft balancing (deviation minimization) ───────────────────────────────
     k  = model.NewIntVar(0, 6, 'k_DE')
     k1 = model.NewIntVar(0, 6, 'k1_holiday')
@@ -480,10 +545,11 @@ def build_and_solve(params: dict[str, Any]):
     junior_excess_total = sum(junior_excess_vars) if junior_excess_vars else 0
     junior_penalty = junior_excess_total * junior_penalty_weight
     balance_penalty = (
-        k * weight_de_dev
+        k  * weight_de_dev
         + k1 * weight_holiday_dev
         + k2 * weight_total_dev
         + k3 * weight_n_dev
+        + k4 * weight_grade_dev
     )
     adv = balance_penalty + junior_penalty
     is_multi = "다중" in solver_mode
@@ -551,6 +617,7 @@ def build_and_solve(params: dict[str, Any]):
             "k1": value_fn(k1),
             "k2": value_fn(k2),
             "k3": value_fn(k3),
+            "k4": value_fn(k4),
             "junior_excess": value_fn(junior_excess_total) if junior_excess_vars else 0,
             "junior_penalty": value_fn(junior_penalty) if junior_excess_vars else 0,
             "senior_min_grade": senior_min_grade,
@@ -562,6 +629,7 @@ def build_and_solve(params: dict[str, Any]):
             "weight_holiday_dev": weight_holiday_dev,
             "weight_total_dev": weight_total_dev,
             "weight_n_dev": weight_n_dev,
+            "weight_grade_dev": weight_grade_dev,
             "balance_penalty": value_fn(balance_penalty),
             "best_adv": best_adv,
             "allowed_adv": allowed_adv,

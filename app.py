@@ -281,6 +281,7 @@ def _init_state():
             "weight_holiday_dev": 3,
             "weight_total_dev": 5,
             "weight_n_dev": 5,
+            "weight_grade_dev": 3,
         },
         "solutions": [],
         "summaries": [],
@@ -323,6 +324,7 @@ DEFAULT_GRADE_RULES = {
     "weight_holiday_dev": 3,     # objective weight for holiday imbalance
     "weight_total_dev": 5,       # objective weight for total-duty imbalance
     "weight_n_dev": 5,           # objective weight for night-duty imbalance
+    "weight_grade_dev": 3,       # objective weight for grade imbalance per duty
 }
 GRADE_RULE_LABELS = {
     "senior_min_grade": "고년차 기준 grade 이상",
@@ -637,80 +639,81 @@ with st.sidebar:
         )
 
     # 2. [불러오기] Excel 가져오기
-    uploaded_file = col_load.file_uploader("설정 Excel 불러오기", type="xlsx")
-    if uploaded_file is not None and col_load.button("📤 불러오기 적용"):
-        try:
-            xls = pd.ExcelFile(uploaded_file)
-            df_doctors = pd.read_excel(xls, sheet_name='Doctors')
-            df_rules = pd.read_excel(xls, sheet_name='Rules', index_col=0)
-            df_duty = pd.read_excel(xls, sheet_name='DutyRequests', index_col=0)
-            df_shift = pd.read_excel(xls, sheet_name='ShiftRequests', index_col=0)
-            df_grade_rules = pd.read_excel(xls, sheet_name='GradeRules') if 'GradeRules' in xls.sheet_names else pd.DataFrame()
+    # 2. [불러오기] Excel 가져오기
+    uploaded_file = st.file_uploader("설정 Excel 불러오기", type="xlsx", key="upload_xlsx")
+    if uploaded_file is not None:
+        if st.button("📤 불러오기 적용", use_container_width=True, key="btn_load_config"):
+            try:
+                xls = pd.ExcelFile(uploaded_file)
+                df_doctors = pd.read_excel(xls, sheet_name='Doctors')
+                df_rules = pd.read_excel(xls, sheet_name='Rules', index_col=0)
+                df_duty = pd.read_excel(xls, sheet_name='DutyRequests', index_col=0)
+                df_shift = pd.read_excel(xls, sheet_name='ShiftRequests', index_col=0)
+                df_grade_rules = pd.read_excel(xls, sheet_name='GradeRules') if 'GradeRules' in xls.sheet_names else pd.DataFrame()
 
-            # 1) 의사 정보: 기존 설정 파일에 grade가 없으면 기본 grade로 보정
-            new_doctors = []
-            for _, row in df_doctors.iterrows():
-                name = str(row.get('name', '')).strip()
-                if not name:
-                    continue
-                grade = int(row.get('grade', DEFAULT_DOCTOR_GRADE)) if pd.notna(row.get('grade', None)) else DEFAULT_DOCTOR_GRADE
-                adj = int(row.get('shift_adj', 0)) if pd.notna(row.get('shift_adj', None)) else 0
-                new_doctors.append({"name": name, "shift_adj": adj, "grade": grade})
-            st.session_state.doctors = new_doctors
+                # 1) 의사 정보: grade 포함해서 읽기 (없으면 기본값)
+                new_doctors = []
+                for _, row in df_doctors.iterrows():
+                    name = str(row.get('name', '')).strip()
+                    if not name:
+                        continue
+                    grade = int(row['grade']) if 'grade' in row and pd.notna(row.get('grade')) else DEFAULT_DOCTOR_GRADE
+                    adj = int(row['shift_adj']) if 'shift_adj' in row and pd.notna(row.get('shift_adj')) else 0
+                    new_doctors.append({"name": name, "shift_adj": adj, "grade": grade})
+                st.session_state.doctors = new_doctors
 
-            # 2) Rules + shift_counts: 컬럼명 기반으로 읽어서 RULE_COL_ORDER 키로 매핑
-            new_rules = {}
-            new_shift_counts = {}
-            for i in range(len(df_rules)):
-                row = df_rules.iloc[i]
-                new_rules[i] = {key: int(row[key]) if key in row.index and pd.notna(row[key]) else DEFAULT_RULES.get(key, 0)
-                                for key in RULE_COL_ORDER}
-                new_shift_counts[i] = {
-                    "D": int(row["fixed_D"]) if "fixed_D" in row.index and pd.notna(row["fixed_D"]) else -1,
-                    "E": int(row["fixed_E"]) if "fixed_E" in row.index and pd.notna(row["fixed_E"]) else -1,
-                    "N": int(row["fixed_N"]) if "fixed_N" in row.index and pd.notna(row["fixed_N"]) else -1,
+                # 2) Rules + shift_counts
+                new_rules = {}
+                new_shift_counts = {}
+                for i in range(len(df_rules)):
+                    row = df_rules.iloc[i]
+                    new_rules[i] = {key: int(row[key]) if key in row.index and pd.notna(row[key]) else DEFAULT_RULES.get(key, 0)
+                                    for key in RULE_COL_ORDER}
+                    new_shift_counts[i] = {
+                        "D": int(row["fixed_D"]) if "fixed_D" in row.index and pd.notna(row["fixed_D"]) else -1,
+                        "E": int(row["fixed_E"]) if "fixed_E" in row.index and pd.notna(row["fixed_E"]) else -1,
+                        "N": int(row["fixed_N"]) if "fixed_N" in row.index and pd.notna(row["fixed_N"]) else -1,
+                    }
+                st.session_state.rules = new_rules
+                st.session_state.shift_counts = new_shift_counts
+
+                # shift_adj도 Doctors 시트에서 복원
+                st.session_state.shift_adj = {
+                    i: int(st.session_state.doctors[i].get('shift_adj', 0))
+                    for i in range(len(st.session_state.doctors))
                 }
-            st.session_state.rules = new_rules
-            st.session_state.shift_counts = new_shift_counts
 
-            # shift_adj 도 Doctors 시트에서 복원
-            st.session_state.shift_adj = {
-                i: int(st.session_state.doctors[i].get('shift_adj', 0))
-                for i in range(len(st.session_state.doctors))
-            }
+                # GradeRules
+                st.session_state.grade_rules = grade_rules_from_df(df_grade_rules)
+                normalize_grade_rules()
 
-            # GradeRules: 전체 grade 정책 복원. 없는 옛 설정 파일은 기본값 사용.
-            st.session_state.grade_rules = grade_rules_from_df(df_grade_rules)
-            normalize_grade_rules()
+                # 3) DutyRequests
+                loaded_duty = {i: [int(df_duty.iloc[i]['D']), int(df_duty.iloc[i]['E']), int(df_duty.iloc[i]['N'])]
+                               for i in range(len(df_duty))}
+                st.session_state.duty_requests = loaded_duty
+                st.session_state.num_days = len(loaded_duty)
+                st.session_state.day_types = auto_day_types(st.session_state.start_date, st.session_state.num_days)
 
-            # 3) DutyRequests — 길이만 참조, 시작날짜는 사이드바 기준
-            loaded_duty = {i: [int(df_duty.iloc[i]['D']), int(df_duty.iloc[i]['E']), int(df_duty.iloc[i]['N'])]
-                           for i in range(len(df_duty))}
-            st.session_state.duty_requests = loaded_duty
-            st.session_state.num_days = len(loaded_duty)
-            # day_types는 사이드바 start_date 기준으로 재생성
-            st.session_state.day_types = auto_day_types(st.session_state.start_date, st.session_state.num_days)
+                # 4) ShiftRequests
+                name_to_doc_idx = {doc['name']: i for i, doc in enumerate(st.session_state.doctors)}
+                new_shift = {}
+                max_days = min(len(df_shift.columns), st.session_state.num_days)
+                for row_name, row in df_shift.iterrows():
+                    doc_name = str(row_name).strip()
+                    if doc_name not in name_to_doc_idx:
+                        continue
+                    doc_idx = name_to_doc_idx[doc_name]
+                    for day_idx in range(max_days):
+                        val = row.iloc[day_idx]
+                        new_shift[(doc_idx, day_idx)] = str(val).strip() if pd.notna(val) else ''
+                st.session_state.shift_requests = new_shift
 
-            # 4) ShiftRequests
-            # 새 형식만 지원: 행=의사(Name), 열=날짜.
-            # 행 이름으로 의사를 매칭하므로 시트에서 의사 행 순서를 바꿔도 안전하다.
-            name_to_doc_idx = {doc['name']: i for i, doc in enumerate(st.session_state.doctors)}
-            new_shift = {}
-            max_days = min(len(df_shift.columns), st.session_state.num_days)
-            for row_name, row in df_shift.iterrows():
-                doc_name = str(row_name).strip()
-                if doc_name not in name_to_doc_idx:
-                    continue
-                doc_idx = name_to_doc_idx[doc_name]
-                for day_idx in range(max_days):
-                    val = row.iloc[day_idx]
-                    new_shift[(doc_idx, day_idx)] = str(val).strip() if pd.notna(val) else ''
-            st.session_state.shift_requests = new_shift
-
-            st.toast("✅ 설정 적용 완료!", icon="✅")
-            st.rerun()
-        except Exception as e:
-            st.error(f"불러오기 실패: {e}")
+                st.toast("✅ 설정 적용 완료!", icon="✅")
+                st.rerun()
+            except Exception as e:
+                st.error(f"불러오기 실패: {e}")
+                import traceback
+                st.code(traceback.format_exc())
 
     st.divider()
 
@@ -906,8 +909,8 @@ with tab3:
     ))
 
     st.markdown('<div class="section-label">편차 가중치 설정</div>', unsafe_allow_html=True)
-    st.caption("Objective = D/E 편차×가중치 + 휴일 편차×가중치 + 총근무 편차×가중치 + N 편차×가중치 + 저년차 초과×가중치")
-    wcol1, wcol2, wcol3, wcol4 = st.columns(4)
+    st.caption("Objective = D/E 편차×가중치 + 휴일 편차×가중치 + 총근무 편차×가중치 + N 편차×가중치 + Grade 편차×가중치 + 저년차 초과×가중치")
+    wcol1, wcol2, wcol3, wcol4, wcol5 = st.columns(5)
     gr["weight_de_dev"] = int(wcol1.number_input(
         "D/E 편차 가중치", min_value=0, max_value=100,
         value=int(gr.get("weight_de_dev", DEFAULT_GRADE_RULES["weight_de_dev"])),
@@ -927,6 +930,11 @@ with tab3:
         "N 편차 가중치", min_value=0, max_value=100,
         value=int(gr.get("weight_n_dev", DEFAULT_GRADE_RULES["weight_n_dev"])),
         key="weight_n_dev"
+    ))
+    gr["weight_grade_dev"] = int(wcol5.number_input(
+        "Grade 편차 가중치", min_value=0, max_value=100,
+        value=int(gr.get("weight_grade_dev", DEFAULT_GRADE_RULES.get("weight_grade_dev", 3))),
+        key="weight_grade_dev"
     ))
     st.session_state.grade_rules = gr
     st.markdown(
@@ -1141,7 +1149,7 @@ with tab4:
         except ImportError:
             st.dataframe(summary_display, use_container_width=True, hide_index=True)
 
-        # 편차 정보 (k (DE), k1 (holiday), k2 (N), k3 (total))
+        # 편차 정보 (k (DE), k1 (holiday), k2 (N), k3 (total), k4 (grade))
         if metrics and sol_idx < len(metrics):
             m = metrics[sol_idx]
             st.markdown(
@@ -1154,6 +1162,7 @@ with tab4:
                 f"| **k1 휴일:** {m.get('k1')}×{m.get('weight_holiday_dev', gr.get('weight_holiday_dev', 3))} "
                 f"| **k2 총근무:** {m.get('k2')}×{m.get('weight_total_dev', gr.get('weight_total_dev', 5))} "
                 f"| **k3 N:** {m.get('k3')}×{m.get('weight_n_dev', gr.get('weight_n_dev', 5))} "
+                f"| **k4 Grade편차:** {m.get('k4', 0)} (실제±{round(m.get('k4',0)/10,1)})×{m.get('weight_grade_dev', gr.get('weight_grade_dev', 3))} "
                 f"| **저년차 초과:** {m.get('junior_excess', 0)}×{m.get('junior_penalty_weight', gr.get('junior_penalty_weight', 1))} "
                 f"= **{m.get('junior_penalty', 0)}**</div>",
                 unsafe_allow_html=True
