@@ -135,6 +135,23 @@ html, body, [class*="css"] {
 .cell-n { color: #8080f0; font-weight: 600; }
 .cell-off { color: var(--text-dim); }
 .cell-request { outline: 1px solid var(--accent2); }
+.lock-marker { color: var(--text-dim); font-size: 0.55rem; margin-right: 1px; vertical-align: 1px; }
+.fixed-request-note {
+    background: #3a2a1026;
+    border: 1px solid #f0a04066;
+    color: var(--accent4);
+    border-radius: 4px;
+    padding: 2px 3px;
+    margin-bottom: 2px;
+    text-align: center;
+    font-family: var(--mono);
+    font-size: 0.58rem;
+    line-height: 1.15;
+}
+.fixed-request-note span {
+    color: var(--text-dim);
+    font-size: 0.52rem;
+}
 
 .grade-separator td {
     background: var(--surface2) !important;
@@ -266,8 +283,10 @@ def _init_state():
         "start_date": start_of_month,
         "day_types": {},          # {day_idx: '평일'|'토'|'일'|'공'}
         "duty_requests": {},      # {day_idx: [D, E, N]}
-        "shift_requests": {},     # {(n,d): set of 'd'|'e'|'n' (못하는)}
-        "shift_requests1": {},    # {(n,d): str (원하는) or ''}
+        "shift_requests": {},     # combined view: base_shift_requests + fixed_shift_requests
+        "base_shift_requests": {}, # user-entered wanted/cannot schedule
+        "fixed_shift_requests": {},# result-cell locks overlaid on top of base requests
+        "shift_requests1": {},    # legacy key; wishes are parsed from shift_requests
         "rules": {},              # {n: {rule_key: value}}
         "shift_adj": {},          # {n: int}
         "shift_counts": {},       # {n: {"D": None|int, "E": None|int, "N": None|int}}
@@ -287,6 +306,7 @@ def _init_state():
         "summaries": [],
         "sol_idx": 0,
         "solved": False,
+        "shift_req_version": 0,  # key versioning for shift_request widgets
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -377,6 +397,70 @@ def grade_rules_from_df(df: pd.DataFrame) -> dict:
             if key in rules and pd.notna(row.get("value")):
                 rules[key] = int(row.get("value"))
     return rules
+
+
+HARD_SHIFT_VALUES = {"D", "E", "N", "x"}
+
+def _clean_shift_request_value(val) -> str:
+    """Normalize empty/NaN values from widgets and Excel."""
+    if val is None:
+        return ""
+    if isinstance(val, float) and pd.isna(val):
+        return ""
+    text = str(val).strip()
+    return "" if text.lower() == "nan" else text
+
+def normalize_shift_request_layers():
+    """
+    Split schedule requests into two layers.
+    - base_shift_requests: user-entered wanted/cannot schedule from Tab 1 or Excel.
+    - fixed_shift_requests: locks created from the result grid.
+
+    The solver receives the combined overlay. Removing a fixed lock restores the
+    original user-entered base value, such as d/en/blank.
+    """
+    if not st.session_state.get("shift_request_layers_initialized", False):
+        existing = {k: _clean_shift_request_value(v) for k, v in st.session_state.get("shift_requests", {}).items()}
+        existing = {k: v for k, v in existing.items() if v}
+        st.session_state["base_shift_requests"] = dict(existing)
+        st.session_state["fixed_shift_requests"] = {}
+        st.session_state["shift_request_layers_initialized"] = True
+
+    if "base_shift_requests" not in st.session_state or not isinstance(st.session_state.base_shift_requests, dict):
+        st.session_state.base_shift_requests = {}
+    if "fixed_shift_requests" not in st.session_state or not isinstance(st.session_state.fixed_shift_requests, dict):
+        st.session_state.fixed_shift_requests = {}
+
+    st.session_state.base_shift_requests = {
+        k: _clean_shift_request_value(v)
+        for k, v in st.session_state.base_shift_requests.items()
+        if _clean_shift_request_value(v)
+    }
+    st.session_state.fixed_shift_requests = {
+        k: _clean_shift_request_value(v)
+        for k, v in st.session_state.fixed_shift_requests.items()
+        if _clean_shift_request_value(v) in HARD_SHIFT_VALUES
+    }
+    refresh_combined_shift_requests()
+
+def get_combined_shift_requests() -> dict:
+    """Return base requests with result-fixed locks overlaid."""
+    base = dict(st.session_state.get("base_shift_requests", {}))
+    fixed = dict(st.session_state.get("fixed_shift_requests", {}))
+    combined = {k: v for k, v in base.items() if _clean_shift_request_value(v)}
+    combined.update({k: v for k, v in fixed.items() if _clean_shift_request_value(v) in HARD_SHIFT_VALUES})
+    return combined
+
+def refresh_combined_shift_requests() -> dict:
+    combined = get_combined_shift_requests()
+    st.session_state.shift_requests = combined
+    return combined
+
+def is_hard_shift_request_value(val) -> bool:
+    return _clean_shift_request_value(val) in HARD_SHIFT_VALUES
+
+def lock_prefix_for_request(val) -> str:
+    return "<span class='lock-marker'>🔒</span>" if is_hard_shift_request_value(val) else ""
 
 
 def read_readme_text() -> str:
@@ -503,6 +587,7 @@ CHUNK = 7  # Number of days per chunk for display
 # Normalize early so sidebar save/display also works with older sessions.
 normalize_doctors()
 normalize_grade_rules()
+normalize_shift_request_layers()
 
 
 # ── SIDEBAR ──────────────────────────────────────────────────────────────────
@@ -522,7 +607,7 @@ with st.sidebar:
     st.divider()
     st.markdown('<div class="section-label">👨‍⚕️ 의사 관리</div>', unsafe_allow_html=True)
 
-    with st.form("add_doctor_form", clear_on_submit = True):
+    with st.form("add_doctor_form", clear_on_submit=True):
         new_name = st.text_input("이름 추가", placeholder="홍길동", key="new_doc_name")
         submitted = st.form_submit_button("추가")
         if submitted:
@@ -613,12 +698,19 @@ with st.sidebar:
         df_duty.index = date_list
 
         # ShiftRequests: 행=의사, 열=날짜 구조로 저장
-        # 다른 시트처럼 첫 번째 열이 의사 이름이 되도록 하여 복사/붙여넣기를 쉽게 한다.
+        # 사용자가 원래 입력한 wanted/cannot schedule만 저장한다.
+        # 결과표에서 추가로 고정한 셀은 FixedShiftRequests 시트에 따로 저장한다.
         shift_grid = pd.DataFrame('', index=doctor_names, columns=date_list)
         shift_grid.index.name = 'Name'
-        for (doc_idx, day_idx), val in st.session_state.shift_requests.items():
+        for (doc_idx, day_idx), val in st.session_state.base_shift_requests.items():
             if day_idx < len(date_list) and doc_idx < len(doctor_names):
                 shift_grid.iloc[doc_idx, day_idx] = val
+
+        fixed_grid = pd.DataFrame('', index=doctor_names, columns=date_list)
+        fixed_grid.index.name = 'Name'
+        for (doc_idx, day_idx), val in st.session_state.fixed_shift_requests.items():
+            if day_idx < len(date_list) and doc_idx < len(doctor_names):
+                fixed_grid.iloc[doc_idx, day_idx] = val
 
         df_grade_rules = grade_rules_to_df(st.session_state.grade_rules)
 
@@ -629,6 +721,7 @@ with st.sidebar:
             df_grade_rules.to_excel(writer, sheet_name='GradeRules', index=False)
             df_duty.to_excel(writer, sheet_name='DutyRequests')
             shift_grid.to_excel(writer, sheet_name='ShiftRequests')
+            fixed_grid.to_excel(writer, sheet_name='FixedShiftRequests')
 
         st.download_button(
             label="📥 설정 파일 다운로드 (.xlsx)",
@@ -649,6 +742,7 @@ with st.sidebar:
                 df_rules = pd.read_excel(xls, sheet_name='Rules', index_col=0)
                 df_duty = pd.read_excel(xls, sheet_name='DutyRequests', index_col=0)
                 df_shift = pd.read_excel(xls, sheet_name='ShiftRequests', index_col=0)
+                df_fixed_shift = pd.read_excel(xls, sheet_name='FixedShiftRequests', index_col=0) if 'FixedShiftRequests' in xls.sheet_names else pd.DataFrame()
                 df_grade_rules = pd.read_excel(xls, sheet_name='GradeRules') if 'GradeRules' in xls.sheet_names else pd.DataFrame()
 
                 # 1) 의사 정보: grade 포함해서 읽기 (없으면 기본값)
@@ -696,17 +790,33 @@ with st.sidebar:
 
                 # 4) ShiftRequests
                 name_to_doc_idx = {doc['name']: i for i, doc in enumerate(st.session_state.doctors)}
-                new_shift = {}
-                max_days = min(len(df_shift.columns), st.session_state.num_days)
-                for row_name, row in df_shift.iterrows():
-                    doc_name = str(row_name).strip()
-                    if doc_name not in name_to_doc_idx:
-                        continue
-                    doc_idx = name_to_doc_idx[doc_name]
-                    for day_idx in range(max_days):
-                        val = row.iloc[day_idx]
-                        new_shift[(doc_idx, day_idx)] = str(val).strip() if pd.notna(val) else ''
-                st.session_state.shift_requests = new_shift
+
+                def _grid_to_shift_dict(df_grid, hard_only=False):
+                    out = {}
+                    if df_grid is None or df_grid.empty:
+                        return out
+                    max_days = min(len(df_grid.columns), st.session_state.num_days)
+                    for row_name, row in df_grid.iterrows():
+                        doc_name = str(row_name).strip()
+                        if doc_name not in name_to_doc_idx:
+                            continue
+                        doc_idx = name_to_doc_idx[doc_name]
+                        for day_idx in range(max_days):
+                            val = _clean_shift_request_value(row.iloc[day_idx])
+                            if not val:
+                                continue
+                            if hard_only and val not in HARD_SHIFT_VALUES:
+                                continue
+                            out[(doc_idx, day_idx)] = val
+                    return out
+
+                # ShiftRequests = user-entered base layer.
+                # FixedShiftRequests = result-grid lock overlay.
+                st.session_state.base_shift_requests = _grid_to_shift_dict(df_shift, hard_only=False)
+                st.session_state.fixed_shift_requests = _grid_to_shift_dict(df_fixed_shift, hard_only=True)
+                st.session_state["shift_request_layers_initialized"] = True
+                refresh_combined_shift_requests()
+                st.session_state["shift_req_version"] = st.session_state.get("shift_req_version", 0) + 1
 
                 st.toast("✅ 설정 적용 완료!", icon="✅")
                 st.rerun()
@@ -730,6 +840,7 @@ st.markdown('<div class="main-header"><h1>🏥 SHIFT SCHEDULER</h1><p>의료진 
 
 normalize_doctors()
 normalize_grade_rules()
+normalize_shift_request_layers()
 
 doctors = st.session_state.doctors
 num_days = st.session_state.num_days
@@ -759,6 +870,7 @@ with tab1:
 
     # Combined table: Day types + Per-doctor shift requests
     st.markdown("**날짜 유형 & 개인별 근무 요청** · `d/e/n` = 못하는 근무 | `D/E/N` = 원하는 근무 | `x` = 전체 불가")
+    st.caption("🔒 fixed 표시가 있는 칸은 결과표에서 고정된 셀이므로 여기서는 수정할 수 없습니다. 결과 탭에서 고정 해제 후 수정하세요.")
     SHIFT_OPTIONS = ['', 'd', 'e', 'n', 'x', 'de', 'dn', 'en', 'den', 'D', 'E', 'N']
     day_type_options = ['평일', '토', '일', '공']
 
@@ -793,18 +905,40 @@ with tab1:
             for ci in range(CHUNK):
                 di = chunk_start + ci
                 if di < num_days:
-                    key = f"sr_{ni}_{di}"
-                    cur = st.session_state.shift_requests.get((ni, di), '')
+                    ver = st.session_state.get("shift_req_version", 0)
+                    key = f"sr_{ni}_{di}_v{ver}"
+                    base_val = st.session_state.base_shift_requests.get((ni, di), '')
+                    fixed_val = st.session_state.fixed_shift_requests.get((ni, di), '')
+                    cur = fixed_val if fixed_val else base_val
                     options = SHIFT_OPTIONS
                     if cur and cur not in options:
                         options = [cur] + options
                     idx = options.index(cur) if cur in options else 0
-                    new_val = cols2[ci+1].selectbox(
-                        f"sr{ni}{di}", options,
-                        index=idx,
-                        label_visibility="collapsed", key=key
-                    )
-                    st.session_state.shift_requests[(ni, di)] = new_val
+
+                    if fixed_val:
+                        base_label = base_val if base_val else "빈칸"
+                        cols2[ci+1].markdown(
+                            f"<div class='fixed-request-note'>🔒 fixed {fixed_val}<br><span>원래 입력: {base_label}</span></div>",
+                            unsafe_allow_html=True,
+                        )
+                        cols2[ci+1].selectbox(
+                            f"sr{ni}{di}", options,
+                            index=idx,
+                            label_visibility="collapsed", key=key,
+                            disabled=True,
+                            help="결과표에서 고정된 셀입니다. 수정하려면 결과 탭에서 먼저 고정 해제하세요.",
+                        )
+                    else:
+                        new_val = cols2[ci+1].selectbox(
+                            f"sr{ni}{di}", options,
+                            index=idx,
+                            label_visibility="collapsed", key=key
+                        )
+                        if new_val:
+                            st.session_state.base_shift_requests[(ni, di)] = new_val
+                        else:
+                            st.session_state.base_shift_requests.pop((ni, di), None)
+                    refresh_combined_shift_requests()
                 else:
                     cols2[ci+1].empty()  # Empty cell for missing days
 
@@ -1075,7 +1209,7 @@ if st.session_state.get("trigger_solve"):
                     "start_date": str(start_date),
                     "day_types": st.session_state.day_types,
                     "duty_requests": st.session_state.duty_requests,
-                    "shift_requests": {f"{k[0]},{k[1]}": v for k, v in st.session_state.shift_requests.items()},
+                    "shift_requests": {f"{k[0]},{k[1]}": v for k, v in refresh_combined_shift_requests().items()},
                     "rules": {str(k): v for k, v in st.session_state.rules.items()},
                     "shift_adj": {str(k): v for k, v in st.session_state.shift_adj.items()},
                     "shift_counts": {str(k): v for k, v in st.session_state.shift_counts.items()},
@@ -1204,11 +1338,12 @@ with tab4:
             )
             for di in range(num_days):
                 val = sol.get((ni, di), '')
-                req = st.session_state.shift_requests.get((ni, di), '')
+                req = refresh_combined_shift_requests().get((ni, di), '')
                 is_hol = di in holiday_days
                 hol_style = "border-left: 2px solid #e05c5c44;" if is_hol else ""
                 cell_cls = SHIFT_COLORS.get(val, 'cell-off')
                 shift_html = val.upper() if val else "·"
+                shift_html = f"{lock_prefix_for_request(req)}{shift_html}"
                 body_rows += f"<td class='{cell_cls}' style='{hol_style}'>{shift_html}</td>"
             body_rows += "</tr>"
 
@@ -1221,6 +1356,119 @@ with tab4:
         </div>
         """
         st.markdown(table_html, unsafe_allow_html=True)
+
+        # ── 편집 & 고정 기능 ──────────────────────────────────────────────────
+        st.divider()
+        st.markdown('<div class="section-label">✏ 셀 선택 & 고정 후 재실행</div>', unsafe_allow_html=True)
+        st.caption("셀을 클릭(또는 드래그)해서 선택한 뒤 **고정 적용** 버튼을 누르면 선택된 셀의 현재 값이 그대로 고정돼요. 값을 바꿀 필요 없이 선택만 하면 돼요.")
+
+        # data_editor용 DataFrame 생성 (display_order 기준)
+        date_cols = [(start_date + timedelta(days=di)).strftime('%m/%d') for di in range(num_days)]
+        editor_row_order = []  # (ni, row_label)
+        editor_rows = {}
+        for ni in display_order:
+            doc = doctors[ni]
+            row_label = f"[G{int(doc.get('grade', DEFAULT_DOCTOR_GRADE))}] {doc['name']}"
+            editor_row_order.append((ni, row_label))
+            editor_rows[row_label] = []
+            for di in range(num_days):
+                raw_val = sol.get((ni, di), '')
+                display_val = raw_val.upper() if raw_val else '·'
+                req = refresh_combined_shift_requests().get((ni, di), '')
+                if is_hard_shift_request_value(req):
+                    display_val = f"🔒{display_val}"
+                editor_rows[row_label].append(display_val)
+
+        editor_df = pd.DataFrame(editor_rows, index=date_cols).T
+
+        # 셀 단위 선택
+        event = st.dataframe(
+            editor_df,
+            use_container_width=True,
+            on_select="rerun",
+            selection_mode="multi-cell",
+            key=f"schedule_selector_{sol_idx}",
+        )
+
+        selected_cells = event.selection.get("cells", [])
+
+        if selected_cells:
+            st.caption(f"선택된 셀: {len(selected_cells)}개 → 고정 버튼을 누르면 현재 값이 그대로 고정됩니다.")
+
+        def _selected_to_positions(selected_cells):
+            """Convert Streamlit dataframe selection payload to (doctor_idx, day_idx) pairs."""
+            positions = []
+            row_label_map = {lbl: i for i, (_, lbl) in enumerate(editor_row_order)}
+            for cell in selected_cells:
+                # Streamlit 버전에 따라 형식이 다름:
+                # - dict: {"row": r, "column": c}
+                # - tuple: (row_idx, col_idx) 또는 (row_label, date_str)
+                if isinstance(cell, dict):
+                    row_idx = cell.get("row", -1)
+                    col_idx = cell.get("column", -1)
+                elif isinstance(cell, (tuple, list)) and len(cell) >= 2:
+                    r, c = cell[0], cell[1]
+                    row_idx = r if isinstance(r, int) else row_label_map.get(str(r), -1)
+                    col_idx = c if isinstance(c, int) else (date_cols.index(str(c)) if str(c) in date_cols else -1)
+                else:
+                    continue
+
+                if row_idx < 0 or col_idx < 0 or row_idx >= len(editor_row_order) or col_idx >= num_days:
+                    continue
+                ni, _ = editor_row_order[row_idx]
+                positions.append((ni, col_idx))
+            return positions
+
+        lock_col1, lock_col2, lock_col3 = st.columns([1, 1, 3])
+        if lock_col1.button("🔒 선택 셀 고정", key="btn_lock_apply"):
+            positions = _selected_to_positions(selected_cells)
+            if not positions:
+                st.warning("선택된 셀이 없어요. 고정할 셀을 먼저 클릭해서 선택해주세요.")
+            else:
+                new_fixed_req = dict(st.session_state.fixed_shift_requests)
+                for ni, di in positions:
+                    val = sol.get((ni, di), '')
+                    new_fixed_req[(ni, di)] = val.upper() if val else 'x'
+
+                st.session_state.fixed_shift_requests = new_fixed_req
+                combined_req = refresh_combined_shift_requests()
+
+                # 모든 날이 hard-coded 된 의사는 shift_counts 자동 계산
+                new_shift_counts = dict(st.session_state.shift_counts)
+                for ni, row_label in editor_row_order:
+                    total_fixed = sum(
+                        1 for di in range(num_days)
+                        if combined_req.get((ni, di), '') in ('D', 'E', 'N', 'x')
+                    )
+                    if total_fixed == num_days:
+                        d_cnt = sum(1 for di in range(num_days) if combined_req.get((ni, di), '') == 'D')
+                        e_cnt = sum(1 for di in range(num_days) if combined_req.get((ni, di), '') == 'E')
+                        n_cnt = sum(1 for di in range(num_days) if combined_req.get((ni, di), '') == 'N')
+                        new_shift_counts[ni] = {"D": d_cnt, "E": e_cnt, "N": n_cnt}
+                st.session_state.shift_counts = new_shift_counts
+                st.session_state["shift_req_version"] = st.session_state.get("shift_req_version", 0) + 1
+                st.toast(f"🔒 {len(positions)}개 셀 고정 완료!", icon="🔒")
+                st.rerun()
+
+        if lock_col2.button("🔓 선택 셀 고정 해제", key="btn_lock_release"):
+            positions = _selected_to_positions(selected_cells)
+            if not positions:
+                st.warning("선택된 셀이 없어요. 해제할 셀을 먼저 클릭해서 선택해주세요.")
+            else:
+                released = 0
+                for ni, di in positions:
+                    if (ni, di) in st.session_state.fixed_shift_requests:
+                        st.session_state.fixed_shift_requests.pop((ni, di), None)
+                        released += 1
+                refresh_combined_shift_requests()
+                st.session_state["shift_req_version"] = st.session_state.get("shift_req_version", 0) + 1
+                if released > 0:
+                    st.toast(f"🔓 {released}개 셀 고정 해제 완료! 원래 사용자 입력값으로 돌아갑니다.", icon="🔓")
+                else:
+                    st.toast("선택한 셀에는 결과표에서 추가한 고정 layer가 없어요. 원래 사용자 입력값은 근무 요청 탭에서 수정하세요.", icon="ℹ️")
+                st.rerun()
+
+        lock_col3.caption("고정은 결과표 위에 임시 hard layer로 저장됩니다. 해제하면 기존 사용자 입력값(d/en/빈칸 등)이 다시 적용됩니다. 사용자 입력 자체를 바꾸려면 근무 요청 탭에서 수정하세요.")
 
         # Navigator (schedule grid 아래)
         nav_col1, nav_col2, nav_col3, nav_col4, nav_col5 = st.columns([1,1,2,2,1])
