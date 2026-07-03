@@ -522,7 +522,7 @@ with st.sidebar:
     st.divider()
     st.markdown('<div class="section-label">👨‍⚕️ 의사 관리</div>', unsafe_allow_html=True)
 
-    with st.form("add_doctor_form"):
+    with st.form("add_doctor_form", clear_on_submit = True):
         new_name = st.text_input("이름 추가", placeholder="홍길동", key="new_doc_name")
         submitted = st.form_submit_button("추가")
         if submitted:
