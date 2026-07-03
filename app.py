@@ -135,6 +135,9 @@ html, body, [class*="css"] {
 .cell-n { color: #8080f0; font-weight: 600; }
 .cell-off { color: var(--text-dim); }
 .cell-request { outline: 1px solid var(--accent2); }
+.cell-public-holiday {
+    background-color: rgba(240, 160, 64, 0.14) !important;
+}
 .lock-marker { color: var(--text-dim); font-size: 0.55rem; margin-right: 1px; vertical-align: 1px; }
 .fixed-request-note {
     background: #3a2a1026;
@@ -1304,67 +1307,36 @@ with tab4:
 
         st.divider()
 
-        # Schedule grid
-        st.markdown('<div class="section-label">근무 일정표</div>', unsafe_allow_html=True)
+        # ── 통합 근무표: 표시 + 셀 선택/고정 ────────────────────────────────
+        st.markdown('<div class="section-label">근무 일정표 / 셀 선택 & 고정</div>', unsafe_allow_html=True)
+        st.caption(
+            "이 표에서 셀을 클릭(또는 드래그)해 선택한 뒤 **선택 셀 고정**을 누르면 현재 결과값이 hard request로 고정됩니다. "
+            "🔒 표시는 이미 base request 또는 fixed layer로 하드코딩된 셀입니다."
+        )
 
         holiday_days = [d for d, t in st.session_state.day_types.items() if t in ('토','일','공')]
+        combined_req = refresh_combined_shift_requests()
 
-        # Build HTML table
-        header_row = "<tr><th style='text-align:left;white-space:nowrap;padding:2px 6px'>이름 / Grade</th>"
+        # data frame용 날짜 컬럼: 요일 표시
+        # 토/일은 요일 자체가 휴일 의미이므로 별도 '휴'를 붙이지 않는다.
+        # 평일 날짜를 '공'으로 지정한 경우만 (월·휴)처럼 표시한다.
+        # 다만 셀 음영은 토/일/공 모두 휴일 컬럼으로 적용한다.
+        date_cols = []
+        holiday_cols = []
         for di in range(num_days):
             d = start_date + timedelta(days=di)
             lbl = get_day_label(start_date, di)
-            is_hol = di in holiday_days
-            cls = ' class="th-holiday"' if is_hol else ''
-            header_row += f"<th{cls}>{d.strftime('%m/%d')}<br><span style='font-weight:400;font-size:0.58rem'>{lbl}</span></th>"
-        header_row += "</tr>"
+            dtype = st.session_state.day_types.get(di, '평일')
+            is_weekday_public_holiday = (dtype == '공' and lbl not in ('토', '일'))
+            if is_weekday_public_holiday:
+                col_label = f"{d.strftime('%m/%d')}({lbl}·휴)"
+            else:
+                col_label = f"{d.strftime('%m/%d')}({lbl})"
+            date_cols.append(col_label)
+            if dtype in ('토', '일', '공'):
+                holiday_cols.append(col_label)
 
-        body_rows = ""
-        current_grade = None
-        total_cols = num_days + 1
-        for ni in display_order:
-            doc = doctors[ni]
-            grade = int(doc.get("grade", DEFAULT_DOCTOR_GRADE))
-            if grade != current_grade:
-                current_grade = grade
-                body_rows += (
-                    f"<tr class='grade-separator'>"
-                    f"<td colspan='{total_cols}'>Grade {grade}</td>"
-                    f"</tr>"
-                )
-            body_rows += (
-                f"<tr><td class='name-col'>{doc['name']}"
-                f"<span class='grade-name-badge'>G{grade}</span></td>"
-            )
-            for di in range(num_days):
-                val = sol.get((ni, di), '')
-                req = refresh_combined_shift_requests().get((ni, di), '')
-                is_hol = di in holiday_days
-                hol_style = "border-left: 2px solid #e05c5c44;" if is_hol else ""
-                cell_cls = SHIFT_COLORS.get(val, 'cell-off')
-                shift_html = val.upper() if val else "·"
-                shift_html = f"{lock_prefix_for_request(req)}{shift_html}"
-                body_rows += f"<td class='{cell_cls}' style='{hol_style}'>{shift_html}</td>"
-            body_rows += "</tr>"
-
-        table_html = f"""
-        <div style="overflow-x:auto; max-width:100%;">
-        <table class="schedule-grid">
-        <thead>{header_row}</thead>
-        <tbody>{body_rows}</tbody>
-        </table>
-        </div>
-        """
-        st.markdown(table_html, unsafe_allow_html=True)
-
-        # ── 편집 & 고정 기능 ──────────────────────────────────────────────────
-        st.divider()
-        st.markdown('<div class="section-label">✏ 셀 선택 & 고정 후 재실행</div>', unsafe_allow_html=True)
-        st.caption("셀을 클릭(또는 드래그)해서 선택한 뒤 **고정 적용** 버튼을 누르면 선택된 셀의 현재 값이 그대로 고정돼요. 값을 바꿀 필요 없이 선택만 하면 돼요.")
-
-        # data_editor용 DataFrame 생성 (display_order 기준)
-        date_cols = [(start_date + timedelta(days=di)).strftime('%m/%d') for di in range(num_days)]
-        editor_row_order = []  # (ni, row_label)
+        editor_row_order = []  # [(doctor_idx, row_label)]
         editor_rows = {}
         for ni in display_order:
             doc = doctors[ni]
@@ -1374,16 +1346,24 @@ with tab4:
             for di in range(num_days):
                 raw_val = sol.get((ni, di), '')
                 display_val = raw_val.upper() if raw_val else '·'
-                req = refresh_combined_shift_requests().get((ni, di), '')
+                req = combined_req.get((ni, di), '')
                 if is_hard_shift_request_value(req):
                     display_val = f"🔒{display_val}"
                 editor_rows[row_label].append(display_val)
 
         editor_df = pd.DataFrame(editor_rows, index=date_cols).T
 
-        # 셀 단위 선택
+        def _style_holiday_columns(df):
+            styles = pd.DataFrame('', index=df.index, columns=df.columns)
+            for col in holiday_cols:
+                if col in styles.columns:
+                    styles[col] = 'background-color: rgba(240, 160, 64, 0.14);'
+            return styles
+
+        editor_view = editor_df.style.apply(_style_holiday_columns, axis=None) if holiday_cols else editor_df
+
         event = st.dataframe(
-            editor_df,
+            editor_view,
             use_container_width=True,
             on_select="rerun",
             selection_mode="multi-cell",
@@ -1391,9 +1371,8 @@ with tab4:
         )
 
         selected_cells = event.selection.get("cells", [])
-
         if selected_cells:
-            st.caption(f"선택된 셀: {len(selected_cells)}개 → 고정 버튼을 누르면 현재 값이 그대로 고정됩니다.")
+            st.caption(f"선택된 셀: {len(selected_cells)}개 → 고정/해제 버튼을 사용할 수 있습니다.")
 
         def _selected_to_positions(selected_cells):
             """Convert Streamlit dataframe selection payload to (doctor_idx, day_idx) pairs."""
@@ -1402,7 +1381,7 @@ with tab4:
             for cell in selected_cells:
                 # Streamlit 버전에 따라 형식이 다름:
                 # - dict: {"row": r, "column": c}
-                # - tuple: (row_idx, col_idx) 또는 (row_label, date_str)
+                # - tuple/list: (row_idx, col_idx) 또는 (row_label, date_col)
                 if isinstance(cell, dict):
                     row_idx = cell.get("row", -1)
                     col_idx = cell.get("column", -1)
@@ -1465,10 +1444,53 @@ with tab4:
                 if released > 0:
                     st.toast(f"🔓 {released}개 셀 고정 해제 완료! 원래 사용자 입력값으로 돌아갑니다.", icon="🔓")
                 else:
-                    st.toast("선택한 셀에는 결과표에서 추가한 고정 layer가 없어요. 원래 사용자 입력값은 근무 요청 탭에서 수정하세요.", icon="ℹ️")
+                    st.toast("선택한 셀에는 결과표에서 추가한 fixed layer가 없어요. 원래 사용자 입력값은 근무 요청 탭에서 수정하세요.", icon="ℹ️")
                 st.rerun()
 
-        lock_col3.caption("고정은 결과표 위에 임시 hard layer로 저장됩니다. 해제하면 기존 사용자 입력값(d/en/빈칸 등)이 다시 적용됩니다. 사용자 입력 자체를 바꾸려면 근무 요청 탭에서 수정하세요.")
+        lock_col3.caption(
+            "고정은 결과표 위에 fixed layer로 저장됩니다. 해제하면 기존 사용자 입력값(d/en/빈칸 등)이 다시 적용됩니다. "
+            "🔒가 붙은 request 칸은 근무 요청 탭에서도 잠겨 보입니다."
+        )
+
+        # ── 날짜별 duty 구성 요약 ─────────────────────────────────────────────
+        st.markdown('<div class="section-label">Daily duty 구성 요약</div>', unsafe_allow_html=True)
+        st.caption("각 날짜·D/E/N별 실제 배정 인원, 필요 인원, 평균 grade, 근무자를 확인합니다.")
+
+        duty_summary_rows = []
+        shift_labels = [('D', 'Day'), ('E', 'Evening'), ('N', 'Night')]
+        for di in range(num_days):
+            d = start_date + timedelta(days=di)
+            lbl = get_day_label(start_date, di)
+            dtype = st.session_state.day_types.get(di, '평일')
+            is_weekday_public_holiday = (dtype == '공' and lbl not in ('토', '일'))
+            date_label = f"{d.strftime('%m/%d')} ({lbl}·휴)" if is_weekday_public_holiday else f"{d.strftime('%m/%d')} ({lbl})"
+            is_holiday_type = dtype in ('토', '일', '공')
+            for si, (shift_key, shift_name) in enumerate(shift_labels):
+                staff = [ni for ni in range(len(doctors)) if sol.get((ni, di), '') == shift_key.lower()]
+                grades_for_shift = [int(doctors[ni].get('grade', DEFAULT_DOCTOR_GRADE)) for ni in staff]
+                avg_grade = round(sum(grades_for_shift) / len(grades_for_shift), 2) if grades_for_shift else None
+                required = st.session_state.duty_requests.get(di, [0, 0, 0])[si]
+                duty_summary_rows.append({
+                    "날짜": date_label,
+                    "유형": dtype,
+                    "Duty": shift_key,
+                    "인원/필요": f"{len(staff)}/{required}",
+                    "평균 Grade": avg_grade if avg_grade is not None else "-",
+                    "근무자": ", ".join(doctors[ni]['name'] for ni in staff),
+                    "_is_holiday": is_holiday_type,
+                })
+
+        duty_summary_df = pd.DataFrame(duty_summary_rows)
+        if not duty_summary_df.empty:
+            holiday_row_flags = duty_summary_df['_is_holiday'].tolist() if '_is_holiday' in duty_summary_df.columns else []
+            display_duty_summary_df = duty_summary_df.drop(columns=['_is_holiday'], errors='ignore')
+            def _style_duty_summary(row):
+                if row.name < len(holiday_row_flags) and bool(holiday_row_flags[row.name]):
+                    return ['background-color: rgba(240, 160, 64, 0.12);'] * len(row)
+                return [''] * len(row)
+            st.dataframe(display_duty_summary_df.style.apply(_style_duty_summary, axis=1), use_container_width=True, hide_index=True)
+        else:
+            st.dataframe(duty_summary_df, use_container_width=True, hide_index=True)
 
         # Navigator (schedule grid 아래)
         nav_col1, nav_col2, nav_col3, nav_col4, nav_col5 = st.columns([1,1,2,2,1])
@@ -1523,4 +1545,4 @@ with tab4:
         leg_cols[1].markdown('<span class="badge-e">E Evening</span>', unsafe_allow_html=True)
         leg_cols[2].markdown('<span class="badge-n">N Night</span>', unsafe_allow_html=True)
         leg_cols[3].markdown('<span class="badge-off">· Off</span>', unsafe_allow_html=True)
-        leg_cols[4].markdown('<span style="font-family:var(--mono);font-size:0.75rem;color:#e05c5c">🔴 = 휴일</span>', unsafe_allow_html=True)
+        leg_cols[4].markdown('<span style="font-family:var(--mono);font-size:0.75rem;color:#f0a040">음영 = 토/일/공 휴일</span>', unsafe_allow_html=True)
