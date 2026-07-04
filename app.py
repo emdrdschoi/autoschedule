@@ -1311,30 +1311,30 @@ with tab4:
         st.markdown('<div class="section-label">근무 일정표 / 셀 선택 & 고정</div>', unsafe_allow_html=True)
         st.caption(
             "이 표에서 셀을 클릭(또는 드래그)해 선택한 뒤 **선택 셀 고정**을 누르면 현재 결과값이 hard request로 고정됩니다. "
-            "🔒 표시는 이미 base request 또는 fixed layer로 하드코딩된 셀입니다."
+            "🔒 표시는 이미 base request 또는 fixed layer로 하드코딩된 셀입니다. "
+            "날짜는 `일자+요일` 형식이며, `*`는 평일 공휴일입니다. 표 높이는 인원 수에 맞춰 자동으로 늘어납니다."
         )
 
         holiday_days = [d for d, t in st.session_state.day_types.items() if t in ('토','일','공')]
         combined_req = refresh_combined_shift_requests()
 
-        # data frame용 날짜 컬럼: 요일 표시
-        # 토/일은 요일 자체가 휴일 의미이므로 별도 '휴'를 붙이지 않는다.
-        # 평일 날짜를 '공'으로 지정한 경우만 (월·휴)처럼 표시한다.
-        # 다만 셀 음영은 토/일/공 모두 휴일 컬럼으로 적용한다.
+        # Compact date columns for 30-day / 20-30-person view.
+        # Keep labels very short: 2목, 3금, 4토. Weekday public holidays get *: 6월*.
+        # Cell shading still applies to all holiday-type days: 토/일/공.
         date_cols = []
         holiday_cols = []
+        public_holiday_cols = []
         for di in range(num_days):
             d = start_date + timedelta(days=di)
             lbl = get_day_label(start_date, di)
             dtype = st.session_state.day_types.get(di, '평일')
             is_weekday_public_holiday = (dtype == '공' and lbl not in ('토', '일'))
-            if is_weekday_public_holiday:
-                col_label = f"{d.strftime('%m/%d')}({lbl}·휴)"
-            else:
-                col_label = f"{d.strftime('%m/%d')}({lbl})"
+            col_label = f"{d.day}{lbl}{'*' if is_weekday_public_holiday else ''}"
             date_cols.append(col_label)
             if dtype in ('토', '일', '공'):
                 holiday_cols.append(col_label)
+            if is_weekday_public_holiday:
+                public_holiday_cols.append(col_label)
 
         editor_row_order = []  # [(doctor_idx, row_label)]
         editor_rows = {}
@@ -1353,18 +1353,50 @@ with tab4:
 
         editor_df = pd.DataFrame(editor_rows, index=date_cols).T
 
-        def _style_holiday_columns(df):
+        def _style_compact_schedule(df):
             styles = pd.DataFrame('', index=df.index, columns=df.columns)
+            base = (
+                'font-size: 10px; line-height: 1.0; padding: 0px 1px; '
+                'text-align: center; white-space: nowrap; min-width: 22px; max-width: 28px;'
+            )
+            styles.loc[:, :] = base
             for col in holiday_cols:
                 if col in styles.columns:
-                    styles[col] = 'background-color: rgba(240, 160, 64, 0.14);'
+                    styles[col] = base + ' background-color: rgba(240, 160, 64, 0.16);'
             return styles
 
-        editor_view = editor_df.style.apply(_style_holiday_columns, axis=None) if holiday_cols else editor_df
+        editor_view = (
+            editor_df.style
+            .apply(_style_compact_schedule, axis=None)
+            .set_table_styles([
+                {'selector': 'th', 'props': [
+                    ('font-size', '9px'), ('line-height', '1.0'), ('padding', '0px 1px'),
+                    ('text-align', 'center'), ('white-space', 'nowrap')
+                ]},
+                {'selector': 'td', 'props': [
+                    ('font-size', '10px'), ('line-height', '1.0'), ('padding', '0px 1px'),
+                    ('text-align', 'center'), ('white-space', 'nowrap')
+                ]},
+            ])
+        )
+
+        compact_column_config = {
+            col: st.column_config.TextColumn(col, width=34)
+            for col in date_cols
+        }
+        # Make the selectable schedule grid tall enough to avoid an inner vertical scrollbar.
+        # st.dataframe keeps a relatively fixed row height internally, so pandas CSS cannot
+        # reliably shrink rows. Instead, calculate the widget height from the number of
+        # displayed doctors. This keeps roughly 20-30 doctors visible at once.
+        compact_row_height = 35
+        compact_header_height = 42
+        compact_height = min(1280, max(420, compact_header_height + compact_row_height * (len(editor_df.index) + 1)))
 
         event = st.dataframe(
             editor_view,
             use_container_width=True,
+            height=compact_height,
+            column_config=compact_column_config,
             on_select="rerun",
             selection_mode="multi-cell",
             key=f"schedule_selector_{sol_idx}",
@@ -1463,7 +1495,7 @@ with tab4:
             lbl = get_day_label(start_date, di)
             dtype = st.session_state.day_types.get(di, '평일')
             is_weekday_public_holiday = (dtype == '공' and lbl not in ('토', '일'))
-            date_label = f"{d.strftime('%m/%d')} ({lbl}·휴)" if is_weekday_public_holiday else f"{d.strftime('%m/%d')} ({lbl})"
+            date_label = f"{d.strftime('%m/%d')} ({lbl}{'·휴' if is_weekday_public_holiday else ''})"
             is_holiday_type = dtype in ('토', '일', '공')
             for si, (shift_key, shift_name) in enumerate(shift_labels):
                 staff = [ni for ni in range(len(doctors)) if sol.get((ni, di), '') == shift_key.lower()]
