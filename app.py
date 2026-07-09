@@ -292,7 +292,7 @@ def _init_state():
         "shift_requests1": {},    # legacy key; wishes are parsed from shift_requests
         "rules": {},              # {n: {rule_key: value}}
         "shift_adj": {},          # {n: int}
-        "shift_counts": {},       # {n: {"D": None|int, "E": None|int, "N": None|int}}
+        "shift_counts": {},       # {n: {"D": -1|int, "E": -1|int, "N": -1|int, "Total": -1|int}}
         "grade_rules": {          # Global grade/balancing policy; not per-doctor
             "senior_min_grade": 2,
             "senior_min_count": 1,
@@ -310,6 +310,7 @@ def _init_state():
         "sol_idx": 0,
         "solved": False,
         "shift_req_version": 0,  # key versioning for shift_request widgets
+        "duty_req_version": 0,   # key versioning for duty number_input widgets
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -383,6 +384,75 @@ def normalize_grade_rules():
             st.session_state.grade_rules[key] = int(val)
         except (TypeError, ValueError):
             st.session_state.grade_rules[key] = default
+
+def normalize_shift_counts():
+    """Ensure per-doctor fixed D/E/N/Total counts exist. -1 means automatic."""
+    if "shift_counts" not in st.session_state or not isinstance(st.session_state.shift_counts, dict):
+        st.session_state.shift_counts = {}
+    for ni in range(len(st.session_state.get("doctors", []))):
+        sc = st.session_state.shift_counts.get(ni, {})
+        if not isinstance(sc, dict):
+            sc = {}
+        for key in ("D", "E", "N", "Total"):
+            try:
+                sc[key] = int(sc.get(key, -1))
+            except (TypeError, ValueError):
+                sc[key] = -1
+        st.session_state.shift_counts[ni] = sc
+
+def get_total_duty_count() -> int:
+    """Total number of required assignments in DutyRequests."""
+    return int(sum(sum(map(int, st.session_state.duty_requests.get(di, [0, 0, 0]))) for di in range(st.session_state.num_days)))
+
+def get_fixed_total_summary():
+    """Return summary of per-doctor fixed_total constraints."""
+    normalize_shift_counts()
+    fixed = {}
+    for ni in range(len(st.session_state.get("doctors", []))):
+        val = int(st.session_state.shift_counts.get(ni, {}).get("Total", -1))
+        if val >= 0:
+            fixed[ni] = val
+    total_duty = get_total_duty_count()
+    fixed_sum = sum(fixed.values())
+    free_count = max(0, len(st.session_state.get("doctors", [])) - len(fixed))
+    remaining = total_duty - fixed_sum
+    return {
+        "total_duty": total_duty,
+        "fixed_sum": fixed_sum,
+        "fixed_count": len(fixed),
+        "free_count": free_count,
+        "remaining": remaining,
+        "fixed": fixed,
+    }
+
+def render_fixed_total_duty_summary(num_days: int):
+    """Render a compact mismatch/remaining summary for DutyRequests vs fixed_total."""
+    fixed_total_info = get_fixed_total_summary()
+    d_total = sum(st.session_state.duty_requests.get(di, [0, 0, 0])[0] for di in range(num_days))
+    e_total = sum(st.session_state.duty_requests.get(di, [0, 0, 0])[1] for di in range(num_days))
+    n_total = sum(st.session_state.duty_requests.get(di, [0, 0, 0])[2] for di in range(num_days))
+    remaining = fixed_total_info["remaining"]
+    st.markdown(
+        f"""
+        <div style='font-family:var(--mono);font-size:0.78rem;line-height:1.45;
+                    padding:0.55rem 0.7rem;border:1px solid var(--border);border-radius:4px;
+                    background:var(--surface);margin:0.7rem 0;'>
+        Duty 총합: <b>{fixed_total_info['total_duty']}</b>
+        <span style='color:var(--text-dim)'>(D {d_total} / E {e_total} / N {n_total})</span>
+        &nbsp;|&nbsp; fixed_total 합: <b>{fixed_total_info['fixed_sum']}</b>
+        &nbsp;|&nbsp; fixed_total 미지정 인원: <b>{fixed_total_info['free_count']}</b>
+        &nbsp;|&nbsp; 남은 근무수: <b style='color:{'#e05c5c' if remaining < 0 else '#54c78a'}'>{remaining}</b>
+        </div>
+        """,
+        unsafe_allow_html=True
+    )
+    if fixed_total_info["fixed_count"] > 0:
+        if remaining < 0:
+            st.error(f"fixed_total 합이 Duty 총합보다 {-remaining}개 많습니다. Duty 설정에서 총 근무를 {-remaining}개 추가하거나 fixed_total을 줄여야 합니다.")
+        elif fixed_total_info["free_count"] == 0 and remaining != 0:
+            st.error(f"모든 의사의 fixed_total이 지정되어 있는데 Duty 총합과 {remaining}개 차이가 납니다. Duty 설정 또는 fixed_total을 맞춰주세요.")
+        elif fixed_total_info["free_count"] > 0:
+            st.info(f"fixed_total이 없는 {fixed_total_info['free_count']}명에게 남은 근무수 {remaining}개가 자동 배분됩니다.")
 
 def grade_rules_to_df(grade_rules: dict) -> pd.DataFrame:
     return pd.DataFrame([
@@ -590,6 +660,7 @@ CHUNK = 7  # Number of days per chunk for display
 # Normalize early so sidebar save/display also works with older sessions.
 normalize_doctors()
 normalize_grade_rules()
+normalize_shift_counts()
 normalize_shift_request_layers()
 
 
@@ -624,6 +695,7 @@ with st.sidebar:
                 })
                 st.session_state.rules[n] = DEFAULT_RULES.copy()
                 st.session_state.shift_adj[n] = 0
+                st.session_state.shift_counts[n] = {"D": -1, "E": -1, "N": -1, "Total": -1}
                 st.rerun()
 
     if st.session_state.doctors:
@@ -688,11 +760,12 @@ with st.sidebar:
         rules_rows = []
         for ni in range(len(doctor_names)):
             r  = st.session_state.rules.get(ni, {})
-            sc = st.session_state.shift_counts.get(ni, {"D": -1, "E": -1, "N": -1})
+            sc = st.session_state.shift_counts.get(ni, {"D": -1, "E": -1, "N": -1, "Total": -1})
             row = {key: r.get(key, '') for key in RULE_COL_ORDER}
             row["fixed_D"] = sc.get("D", -1)
             row["fixed_E"] = sc.get("E", -1)
             row["fixed_N"] = sc.get("N", -1)
+            row["fixed_Total"] = sc.get("Total", -1)
             rules_rows.append(row)
         df_rules = pd.DataFrame(rules_rows, index=doctor_names)
         df_rules.index.name = 'Name'
@@ -770,9 +843,11 @@ with st.sidebar:
                         "D": int(row["fixed_D"]) if "fixed_D" in row.index and pd.notna(row["fixed_D"]) else -1,
                         "E": int(row["fixed_E"]) if "fixed_E" in row.index and pd.notna(row["fixed_E"]) else -1,
                         "N": int(row["fixed_N"]) if "fixed_N" in row.index and pd.notna(row["fixed_N"]) else -1,
+                        "Total": int(row["fixed_Total"]) if "fixed_Total" in row.index and pd.notna(row["fixed_Total"]) else -1,
                     }
                 st.session_state.rules = new_rules
                 st.session_state.shift_counts = new_shift_counts
+                normalize_shift_counts()
 
                 # shift_adj도 Doctors 시트에서 복원
                 st.session_state.shift_adj = {
@@ -790,6 +865,7 @@ with st.sidebar:
                 st.session_state.duty_requests = loaded_duty
                 st.session_state.num_days = len(loaded_duty)
                 st.session_state.day_types = auto_day_types(st.session_state.start_date, st.session_state.num_days)
+                st.session_state["duty_req_version"] = st.session_state.get("duty_req_version", 0) + 1
 
                 # 4) ShiftRequests
                 name_to_doc_idx = {doc['name']: i for i, doc in enumerate(st.session_state.doctors)}
@@ -984,10 +1060,11 @@ with tab2:
                 di = chunk_start + ci
                 if di < num_days:
                     cur_val = st.session_state.duty_requests.get(di, [1,1,1])[shift_i]
+                    duty_ver = st.session_state.get("duty_req_version", 0)
                     new_val = cols2[ci+1].number_input(
                         f"duty_{di}_{shift_i}", min_value=0, max_value=len(doctors),
                         value=cur_val, label_visibility="collapsed",
-                        key=f"duty_{di}_{shift_i}"
+                        key=f"duty_{di}_{shift_i}_v{duty_ver}"
                     )
                     if di not in st.session_state.duty_requests:
                         st.session_state.duty_requests[di] = [1,1,1]
@@ -996,6 +1073,8 @@ with tab2:
                     cols2[ci+1].empty()
 
         st.divider()
+
+    render_fixed_total_duty_summary(num_days)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1143,18 +1222,20 @@ with tab3:
             st.session_state.shift_adj[ni] = int(new_val)
             doctors[ni]["shift_adj"] = int(new_val)
 
-        # D/E/N 고정 개수 (-1 = 평준화)
+        # Total/D/E/N 고정 개수 (-1 = 평준화)
         st.markdown(
             "<span style='font-family:var(--mono);font-size:0.68rem;color:var(--text-dim)'>"
-            "▸ D/E/N 고정 개수 (-1 = 자동 평준화)</span>",
+            "▸ Total/D/E/N 고정 개수 (-1 = 자동 평준화)</span>",
             unsafe_allow_html=True
         )
-        for shift_key, shift_label in [("D", "D 고정"), ("E", "E 고정"), ("N", "N 고정")]:
+        for shift_key, shift_label in [("Total", "Total 고정"), ("D", "D 고정"), ("E", "E 고정"), ("N", "N 고정")]:
             sc_cols = st.columns([2] + [1] * chunk_size)
             sc_cols[0].markdown(f"<span style='font-size:0.75rem'>{shift_label}</span>", unsafe_allow_html=True)
             for ci, ni in enumerate(range(chunk_start, chunk_end)):
                 if ni not in st.session_state.shift_counts:
-                    st.session_state.shift_counts[ni] = {"D": -1, "E": -1, "N": -1}
+                    st.session_state.shift_counts[ni] = {"D": -1, "E": -1, "N": -1, "Total": -1}
+                if "Total" not in st.session_state.shift_counts[ni]:
+                    st.session_state.shift_counts[ni]["Total"] = -1
                 cur = int(st.session_state.shift_counts[ni].get(shift_key, -1))
                 new_val = sc_cols[ci+1].number_input(
                     f"sc_{shift_key}_{ni}", min_value=-1, max_value=60,
@@ -1254,11 +1335,10 @@ with tab4:
         sol = solutions[sol_idx]
         summary = summaries[sol_idx]
 
-        # 화면/Excel 표시 순서: grade 높은 순서로 묶고, 같은 grade 안에서는 기존 입력 순서 유지
-        display_order = sorted(
-            range(len(doctors)),
-            key=lambda ni: (-int(doctors[ni].get("grade", DEFAULT_DOCTOR_GRADE)), ni)
-        )
+        # 화면/Excel 표시 순서: 의사 입력 순서 그대로 유지
+        # Grade는 표시하되, Grade 값으로 재정렬하지 않는다.
+        # 즉 근무 요청/날짜 설정 탭에서 보이는 의사 순서와 결과표/Excel 순서가 동일하다.
+        display_order = list(range(len(doctors)))
         name_to_grade = {doc["name"]: int(doc.get("grade", DEFAULT_DOCTOR_GRADE)) for doc in doctors}
         name_to_display_order = {doctors[ni]["name"]: order for order, ni in enumerate(display_order)}
 
@@ -1268,7 +1348,7 @@ with tab4:
         summary_display["_display_order"] = summary_display["Name"].map(name_to_display_order).fillna(9999).astype(int)
         summary_display = (
             summary_display
-            .sort_values(["Grade", "_display_order"], ascending=[False, True], kind="stable")
+            .sort_values(["_display_order"], ascending=[True], kind="stable")
             .drop(columns=["_display_order"])
         )
 
@@ -1310,7 +1390,8 @@ with tab4:
         # ── 통합 근무표: 표시 + 셀 선택/고정 ────────────────────────────────
         st.markdown('<div class="section-label">근무 일정표 / 셀 선택 & 고정</div>', unsafe_allow_html=True)
         st.caption(
-            "이 표에서 셀을 클릭(또는 드래그)해 선택한 뒤 **선택 셀 고정**을 누르면 현재 결과값이 hard request로 고정됩니다. "
+            "근무 요청/날짜 설정 탭의 의사 입력 순서 그대로 표시합니다. Grade는 이름 옆에 G값으로 표시하지만 Grade순 정렬은 하지 않습니다. "
+            "셀을 클릭(또는 드래그)해 선택한 뒤 **선택 셀 고정**을 누르면 현재 결과값이 hard request로 고정됩니다. "
             "🔒 표시는 이미 base request 또는 fixed layer로 하드코딩된 셀입니다. "
             "날짜는 `일자+요일` 형식이며, `*`는 평일 공휴일입니다. 표 높이는 인원 수에 맞춰 자동으로 늘어납니다."
         )
@@ -1340,7 +1421,10 @@ with tab4:
         editor_rows = {}
         for ni in display_order:
             doc = doctors[ni]
-            row_label = f"[G{int(doc.get('grade', DEFAULT_DOCTOR_GRADE))}] {doc['name']}"
+            grade_val = int(doc.get("grade", DEFAULT_DOCTOR_GRADE))
+            # Grade는 표시만 하고, 정렬 기준으로 사용하지 않는다.
+            # 행 순서는 근무 요청/날짜 설정 탭의 의사 입력 순서와 동일하다.
+            row_label = f"{doc['name']} [G{grade_val}]"
             editor_row_order.append((ni, row_label))
             editor_rows[row_label] = []
             for di in range(num_days):
@@ -1455,7 +1539,7 @@ with tab4:
                         d_cnt = sum(1 for di in range(num_days) if combined_req.get((ni, di), '') == 'D')
                         e_cnt = sum(1 for di in range(num_days) if combined_req.get((ni, di), '') == 'E')
                         n_cnt = sum(1 for di in range(num_days) if combined_req.get((ni, di), '') == 'N')
-                        new_shift_counts[ni] = {"D": d_cnt, "E": e_cnt, "N": n_cnt}
+                        new_shift_counts[ni] = {"D": d_cnt, "E": e_cnt, "N": n_cnt, "Total": d_cnt + e_cnt + n_cnt}
                 st.session_state.shift_counts = new_shift_counts
                 st.session_state["shift_req_version"] = st.session_state.get("shift_req_version", 0) + 1
                 st.toast(f"🔒 {len(positions)}개 셀 고정 완료!", icon="🔒")

@@ -89,7 +89,10 @@ def build_and_solve(params: dict[str, Any]):
     shift_counts_raw = params.get("shift_counts", {})
     shift_counts = {}
     for k, v in shift_counts_raw.items():
-        shift_counts[int(k)] = {sk: int(sv) for sk, sv in v.items()}
+        sc = {sk: int(sv) for sk, sv in v.items()}
+        for sk in ("D", "E", "N", "Total"):
+            sc.setdefault(sk, -1)
+        shift_counts[int(k)] = sc
     grades       = {int(k): int(v) for k, v in params.get("grades", {}).items()}
     grade_rules_raw = params.get("grade_rules", {}) or {}
     default_grade_rules = {
@@ -191,6 +194,46 @@ def build_and_solve(params: dict[str, Any]):
 
     s_rate   = [total_s[s] / total_duty if total_duty else 0 for s in all_shifts]
     hol_rate = total_holiday_demand / total_duty if total_duty else 0
+
+    # ── fixed_total validation / average ─────────────────────────────────────
+    # shift_counts[n]["Total"] >= 0 means the doctor's total number of shifts is hard-fixed.
+    fixed_total_by_doc = {
+        n: int(shift_counts.get(n, {}).get("Total", -1))
+        for n in all_doctors
+        if int(shift_counts.get(n, {}).get("Total", -1)) >= 0
+    }
+    fixed_total_sum = sum(fixed_total_by_doc.values())
+    free_total_doctors = [n for n in all_doctors if n not in fixed_total_by_doc]
+
+    if fixed_total_sum > total_duty:
+        raise RuntimeError(
+            f"fixed_total 합({fixed_total_sum})이 Duty 총합({total_duty})보다 {fixed_total_sum - total_duty}개 많습니다. "
+            f"Duty 설정에서 총 근무를 추가하거나 fixed_total을 줄여주세요."
+        )
+    if not free_total_doctors and fixed_total_sum != total_duty:
+        raise RuntimeError(
+            f"모든 의사의 fixed_total이 지정되어 있지만 합({fixed_total_sum})이 Duty 총합({total_duty})과 다릅니다. "
+            f"차이={total_duty - fixed_total_sum}개입니다."
+        )
+
+    for n, fixed_total in fixed_total_by_doc.items():
+        sc = shift_counts.get(n, {})
+        fixed_shift_sum = sum(int(sc.get(sk, -1)) for sk in ("D", "E", "N") if int(sc.get(sk, -1)) >= 0)
+        if fixed_shift_sum > fixed_total:
+            raise RuntimeError(
+                f"{names[n]}의 fixed_D/E/N 합({fixed_shift_sum})이 fixed_total({fixed_total})보다 큽니다."
+            )
+        if all(int(sc.get(sk, -1)) >= 0 for sk in ("D", "E", "N")) and fixed_shift_sum != fixed_total:
+            raise RuntimeError(
+                f"{names[n]}의 fixed_D+fixed_E+fixed_N={fixed_shift_sum}인데 fixed_total={fixed_total}입니다. "
+                f"모두 고정한 경우 두 값이 같아야 합니다."
+            )
+
+    free_total_adj = sum(shift_adj.get(n, 0) for n in free_total_doctors)
+    avr_total_free = (
+        (total_duty - fixed_total_sum - free_total_adj) / len(free_total_doctors)
+        if free_total_doctors else 0.0
+    )
 
     # ── Shift별 독립 평균 계산 ────────────────────────────────────────────────
     # D/E/N 각각: fix된 사람 제외 후 나머지 인원 기준으로 평균 계산
@@ -463,10 +506,10 @@ def build_and_solve(params: dict[str, Any]):
                 model.Add(dev_dn <= k4 * r)
 
     # ── Soft balancing (deviation minimization) ───────────────────────────────
-    k  = model.NewIntVar(0, 12, 'k_DE')
-    k1 = model.NewIntVar(0, 12, 'k1_holiday')
-    k2 = model.NewIntVar(0, 12, 'k2_total')
-    k3 = model.NewIntVar(0, 12, 'k3_N')
+    k  = model.NewIntVar(0, 6, 'k_DE')
+    k1 = model.NewIntVar(0, 6, 'k1_holiday')
+    k2 = model.NewIntVar(0, 6, 'k2_total')
+    k3 = model.NewIntVar(0, 6, 'k3_N')
 
     for n in all_doctors:
         adj     = shift_adj.get(n, 0)
@@ -474,6 +517,8 @@ def build_and_solve(params: dict[str, Any]):
         fixed_d = sc.get("D", -1)
         fixed_e = sc.get("E", -1)
         fixed_n = sc.get("N", -1)
+        fixed_total = sc.get("Total", -1)
+        is_total_fixed = fixed_total >= 0
         is_fully_fixed = (fixed_d >= 0 and fixed_e >= 0 and fixed_n >= 0)
 
         num_s = [sum(shifts[(n,d,s)] for d in all_days) for s in all_shifts]
@@ -484,6 +529,7 @@ def build_and_solve(params: dict[str, Any]):
         if fixed_d >= 0: model.Add(num_s[0] == fixed_d)
         if fixed_e >= 0: model.Add(num_s[1] == fixed_e)
         if fixed_n >= 0: model.Add(num_s[2] == fixed_n)
+        if fixed_total >= 0: model.Add(num_total == fixed_total)
 
         dev_de  = [model.NewIntVar(0, 6, f'dde_{n}_{x}') for x in range(2)]
         dev_hol = [model.NewIntVar(0, 6, f'dhol_{n}_{x}') for x in range(2)]
@@ -527,14 +573,13 @@ def build_and_solve(params: dict[str, Any]):
                 model.Add(int(avr_n + adj * s_rate[2]) - dev_N[0] <= num_s[2])
                 model.Add(num_s[2] <= _max_avr(avr_n + adj * s_rate[2]) + dev_N[1])
 
-            # Total — 이 사람의 free/fix shift 평균 합
-            avr_total_n = (
-                (avr_d if fixed_d < 0 else fixed_d) +
-                (avr_e if fixed_e < 0 else fixed_e) +
-                (avr_n if fixed_n < 0 else fixed_n)
-            )
-            model.Add(int(avr_total_n + adj) - dev_tot[0] <= num_total)
-            model.Add(num_total <= _max_avr(avr_total_n + adj) + dev_tot[1])
+            # Total — fixed_total이 있으면 hard count이므로 total deviation에서 제외.
+            # fixed_total이 없는 사람끼리 남은 총근무수를 평준화한다.
+            if is_total_fixed:
+                model.Add(dev_tot[0] == 0); model.Add(dev_tot[1] == 0)
+            else:
+                model.Add(int(avr_total_free + adj) - dev_tot[0] <= num_total)
+                model.Add(num_total <= _max_avr(avr_total_free + adj) + dev_tot[1])
 
             # Holiday — fix 무관 전체 인원 기준
             model.Add(int(avr_holiday + adj * hol_rate) - dev_hol[0] <= hol_worked)
