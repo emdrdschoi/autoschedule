@@ -605,12 +605,16 @@ def build_schedule_excel_bytes(
     export_rows = []
     for ni in display_order:
         doc = doctors[ni]
-        row = {"Name": doc["name"], "Grade": int(doc.get("grade", DEFAULT_DOCTOR_GRADE))}
+        row = {
+            "No": int(ni) + 1,
+            "Name": doc["name"],
+            "Grade": int(doc.get("grade", DEFAULT_DOCTOR_GRADE)),
+        }
         for di, col in enumerate(date_cols):
             val = sol.get((ni, di), "")
             row[col] = val.upper() if val else ""
         export_rows.append(row)
-    export_df = pd.DataFrame(export_rows).set_index("Name")
+    export_df = pd.DataFrame(export_rows)
 
     rule_col_order = [
         "rule_max_shifts_per_day", "rule_n_block_max", "rule_n_rest", "rule_n_gap",
@@ -645,7 +649,7 @@ def build_schedule_excel_bytes(
 
     towrite = BytesIO()
     with pd.ExcelWriter(towrite, engine="openpyxl") as writer:
-        export_df.to_excel(writer, sheet_name="Schedule")
+        export_df.to_excel(writer, sheet_name="Schedule", index=False)
         summary_display.to_excel(writer, sheet_name="Summary", index=False)
         rules_df.to_excel(writer, sheet_name="Rules", index=False)
         grade_rules_to_df(st.session_state.grade_rules).to_excel(writer, sheet_name="GradeRules", index=False)
@@ -1395,17 +1399,27 @@ with tab4:
         summary_display = summary.copy()
         if "Grade" not in summary_display.columns:
             summary_display.insert(1, "Grade", summary_display["Name"].map(name_to_grade).fillna(DEFAULT_DOCTOR_GRADE).astype(int))
+        # Summary도 Name 정렬이 아니라 근무 요청/날짜 설정 탭의 입력 순서 그대로 표시한다.
+        # 맨 왼쪽 No는 사용자가 입력/Excel에서 보는 의사 순서(1-based index)이다.
         summary_display["_display_order"] = summary_display["Name"].map(name_to_display_order).fillna(9999).astype(int)
         summary_display = (
             summary_display
             .sort_values(["_display_order"], ascending=[True], kind="stable")
             .drop(columns=["_display_order"])
         )
+        if "No" in summary_display.columns:
+            summary_display = summary_display.drop(columns=["No"])
+        summary_display.insert(
+            0,
+            "No",
+            summary_display["Name"].map(lambda nm: name_to_display_order.get(nm, -1) + 1 if nm in name_to_display_order else "")
+        )
 
         # Excel export는 화면 이동 때마다 만들지 않고, 아래의 "Excel 준비" 버튼을 눌렀을 때만 생성합니다.
 
         # Summary stats
         st.markdown('<div class="section-label">근무 통계</div>', unsafe_allow_html=True)
+        st.caption("No는 근무 요청/날짜 설정 탭 및 Excel 입력 순서 기준입니다. Name으로 자동 정렬하지 않습니다.")
         try:
             st.dataframe(
                 summary_display.style.background_gradient(subset=['Total'], cmap='Blues')
