@@ -311,6 +311,7 @@ def _init_state():
         "solved": False,
         "shift_req_version": 0,  # key versioning for shift_request widgets
         "duty_req_version": 0,   # key versioning for duty number_input widgets
+        "shift_count_version": 0, # key versioning for fixed Total/D/E/N count widgets
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -848,6 +849,9 @@ with st.sidebar:
                 st.session_state.rules = new_rules
                 st.session_state.shift_counts = new_shift_counts
                 normalize_shift_counts()
+                # Excel 불러오기 후 Total/D/E/N 고정 개수 입력 위젯이
+                # 이전 값을 붙잡지 않도록 key version을 갱신한다.
+                st.session_state["shift_count_version"] = st.session_state.get("shift_count_version", 0) + 1
 
                 # shift_adj도 Doctors 시트에서 복원
                 st.session_state.shift_adj = {
@@ -1030,6 +1034,8 @@ with tab1:
 with tab2:
     st.markdown('<div class="section-label">날짜별 필요 인원 설정</div>', unsafe_allow_html=True)
     st.caption("각 날짜마다 Day / Evening / Night 에 필요한 의사 수를 설정합니다.")
+    st.caption("아래 요약에서 Duty 총합과 fixed_total 합을 먼저 확인하세요. 숫자가 맞지 않으면 solver가 해를 찾을 수 없습니다.")
+    render_fixed_total_duty_summary(num_days)
 
     for chunk_start in range(0, num_days, CHUNK):
         cols = st.columns(CHUNK + 1)  # Always 8 columns (1 + 7)
@@ -1073,8 +1079,6 @@ with tab2:
                     cols2[ci+1].empty()
 
         st.divider()
-
-    render_fixed_total_duty_summary(num_days)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1237,9 +1241,10 @@ with tab3:
                 if "Total" not in st.session_state.shift_counts[ni]:
                     st.session_state.shift_counts[ni]["Total"] = -1
                 cur = int(st.session_state.shift_counts[ni].get(shift_key, -1))
+                sc_ver = st.session_state.get("shift_count_version", 0)
                 new_val = sc_cols[ci+1].number_input(
                     f"sc_{shift_key}_{ni}", min_value=-1, max_value=60,
-                    value=cur, label_visibility="collapsed", key=f"sc_{shift_key}_{ni}"
+                    value=cur, label_visibility="collapsed", key=f"sc_{shift_key}_{ni}_v{sc_ver}"
                 )
                 st.session_state.shift_counts[ni][shift_key] = int(new_val)
 
@@ -1283,6 +1288,22 @@ if st.session_state.get("trigger_solve"):
     if not doctors:
         st.error("의사를 먼저 추가해 주세요.")
     else:
+        fixed_total_info = get_fixed_total_summary()
+        if fixed_total_info["fixed_count"] > 0 and fixed_total_info["remaining"] < 0:
+            st.error(
+                f"fixed_total 합이 Duty 총합보다 {-fixed_total_info['remaining']}개 많습니다. "
+                f"Duty 설정에서 총 근무를 {-fixed_total_info['remaining']}개 추가하거나 fixed_total을 줄여주세요."
+            )
+            st.info("📋 Duty 설정 탭 상단의 fixed_total 요약을 확인하세요.")
+            st.stop()
+        if fixed_total_info["fixed_count"] > 0 and fixed_total_info["free_count"] == 0 and fixed_total_info["remaining"] != 0:
+            st.error(
+                f"모든 의사의 fixed_total이 지정되어 있는데 Duty 총합과 {fixed_total_info['remaining']}개 차이가 납니다. "
+                "Duty 설정 또는 fixed_total을 맞춰주세요."
+            )
+            st.info("📋 Duty 설정 탭 상단의 fixed_total 요약을 확인하세요.")
+            st.stop()
+
         with st.spinner("최적 스케줄을 계산 중입니다..."):
             try:
                 from scheduler import build_and_solve
