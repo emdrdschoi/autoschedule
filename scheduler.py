@@ -463,10 +463,10 @@ def build_and_solve(params: dict[str, Any]):
                 model.Add(dev_dn <= k4 * r)
 
     # ── Soft balancing (deviation minimization) ───────────────────────────────
-    k  = model.NewIntVar(0, 6, 'k_DE')
-    k1 = model.NewIntVar(0, 6, 'k1_holiday')
-    k2 = model.NewIntVar(0, 6, 'k2_total')
-    k3 = model.NewIntVar(0, 6, 'k3_N')
+    k  = model.NewIntVar(0, 12, 'k_DE')
+    k1 = model.NewIntVar(0, 12, 'k1_holiday')
+    k2 = model.NewIntVar(0, 12, 'k2_total')
+    k3 = model.NewIntVar(0, 12, 'k3_N')
 
     for n in all_doctors:
         adj     = shift_adj.get(n, 0)
