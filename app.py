@@ -433,26 +433,55 @@ def render_fixed_total_duty_summary(num_days: int):
     e_total = sum(st.session_state.duty_requests.get(di, [0, 0, 0])[1] for di in range(num_days))
     n_total = sum(st.session_state.duty_requests.get(di, [0, 0, 0])[2] for di in range(num_days))
     remaining = fixed_total_info["remaining"]
+    diff_text = f"{remaining:+d}"
+
+    if fixed_total_info["fixed_count"] == 0:
+        comment = "fixed_total이 지정된 사람이 없습니다. 총근무 수는 자동 평준화됩니다."
+    elif remaining == 0:
+        comment = "차이 0: Duty 총합과 fixed_total 합이 정확히 맞습니다."
+    elif remaining > 0:
+        if fixed_total_info["free_count"] > 0:
+            comment = (
+                f"차이 {diff_text}: Duty 총합이 fixed_total 합보다 {remaining}개 많습니다. "
+                f"현재는 fixed_total 미지정 인원 {fixed_total_info['free_count']}명에게 {remaining}개가 자동 배분됩니다. "
+                f"모든 인원의 Total을 고정하려면 Duty를 {remaining}개 줄이거나 fixed_total을 {remaining}개 늘리세요."
+            )
+        else:
+            comment = (
+                f"차이 {diff_text}: Duty 총합이 fixed_total 합보다 {remaining}개 많습니다. "
+                f"Duty를 {remaining}개 줄이거나 fixed_total을 {remaining}개 늘려야 합니다."
+            )
+    else:
+        over = -remaining
+        comment = (
+            f"차이 {diff_text}: fixed_total 합이 Duty 총합보다 {over}개 많습니다. "
+            f"Duty를 {over}개 늘리거나 fixed_total을 {over}개 줄여야 합니다."
+        )
+
     st.markdown(
         f"""
-        <div style='font-family:var(--mono);font-size:0.78rem;line-height:1.45;
-                    padding:0.55rem 0.7rem;border:1px solid var(--border);border-radius:4px;
-                    background:var(--surface);margin:0.7rem 0;'>
-        Duty 총합: <b>{fixed_total_info['total_duty']}</b>
-        <span style='color:var(--text-dim)'>(D {d_total} / E {e_total} / N {n_total})</span>
-        &nbsp;|&nbsp; fixed_total 합: <b>{fixed_total_info['fixed_sum']}</b>
-        &nbsp;|&nbsp; fixed_total 미지정 인원: <b>{fixed_total_info['free_count']}</b>
-        &nbsp;|&nbsp; 남은 근무수: <b style='color:{'#e05c5c' if remaining < 0 else '#54c78a'}'>{remaining}</b>
+        <div style='font-family:var(--mono);font-size:0.80rem;line-height:1.55;
+                    padding:0.65rem 0.8rem;border:1px solid #4b5563;border-radius:5px;
+                    background:#1f2937;color:#ffffff;margin:0.7rem 0;'>
+            <div>
+                <span style='color:#ffffff;'>Duty 총합:</span> <b style='color:#ffffff;'>{fixed_total_info['total_duty']}</b>
+                <span style='color:#e5e7eb;'>(D {d_total} / E {e_total} / N {n_total})</span>
+                &nbsp;|&nbsp; <span style='color:#ffffff;'>fixed_total 합:</span> <b style='color:#ffffff;'>{fixed_total_info['fixed_sum']}</b>
+                &nbsp;|&nbsp; <span style='color:#ffffff;'>fixed_total 미지정 인원:</span> <b style='color:#ffffff;'>{fixed_total_info['free_count']}</b>
+                &nbsp;|&nbsp; <span style='color:#ffffff;'>차이:</span> <b style='color:#ffffff;'>{diff_text}</b>
+                &nbsp;|&nbsp; <span style='color:#ffffff;'>남은 근무수:</span> <b style='color:#ffffff;'>{remaining}</b>
+            </div>
+            <div style='margin-top:0.35rem;color:#ffffff;font-weight:600;'>💬 {comment}</div>
         </div>
         """,
         unsafe_allow_html=True
     )
     if fixed_total_info["fixed_count"] > 0:
         if remaining < 0:
-            st.error(f"fixed_total 합이 Duty 총합보다 {-remaining}개 많습니다. Duty 설정에서 총 근무를 {-remaining}개 추가하거나 fixed_total을 줄여야 합니다.")
-        elif fixed_total_info["free_count"] == 0 and remaining != 0:
-            st.error(f"모든 의사의 fixed_total이 지정되어 있는데 Duty 총합과 {remaining}개 차이가 납니다. Duty 설정 또는 fixed_total을 맞춰주세요.")
-        elif fixed_total_info["free_count"] > 0:
+            st.error(f"fixed_total 합이 Duty 총합보다 {-remaining}개 많습니다. Duty를 {-remaining}개 늘리거나 fixed_total을 {-remaining}개 줄여야 합니다.")
+        elif fixed_total_info["free_count"] == 0 and remaining > 0:
+            st.error(f"모든 의사의 fixed_total이 지정되어 있는데 Duty 총합이 fixed_total 합보다 {remaining}개 많습니다. Duty를 {remaining}개 줄이거나 fixed_total을 {remaining}개 늘려야 합니다.")
+        elif fixed_total_info["free_count"] > 0 and remaining >= 0:
             st.info(f"fixed_total이 없는 {fixed_total_info['free_count']}명에게 남은 근무수 {remaining}개가 자동 배분됩니다.")
 
 def grade_rules_to_df(grade_rules: dict) -> pd.DataFrame:
