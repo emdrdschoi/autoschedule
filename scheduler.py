@@ -34,8 +34,8 @@ def _max_avr(x: float) -> int:
 
 def _parse_shift_request(cell: str):
     """Return (cannot_d, cannot_e, cannot_n) booleans from a cell string."""
-    c = cell.lower()
-    if 'x' in c or 'den' in c:
+    c = str(cell).strip().lower()
+    if 'a' in c or 'x' in c or 'den' in c:
         return (True, True, True)
     return (
         'd' in c and 'D' not in cell,
@@ -163,6 +163,7 @@ def build_and_solve(params: dict[str, Any]):
     # shift_requests[n][d][s] = 1 if doctor n cannot work shift s on day d
     shift_requests  = [[[0]*3 for _ in all_days] for _ in all_doctors]
     shift_requests1 = [[[0]*3 for _ in all_days] for _ in all_doctors]
+    annual_leave_counts = {n: 0 for n in all_doctors}
     for key, cell in sr_raw.items():
         if not cell:
             continue
@@ -170,7 +171,10 @@ def build_and_solve(params: dict[str, Any]):
         n, d = int(n_str), int(d_str)
         if n >= num_doctors or d >= num_days:
             continue
-        cant = _parse_shift_request(cell)
+        cell_text = str(cell).strip()
+        if 'a' in cell_text.lower():
+            annual_leave_counts[n] += 1
+        cant = _parse_shift_request(cell_text)
         wish = _parse_shift_wish(cell)
         for s in range(3):
             if cant[s]:
@@ -229,7 +233,15 @@ def build_and_solve(params: dict[str, Any]):
                 f"모두 고정한 경우 두 값이 같아야 합니다."
             )
 
-    free_total_adj = sum(shift_adj.get(n, 0) for n in free_total_doctors)
+    # Annual leave ('a') is treated as hard off like x, but for balancing it acts
+    # like an extra -1 shift adjustment per leave day. This does not change any
+    # fixed_Total hard constraint: doctors with fixed_Total keep their hard total.
+    balance_shift_adj = {
+        n: shift_adj.get(n, 0) - (0 if n in fixed_total_by_doc else annual_leave_counts.get(n, 0))
+        for n in all_doctors
+    }
+
+    free_total_adj = sum(balance_shift_adj.get(n, 0) for n in free_total_doctors)
     avr_total_free = (
         (total_duty - fixed_total_sum - free_total_adj) / len(free_total_doctors)
         if free_total_doctors else 0.0
@@ -253,7 +265,7 @@ def build_and_solve(params: dict[str, Any]):
         ]
         if not free_ns:
             return 0.0, []
-        free_adj = sum(shift_adj.get(n, 0) for n in free_ns)
+        free_adj = sum(balance_shift_adj.get(n, 0) for n in free_ns)
         avr = (total_s[shift_idx] - fixed_sum - free_adj * s_rate[shift_idx]) / len(free_ns)
         return avr, free_ns
 
@@ -263,7 +275,7 @@ def build_and_solve(params: dict[str, Any]):
 
     # Total 평균: 세 shift 평균 합 (인원별로 자기가 free인 shift 평균의 합)
     # Holiday 평균: 전체 인원 기준 유지
-    adj_sum = sum(shift_adj.get(n, 0) for n in all_doctors)
+    adj_sum = sum(balance_shift_adj.get(n, 0) for n in all_doctors)
     avr_holiday = (total_holiday_demand - adj_sum * hol_rate) / num_doctors
 
     # ── Build model ───────────────────────────────────────────────────────────
@@ -512,7 +524,7 @@ def build_and_solve(params: dict[str, Any]):
     k3 = model.NewIntVar(0, 6, 'k3_N')
 
     for n in all_doctors:
-        adj     = shift_adj.get(n, 0)
+        adj     = balance_shift_adj.get(n, 0)
         sc      = shift_counts.get(n, {})
         fixed_d = sc.get("D", -1)
         fixed_e = sc.get("E", -1)
@@ -632,16 +644,16 @@ def build_and_solve(params: dict[str, Any]):
             n_cnt = sum(sol_fn(shifts[(n,d,2)]) for d in all_days)
             tot   = d_cnt + e_cnt + n_cnt
             hol   = sum(sol_fn(shifts[(n,d,s)]) for d in holiday for s in all_shifts)
-            tue_n = sum(sol_fn(shifts[(n,d,2)]) for d in all_days if day_names_list[d] == '화')
             fri_n = sum(sol_fn(shifts[(n,d,2)]) for d in all_days if day_names_list[d] == '금')
+            annual_cnt = annual_leave_counts.get(n, 0)
             rows.append({
                 'Name': names[n],
                 'Grade': grades.get(n, 2),
                 'Senior': 'Y' if grades.get(n, 2) >= senior_min_grade else '',
                 'Junior': 'Y' if grades.get(n, 2) <= junior_max_grade else '',
                 'D': d_cnt, 'E': e_cnt, 'N': n_cnt,
-                'Total': tot, 'Holiday': hol,
-                'Tue_N': tue_n, 'Fri_N': fri_n,
+                'Total': tot, '연차': annual_cnt, 'Holiday': hol,
+                'Fri_N': fri_n,
                 '주간평균hr': round((d_cnt*8 + e_cnt*9 + n_cnt*8) / num_days * 7, 2),
             })
         return sol, pd.DataFrame(rows)

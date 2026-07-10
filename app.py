@@ -312,6 +312,8 @@ def _init_state():
         "shift_req_version": 0,  # key versioning for shift_request widgets
         "duty_req_version": 0,   # key versioning for duty number_input widgets
         "shift_count_version": 0, # key versioning for fixed Total/D/E/N count widgets
+        "grade_version": 0,       # key versioning for individual grade widgets
+        "grade_rule_version": 0,  # key versioning for global grade rule widgets
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -339,6 +341,20 @@ DEFAULT_RULES = {
 }
 
 DEFAULT_DOCTOR_GRADE = 2
+GRADE_MIN_VALUE = 1
+GRADE_MAX_VALUE = 10
+
+def bounded_int(value, default: int, min_value: int, max_value: int) -> int:
+    """Convert to int and keep Streamlit number_input values inside allowed bounds."""
+    try:
+        if value is None or pd.isna(value):
+            val = int(default)
+        else:
+            val = int(value)
+    except (TypeError, ValueError):
+        val = int(default)
+    return max(int(min_value), min(int(max_value), val))
+
 DEFAULT_GRADE_RULES = {
     "senior_min_grade": 2,       # grade >= this is treated as senior
     "senior_min_count": 1,       # hard: at least this many seniors per duty
@@ -361,6 +377,7 @@ GRADE_RULE_LABELS = {
     "weight_holiday_dev": "휴일 편차 가중치",
     "weight_total_dev": "총 근무 편차 가중치",
     "weight_n_dev": "N 편차 가중치",
+    "weight_grade_dev": "Grade 편차 가중치",
 }
 
 def normalize_doctors():
@@ -369,22 +386,33 @@ def normalize_doctors():
         if "grade" not in doc or pd.isna(doc.get("grade")):
             doc["grade"] = DEFAULT_DOCTOR_GRADE
         else:
-            doc["grade"] = int(doc.get("grade", DEFAULT_DOCTOR_GRADE))
+            doc["grade"] = bounded_int(doc.get("grade", DEFAULT_DOCTOR_GRADE), DEFAULT_DOCTOR_GRADE, GRADE_MIN_VALUE, GRADE_MAX_VALUE)
         if "shift_adj" not in doc or pd.isna(doc.get("shift_adj")):
             doc["shift_adj"] = 0
         else:
             doc["shift_adj"] = int(doc.get("shift_adj", 0))
 
 def normalize_grade_rules():
-    """Ensure global GradeRules exist and are integers."""
+    """Ensure global GradeRules exist and stay within Streamlit widget bounds."""
     if "grade_rules" not in st.session_state or not isinstance(st.session_state.grade_rules, dict):
         st.session_state.grade_rules = DEFAULT_GRADE_RULES.copy()
+    bounds = {
+        "senior_min_grade": (GRADE_MIN_VALUE, GRADE_MAX_VALUE),
+        "senior_min_count": (0, 10),
+        "junior_max_grade": (GRADE_MIN_VALUE, GRADE_MAX_VALUE),
+        "junior_soft_max_count": (0, 10),
+        "junior_penalty_weight": (0, 100),
+        "weight_de_dev": (0, 100),
+        "weight_holiday_dev": (0, 100),
+        "weight_total_dev": (0, 100),
+        "weight_n_dev": (0, 100),
+        "weight_grade_dev": (0, 100),
+    }
     for key, default in DEFAULT_GRADE_RULES.items():
-        val = st.session_state.grade_rules.get(key, default)
-        try:
-            st.session_state.grade_rules[key] = int(val)
-        except (TypeError, ValueError):
-            st.session_state.grade_rules[key] = default
+        min_v, max_v = bounds.get(key, (-10_000, 10_000))
+        st.session_state.grade_rules[key] = bounded_int(
+            st.session_state.grade_rules.get(key, default), default, min_v, max_v
+        )
 
 def normalize_shift_counts():
     """Ensure per-doctor fixed D/E/N/Total counts exist. -1 means automatic."""
@@ -502,7 +530,7 @@ def grade_rules_from_df(df: pd.DataFrame) -> dict:
     return rules
 
 
-HARD_SHIFT_VALUES = {"D", "E", "N", "x"}
+HARD_SHIFT_VALUES = {"D", "E", "N", "x", "a"}
 
 def _clean_shift_request_value(val) -> str:
     """Normalize empty/NaN values from widgets and Excel."""
@@ -610,9 +638,14 @@ def build_schedule_excel_bytes(
             "Name": doc["name"],
             "Grade": int(doc.get("grade", DEFAULT_DOCTOR_GRADE)),
         }
+        combined_req = refresh_combined_shift_requests()
         for di, col in enumerate(date_cols):
-            val = sol.get((ni, di), "")
-            row[col] = val.upper() if val else ""
+            req = _clean_shift_request_value(combined_req.get((ni, di), ""))
+            if req.lower() == "a":
+                row[col] = "A"
+            else:
+                val = sol.get((ni, di), "")
+                row[col] = val.upper() if val else ""
         export_rows.append(row)
     export_df = pd.DataFrame(export_rows)
 
@@ -895,6 +928,9 @@ with st.sidebar:
                 # GradeRules
                 st.session_state.grade_rules = grade_rules_from_df(df_grade_rules)
                 normalize_grade_rules()
+                # Excel 불러오기 후 GradeRules/개인 Grade number_input이 이전 값을 붙잡지 않도록 key version을 갱신한다.
+                st.session_state["grade_rule_version"] = st.session_state.get("grade_rule_version", 0) + 1
+                st.session_state["grade_version"] = st.session_state.get("grade_version", 0) + 1
 
                 # 3) DutyRequests
                 loaded_duty = {i: [int(df_duty.iloc[i]['D']), int(df_duty.iloc[i]['E']), int(df_duty.iloc[i]['N'])]
@@ -985,9 +1021,9 @@ with tab1:
     st.caption("셀을 클릭해서 날짜 유형과 의사별로 원하는/못하는 근무를 설정합니다.")
 
     # Combined table: Day types + Per-doctor shift requests
-    st.markdown("**날짜 유형 & 개인별 근무 요청** · `d/e/n` = 못하는 근무 | `D/E/N` = 원하는 근무 | `x` = 전체 불가")
+    st.markdown("**날짜 유형 & 개인별 근무 요청** · `d/e/n` = 못하는 근무 | `D/E/N` = 원하는 근무 | `x` = 전체 불가 | `a` = 연차(off, 근무조정 -1 효과)")
     st.caption("🔒 fixed 표시가 있는 칸은 결과표에서 고정된 셀이므로 여기서는 수정할 수 없습니다. 결과 탭에서 고정 해제 후 수정하세요.")
-    SHIFT_OPTIONS = ['', 'd', 'e', 'n', 'x', 'de', 'dn', 'en', 'den', 'D', 'E', 'N']
+    SHIFT_OPTIONS = ['', 'd', 'e', 'n', 'x', 'a', 'de', 'dn', 'en', 'den', 'D', 'E', 'N']
     day_type_options = ['평일', '토', '일', '공']
 
 
@@ -1134,31 +1170,32 @@ with tab3:
     st.caption("Grade는 개인 속성이고, 고년차/저년차 기준과 objective 가중치는 전체 스케줄에 적용되는 전역 rule입니다.")
 
     gr = st.session_state.grade_rules
+    gr_ver = st.session_state.get("grade_rule_version", 0)
     gcol1, gcol2, gcol3, gcol4, gcol5 = st.columns(5)
     gr["senior_min_grade"] = int(gcol1.number_input(
-        "고년차 기준 grade ≥", min_value=1, max_value=10,
-        value=int(gr.get("senior_min_grade", DEFAULT_GRADE_RULES["senior_min_grade"])),
-        key="grade_senior_min_grade"
+        "고년차 기준 grade ≥", min_value=GRADE_MIN_VALUE, max_value=GRADE_MAX_VALUE,
+        value=bounded_int(gr.get("senior_min_grade", DEFAULT_GRADE_RULES["senior_min_grade"]), DEFAULT_GRADE_RULES["senior_min_grade"], GRADE_MIN_VALUE, GRADE_MAX_VALUE),
+        key=f"grade_senior_min_grade_v{gr_ver}"
     ))
     gr["senior_min_count"] = int(gcol2.number_input(
         "Duty별 고년차 최소", min_value=0, max_value=10,
-        value=int(gr.get("senior_min_count", DEFAULT_GRADE_RULES["senior_min_count"])),
-        key="grade_senior_min_count"
+        value=bounded_int(gr.get("senior_min_count", DEFAULT_GRADE_RULES["senior_min_count"]), DEFAULT_GRADE_RULES["senior_min_count"], 0, 10),
+        key=f"grade_senior_min_count_v{gr_ver}"
     ))
     gr["junior_max_grade"] = int(gcol3.number_input(
-        "저년차 기준 grade ≤", min_value=1, max_value=10,
-        value=int(gr.get("junior_max_grade", DEFAULT_GRADE_RULES["junior_max_grade"])),
-        key="grade_junior_max_grade"
+        "저년차 기준 grade ≤", min_value=GRADE_MIN_VALUE, max_value=GRADE_MAX_VALUE,
+        value=bounded_int(gr.get("junior_max_grade", DEFAULT_GRADE_RULES["junior_max_grade"]), DEFAULT_GRADE_RULES["junior_max_grade"], GRADE_MIN_VALUE, GRADE_MAX_VALUE),
+        key=f"grade_junior_max_grade_v{gr_ver}"
     ))
     gr["junior_soft_max_count"] = int(gcol4.number_input(
         "Duty별 저년차 권장 최대", min_value=0, max_value=10,
-        value=int(gr.get("junior_soft_max_count", DEFAULT_GRADE_RULES["junior_soft_max_count"])),
-        key="grade_junior_soft_max_count"
+        value=bounded_int(gr.get("junior_soft_max_count", DEFAULT_GRADE_RULES["junior_soft_max_count"]), DEFAULT_GRADE_RULES["junior_soft_max_count"], 0, 10),
+        key=f"grade_junior_soft_max_count_v{gr_ver}"
     ))
     gr["junior_penalty_weight"] = int(gcol5.number_input(
         "저년차 초과 penalty", min_value=0, max_value=100,
-        value=int(gr.get("junior_penalty_weight", DEFAULT_GRADE_RULES["junior_penalty_weight"])),
-        key="grade_junior_penalty_weight"
+        value=bounded_int(gr.get("junior_penalty_weight", DEFAULT_GRADE_RULES["junior_penalty_weight"]), DEFAULT_GRADE_RULES["junior_penalty_weight"], 0, 100),
+        key=f"grade_junior_penalty_weight_v{gr_ver}"
     ))
 
     st.markdown('<div class="section-label">편차 가중치 설정</div>', unsafe_allow_html=True)
@@ -1166,28 +1203,28 @@ with tab3:
     wcol1, wcol2, wcol3, wcol4, wcol5 = st.columns(5)
     gr["weight_de_dev"] = int(wcol1.number_input(
         "D/E 편차 가중치", min_value=0, max_value=100,
-        value=int(gr.get("weight_de_dev", DEFAULT_GRADE_RULES["weight_de_dev"])),
-        key="weight_de_dev"
+        value=bounded_int(gr.get("weight_de_dev", DEFAULT_GRADE_RULES["weight_de_dev"]), DEFAULT_GRADE_RULES["weight_de_dev"], 0, 100),
+        key=f"weight_de_dev_v{gr_ver}"
     ))
     gr["weight_holiday_dev"] = int(wcol2.number_input(
         "휴일 편차 가중치", min_value=0, max_value=100,
-        value=int(gr.get("weight_holiday_dev", DEFAULT_GRADE_RULES["weight_holiday_dev"])),
-        key="weight_holiday_dev"
+        value=bounded_int(gr.get("weight_holiday_dev", DEFAULT_GRADE_RULES["weight_holiday_dev"]), DEFAULT_GRADE_RULES["weight_holiday_dev"], 0, 100),
+        key=f"weight_holiday_dev_v{gr_ver}"
     ))
     gr["weight_total_dev"] = int(wcol3.number_input(
         "총 근무 편차 가중치", min_value=0, max_value=100,
-        value=int(gr.get("weight_total_dev", DEFAULT_GRADE_RULES["weight_total_dev"])),
-        key="weight_total_dev"
+        value=bounded_int(gr.get("weight_total_dev", DEFAULT_GRADE_RULES["weight_total_dev"]), DEFAULT_GRADE_RULES["weight_total_dev"], 0, 100),
+        key=f"weight_total_dev_v{gr_ver}"
     ))
     gr["weight_n_dev"] = int(wcol4.number_input(
         "N 편차 가중치", min_value=0, max_value=100,
-        value=int(gr.get("weight_n_dev", DEFAULT_GRADE_RULES["weight_n_dev"])),
-        key="weight_n_dev"
+        value=bounded_int(gr.get("weight_n_dev", DEFAULT_GRADE_RULES["weight_n_dev"]), DEFAULT_GRADE_RULES["weight_n_dev"], 0, 100),
+        key=f"weight_n_dev_v{gr_ver}"
     ))
     gr["weight_grade_dev"] = int(wcol5.number_input(
         "Grade 편차 가중치", min_value=0, max_value=100,
-        value=int(gr.get("weight_grade_dev", DEFAULT_GRADE_RULES.get("weight_grade_dev", 3))),
-        key="weight_grade_dev"
+        value=bounded_int(gr.get("weight_grade_dev", DEFAULT_GRADE_RULES.get("weight_grade_dev", 3)), DEFAULT_GRADE_RULES.get("weight_grade_dev", 3), 0, 100),
+        key=f"weight_grade_dev_v{gr_ver}"
     ))
     st.session_state.grade_rules = gr
     st.markdown(
@@ -1240,10 +1277,11 @@ with tab3:
         grade_cols = st.columns([2] + [1] * chunk_size)
         grade_cols[0].markdown("<span style='font-size:0.75rem'>Grade</span>", unsafe_allow_html=True)
         for ci, ni in enumerate(range(chunk_start, chunk_end)):
-            cur_grade = int(doctors[ni].get("grade", DEFAULT_DOCTOR_GRADE))
+            grade_ver = st.session_state.get("grade_version", 0)
+            cur_grade = bounded_int(doctors[ni].get("grade", DEFAULT_DOCTOR_GRADE), DEFAULT_DOCTOR_GRADE, GRADE_MIN_VALUE, GRADE_MAX_VALUE)
             new_grade = grade_cols[ci+1].number_input(
-                f"grade_{ni}", min_value=1, max_value=10,
-                value=cur_grade, label_visibility="collapsed", key=f"doc_grade_{ni}"
+                f"grade_{ni}", min_value=GRADE_MIN_VALUE, max_value=GRADE_MAX_VALUE,
+                value=cur_grade, label_visibility="collapsed", key=f"doc_grade_{ni}_v{grade_ver}"
             )
             doctors[ni]["grade"] = int(new_grade)
 
@@ -1414,6 +1452,13 @@ with tab4:
             "No",
             summary_display["Name"].map(lambda nm: name_to_display_order.get(nm, -1) + 1 if nm in name_to_display_order else "")
         )
+        # Tue_N은 더 이상 표시하지 않고, 연차는 Total 바로 옆에 둔다.
+        if "Tue_N" in summary_display.columns:
+            summary_display = summary_display.drop(columns=["Tue_N"])
+        if "연차" in summary_display.columns and "Total" in summary_display.columns:
+            annual_col = summary_display.pop("연차")
+            insert_at = list(summary_display.columns).index("Total") + 1
+            summary_display.insert(insert_at, "연차", annual_col)
 
         # Excel export는 화면 이동 때마다 만들지 않고, 아래의 "Excel 준비" 버튼을 눌렀을 때만 생성합니다.
 
@@ -1495,6 +1540,8 @@ with tab4:
                 raw_val = sol.get((ni, di), '')
                 display_val = raw_val.upper() if raw_val else '·'
                 req = combined_req.get((ni, di), '')
+                if _clean_shift_request_value(req).lower() == 'a':
+                    display_val = 'A'
                 if is_hard_shift_request_value(req):
                     display_val = f"🔒{display_val}"
                 editor_rows[row_label].append(display_val)
@@ -1586,8 +1633,12 @@ with tab4:
             else:
                 new_fixed_req = dict(st.session_state.fixed_shift_requests)
                 for ni, di in positions:
-                    val = sol.get((ni, di), '')
-                    new_fixed_req[(ni, di)] = val.upper() if val else 'x'
+                    current_req = _clean_shift_request_value(combined_req.get((ni, di), ''))
+                    if current_req.lower() == 'a':
+                        new_fixed_req[(ni, di)] = 'a'
+                    else:
+                        val = sol.get((ni, di), '')
+                        new_fixed_req[(ni, di)] = val.upper() if val else 'x'
 
                 st.session_state.fixed_shift_requests = new_fixed_req
                 combined_req = refresh_combined_shift_requests()
@@ -1597,7 +1648,7 @@ with tab4:
                 for ni, row_label in editor_row_order:
                     total_fixed = sum(
                         1 for di in range(num_days)
-                        if combined_req.get((ni, di), '') in ('D', 'E', 'N', 'x')
+                        if combined_req.get((ni, di), '') in ('D', 'E', 'N', 'x', 'a')
                     )
                     if total_fixed == num_days:
                         d_cnt = sum(1 for di in range(num_days) if combined_req.get((ni, di), '') == 'D')
