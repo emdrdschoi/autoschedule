@@ -1242,7 +1242,7 @@ with tab3:
         for ci, ni in enumerate(range(chunk_start, chunk_end)):
             cur_grade = int(doctors[ni].get("grade", DEFAULT_DOCTOR_GRADE))
             new_grade = grade_cols[ci+1].number_input(
-                f"grade_{ni}", min_value=1, max_value=5,
+                f"grade_{ni}", min_value=1, max_value=10,
                 value=cur_grade, label_visibility="collapsed", key=f"doc_grade_{ni}"
             )
             doctors[ni]["grade"] = int(new_grade)
