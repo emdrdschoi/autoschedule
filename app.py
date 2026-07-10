@@ -470,13 +470,17 @@ def sync_live_total_summary_inputs(num_days: int | None = None):
                 vals[shift_i] = bounded_int(st.session_state.get(widget_key), vals[shift_i], 0, max(0, len(st.session_state.get("doctors", []))))
         st.session_state.duty_requests[di] = [int(vals[0]), int(vals[1]), int(vals[2])]
 
-    # fixed Total/D/E/N widgets live in Tab 3.
+    # fixed_Total/D/E/N are edited together in the fixed count table.
     normalize_shift_counts()
+    sync_fixed_total_editor_widget()
+    # Backward compatibility: if an older page version still has per-doctor D/E/N
+    # number_input keys in session_state, read them safely. New versions edit these
+    # values in the fixed count table above.
     sc_ver = st.session_state.get("shift_count_version", 0)
     for ni in range(len(st.session_state.get("doctors", []))):
         if ni not in st.session_state.shift_counts:
             st.session_state.shift_counts[ni] = {"D": -1, "E": -1, "N": -1, "Total": -1}
-        for shift_key in ("Total", "D", "E", "N"):
+        for shift_key in ("D", "E", "N"):
             widget_key = f"sc_{shift_key}_{ni}_v{sc_ver}"
             if widget_key in st.session_state:
                 st.session_state.shift_counts[ni][shift_key] = bounded_int(st.session_state.get(widget_key), -1, -1, 60)
@@ -499,6 +503,129 @@ def sync_shift_count_widget(ni: int, shift_key: str, widget_key: str):
     if ni not in st.session_state.shift_counts:
         st.session_state.shift_counts[ni] = {"D": -1, "E": -1, "N": -1, "Total": -1}
     st.session_state.shift_counts[ni][shift_key] = bounded_int(st.session_state.get(widget_key), -1, -1, 60)
+
+
+def get_fixed_total_editor_key() -> str:
+    """Versioned key for the fixed count table editor."""
+    return f"fixed_counts_editor_v{st.session_state.get('shift_count_version', 0)}"
+
+
+def build_fixed_total_editor_df() -> pd.DataFrame:
+    """Build an input-order fixed Total/D/E/N table similar to the result summary table."""
+    normalize_doctors()
+    normalize_grade_rules()
+    normalize_shift_counts()
+    gr = st.session_state.grade_rules
+    senior_min_grade = int(gr.get("senior_min_grade", DEFAULT_GRADE_RULES["senior_min_grade"]))
+    junior_max_grade = int(gr.get("junior_max_grade", DEFAULT_GRADE_RULES["junior_max_grade"]))
+    ultra_max_grade = int(gr.get("ultra_junior_max_grade", DEFAULT_GRADE_RULES.get("ultra_junior_max_grade", 1)))
+
+    rows = []
+    for ni, doc in enumerate(st.session_state.get("doctors", [])):
+        grade = bounded_int(doc.get("grade", DEFAULT_DOCTOR_GRADE), DEFAULT_DOCTOR_GRADE, GRADE_MIN_VALUE, GRADE_MAX_VALUE)
+        sc = st.session_state.shift_counts.get(ni, {})
+        rows.append({
+            "No": ni + 1,
+            "Name": doc.get("name", ""),
+            "Grade": grade,
+            "Senior": "Y" if grade >= senior_min_grade else "",
+            "Junior": "Y" if grade <= junior_max_grade else "",
+            "초저년차": "Y" if grade <= ultra_max_grade else "",
+            "fixed_Total": int(sc.get("Total", -1)),
+            "fixed_D": int(sc.get("D", -1)),
+            "fixed_E": int(sc.get("E", -1)),
+            "fixed_N": int(sc.get("N", -1)),
+        })
+    return pd.DataFrame(rows)
+
+
+def sync_fixed_total_editor_widget():
+    """Callback/sync hook: apply edits from the fixed Total/D/E/N table editor."""
+    key = get_fixed_total_editor_key()
+    editor_state = st.session_state.get(key)
+    if not isinstance(editor_state, dict):
+        return
+    normalize_shift_counts()
+    edited_rows = editor_state.get("edited_rows", {}) or {}
+    for row_idx, changes in edited_rows.items():
+        try:
+            ni = int(row_idx)
+        except (TypeError, ValueError):
+            continue
+        if ni < 0 or ni >= len(st.session_state.get("doctors", [])):
+            continue
+        if isinstance(changes, dict):
+            for col, shift_key in (("fixed_Total", "Total"), ("fixed_D", "D"), ("fixed_E", "E"), ("fixed_N", "N")):
+                if col in changes:
+                    st.session_state.shift_counts[ni][shift_key] = bounded_int(changes.get(col), -1, -1, 60)
+
+
+def apply_fixed_total_editor_df(edited_df: pd.DataFrame):
+    """Apply the returned data_editor DataFrame to fixed Total/D/E/N shift_counts."""
+    editable_cols = (("fixed_Total", "Total"), ("fixed_D", "D"), ("fixed_E", "E"), ("fixed_N", "N"))
+    if edited_df is None or edited_df.empty:
+        return
+    if not any(col in edited_df.columns for col, _ in editable_cols):
+        return
+    normalize_shift_counts()
+    for pos, (_, row) in enumerate(edited_df.iterrows()):
+        if pos >= len(st.session_state.get("doctors", [])):
+            break
+        for col, shift_key in editable_cols:
+            if col in edited_df.columns:
+                st.session_state.shift_counts[pos][shift_key] = bounded_int(row.get(col, -1), -1, -1, 60)
+
+
+def render_fixed_total_editor_table():
+    """Render an editable fixed Total/D/E/N table below the Duty/fixed_total summary."""
+    st.caption("아래 표에서 fixed_Total / fixed_D / fixed_E / fixed_N을 한 번에 수정할 수 있습니다. -1은 자동 평준화입니다.")
+    key = get_fixed_total_editor_key()
+    df = build_fixed_total_editor_df()
+    edited_df = st.data_editor(
+        df,
+        hide_index=True,
+        use_container_width=True,
+        key=key,
+        on_change=sync_fixed_total_editor_widget,
+        disabled=["No", "Name", "Grade", "Senior", "Junior", "초저년차"],
+        column_config={
+            "No": st.column_config.NumberColumn("No", width="small", disabled=True),
+            "Name": st.column_config.TextColumn("Name", width="medium", disabled=True),
+            "Grade": st.column_config.NumberColumn("Grade", width="small", disabled=True),
+            "Senior": st.column_config.TextColumn("Senior", width="small", disabled=True),
+            "Junior": st.column_config.TextColumn("Junior", width="small", disabled=True),
+            "초저년차": st.column_config.TextColumn("초저년차", width="small", disabled=True),
+            "fixed_Total": st.column_config.NumberColumn(
+                "fixed_Total",
+                min_value=-1,
+                max_value=60,
+                step=1,
+                help="-1 = 자동 평준화, 0 이상 = 해당 의사의 총 D/E/N 근무 수를 정확히 고정",
+            ),
+            "fixed_D": st.column_config.NumberColumn(
+                "fixed_D",
+                min_value=-1,
+                max_value=60,
+                step=1,
+                help="-1 = 자동 평준화, 0 이상 = Day 근무 수를 정확히 고정",
+            ),
+            "fixed_E": st.column_config.NumberColumn(
+                "fixed_E",
+                min_value=-1,
+                max_value=60,
+                step=1,
+                help="-1 = 자동 평준화, 0 이상 = Evening 근무 수를 정확히 고정",
+            ),
+            "fixed_N": st.column_config.NumberColumn(
+                "fixed_N",
+                min_value=-1,
+                max_value=60,
+                step=1,
+                help="-1 = 자동 평준화, 0 이상 = Night 근무 수를 정확히 고정",
+            ),
+        },
+    )
+    apply_fixed_total_editor_df(edited_df)
 
 
 def get_total_duty_count() -> int:
@@ -2191,9 +2318,10 @@ with tab3:
     )
 
     st.divider()
-    st.markdown('<div class="section-label">fixed_total / Duty 총합 확인</div>', unsafe_allow_html=True)
-    st.caption("Total 고정값 또는 Duty 필요 인원을 바꾸면 아래 요약이 바로 갱신됩니다.")
+    st.markdown('<div class="section-label">fixed Total/D/E/N / Duty 총합 확인</div>', unsafe_allow_html=True)
+    st.caption("fixed_Total 또는 fixed_D/E/N, Duty 필요 인원을 바꾸면 아래 요약이 바로 갱신됩니다.")
     render_fixed_total_duty_summary(num_days)
+    render_fixed_total_editor_table()
 
     st.divider()
     st.markdown('<div class="section-label">개인별 Grade & 근무 규칙 설정</div>', unsafe_allow_html=True)
@@ -2256,30 +2384,7 @@ with tab3:
             st.session_state.shift_adj[ni] = int(new_val)
             doctors[ni]["shift_adj"] = int(new_val)
 
-        # Total/D/E/N 고정 개수 (-1 = 평준화)
-        st.markdown(
-            "<span style='font-family:var(--mono);font-size:0.68rem;color:var(--text-dim)'>"
-            "▸ Total/D/E/N 고정 개수 (-1 = 자동 평준화)</span>",
-            unsafe_allow_html=True
-        )
-        for shift_key, shift_label in [("Total", "Total 고정"), ("D", "D 고정"), ("E", "E 고정"), ("N", "N 고정")]:
-            sc_cols = st.columns([2] + [1] * chunk_size)
-            sc_cols[0].markdown(f"<span style='font-size:0.75rem'>{shift_label}</span>", unsafe_allow_html=True)
-            for ci, ni in enumerate(range(chunk_start, chunk_end)):
-                if ni not in st.session_state.shift_counts:
-                    st.session_state.shift_counts[ni] = {"D": -1, "E": -1, "N": -1, "Total": -1}
-                if "Total" not in st.session_state.shift_counts[ni]:
-                    st.session_state.shift_counts[ni]["Total"] = -1
-                cur = int(st.session_state.shift_counts[ni].get(shift_key, -1))
-                sc_ver = st.session_state.get("shift_count_version", 0)
-                sc_key = f"sc_{shift_key}_{ni}_v{sc_ver}"
-                new_val = sc_cols[ci+1].number_input(
-                    f"sc_{shift_key}_{ni}", min_value=-1, max_value=60,
-                    value=cur, label_visibility="collapsed", key=sc_key,
-                    on_change=sync_shift_count_widget,
-                    args=(ni, shift_key, sc_key),
-                )
-                st.session_state.shift_counts[ni][shift_key] = int(new_val)
+        # fixed Total/D/E/N counts are edited in the table above.
 
         # 규칙 rows
         for key, label, rtype, opt1, opt2 in RULE_DEFS:

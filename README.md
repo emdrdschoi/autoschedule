@@ -32,7 +32,7 @@
 2. 의사 이름을 직접 추가하거나 설정 Excel 불러오기
 3. 근무 요청 / 날짜 설정 탭에서 날짜 유형과 개인 요청 입력
 4. Duty 설정 탭에서 날짜별 D/E/N 필요 인원 입력
-5. 개인 규칙 / Grade 탭에서 grade, 근무 조정값, fixed_Total, 개인 규칙 입력
+5. 개인 규칙 / Grade 탭에서 grade, 근무 조정값, fixed_Total/fixed_D/E/N, 개인 규칙 입력
 6. Duty 설정 탭 상단의 Duty 총합 / fixed_total 합 / 남은 근무수 확인
 7. 스케줄 생성
 8. 결과 탭에서 근무 통계, 근무 일정표, Daily duty 구성 요약 확인
@@ -60,7 +60,7 @@
 
 - 의사 이름을 추가, 수정, 삭제할 수 있습니다.
 - 실제 운영 중에는 삭제보다 Excel에서 정리 후 다시 불러오는 편이 안전합니다.
-- Grade, 근무 조정값, fixed_Total 등은 `개인 규칙 / Grade` 탭에서 설정합니다.
+- Grade, 근무 조정값, fixed_Total/fixed_D/E/N 등은 `개인 규칙 / Grade` 탭에서 설정합니다.
 
 ### 3.3 솔버 설정
 
@@ -197,7 +197,7 @@ fixed_total 미지정 인원
 
 ## 6. 개인 규칙 / Grade 탭
 
-### 6.1 fixed_total / Duty 총합 확인
+### 6.1 fixed Total/D/E/N / Duty 총합 확인
 
 개인 규칙 / Grade 탭에도 Duty 설정 탭과 같은 요약 박스가 표시됩니다.
 
@@ -222,6 +222,21 @@ fixed_total 미지정 인원: 0
 ```
 
 이 박스는 Total 고정값 또는 Duty 필요 인원을 바꾼 뒤 바로 갱신되도록 앱 내부에서 입력 위젯 값을 먼저 동기화합니다.
+
+요약 박스 바로 아래에는 `fixed_Total / fixed_D / fixed_E / fixed_N` 편집 표가 표시됩니다. 결과 탭의 근무 통계처럼 입력 순서 기준 `No / Name / Grade / Senior / Junior / 초저년차`를 함께 보여주고, 고정값 네 칸을 직접 수정할 수 있습니다.
+
+```text
+No | Name | Grade | Senior | Junior | 초저년차 | fixed_Total | fixed_D | fixed_E | fixed_N
+```
+
+`fixed_Total / fixed_D / fixed_E / fixed_N` 값의 의미는 다음과 같습니다.
+
+```text
+-1 = 자동 평준화
+0 이상 숫자 = 해당 의사의 총 D/E/N 근무 수를 정확히 고정
+```
+
+이 표에서 fixed_Total 또는 fixed_D/E/N을 수정하면 위의 `Duty 총합 / fixed_total 합 / 차이 / 남은 근무수` 요약과 solve/진단 입력값에 바로 반영됩니다. 기존처럼 아래 개인별 규칙 영역에 D/E/N 고정 줄을 따로 두지 않고, 이 표에서 한 번에 관리합니다.
 
 ### 6.2 Grade 정책 설정
 
@@ -287,9 +302,9 @@ Grade는 개인의 숙련도/연차를 숫자로 표현한 값입니다. 현재 
 → 평준화 계산에서는 대략 -2처럼 반영
 ```
 
-### 6.6 Total/D/E/N 고정 개수
+### 6.6 fixed_Total 표와 D/E/N 고정 개수
 
-특정 의사의 전체 근무 수 또는 D/E/N 개수를 정확히 고정하고 싶을 때 사용합니다.
+특정 의사의 전체 근무 수 또는 D/E/N 개수를 정확히 고정하고 싶을 때 사용합니다. `fixed_Total / fixed_D / fixed_E / fixed_N`은 `fixed Total/D/E/N / Duty 총합 확인` 요약 바로 아래의 편집 표에서 한 번에 수정합니다.
 
 | 값 | 의미 |
 |---:|---|
@@ -299,7 +314,7 @@ Grade는 개인의 숙련도/연차를 숫자로 표현한 값입니다. 현재 
 
 예:
 
-| Total 고정 | D 고정 | E 고정 | N 고정 | 의미 |
+| fixed_Total | fixed_D | fixed_E | fixed_N | 의미 |
 |---:|---:|---:|---:|---|
 | -1 | -1 | -1 | -1 | 모두 자동 평준화 |
 | 8 | -1 | -1 | -1 | 총근무는 정확히 8개, D/E/N 구성은 자동 |
@@ -313,7 +328,7 @@ Grade는 개인의 숙련도/연차를 숫자로 표현한 값입니다. 현재 
 - fixed_D/E/N을 모두 고정한 경우 합이 fixed_Total과 같아야 합니다.
 - 연차 `a`는 fixed_Total 값을 줄이지 않습니다.
 
-### 6.6 개인별 근무 규칙
+### 6.7 개인별 근무 규칙
 
 | 규칙 | 의미 |
 |---|---|
@@ -594,7 +609,7 @@ Schedule과 Summary는 앱 화면과 같은 입력 순서를 유지합니다.
 4. 결과 통계에서 연차 컬럼 확인
 ```
 
-### 10.3 fixed_Total을 많이 쓰는 달
+### 10.3 fixed_Total/fixed_D/E/N을 많이 쓰는 달
 
 ```text
 1. 개인별 Total 고정 입력
@@ -661,7 +676,7 @@ Schedule과 Summary는 앱 화면과 같은 입력 순서를 유지합니다.
 [ ] ShiftRequests의 d/e/n/x/a/D/E/N 입력 확인
 [ ] 연차는 a로 입력했는지 확인
 [ ] GradeRules의 고년차/저년차/초저년차 기준 확인
-[ ] fixed_Total 및 fixed_D/E/N 확인
+[ ] fixed_Total/fixed_D/fixed_E/fixed_N 확인
 [ ] Duty 설정 탭 상단의 차이 / 남은 근무수 확인
 [ ] 최대 연속 근무일수와 7일 구간 최대 근무수 확인
 [ ] solver mode와 탐색 시간 확인
