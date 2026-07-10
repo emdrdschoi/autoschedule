@@ -316,6 +316,9 @@ def _init_state():
         "shift_count_version": 0, # key versioning for fixed Total/D/E/N count widgets
         "grade_version": 0,       # key versioning for individual grade widgets
         "grade_rule_version": 0,  # key versioning for global grade rule widgets
+        "solve_failed": False,
+        "solve_failure_message": "",
+        "diagnostic_results": None,
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -780,6 +783,687 @@ def get_annual_leave_counts_by_doc() -> dict:
             counts[int(ni)] += 1
     return counts
 
+
+
+
+def _diagnostic_request_flags(val: str):
+    """Return request flags for diagnostic availability checks."""
+    text = _clean_shift_request_value(val)
+    low = text.lower()
+    must = ["D" in text, "E" in text, "N" in text]
+    annual = "a" in low
+    full_off = annual or "x" in low or "den" in low
+    if full_off:
+        cant = [True, True, True]
+    else:
+        cant = [
+            ("d" in low and "D" not in text),
+            ("e" in low and "E" not in text),
+            ("n" in low and "N" not in text),
+        ]
+    return text, low, must, cant, annual, full_off
+
+
+def _diagnostic_availability_for_shift(ni: int, di: int, si: int, combined_req: dict):
+    """Return (available: bool, reason: str) for one doctor/day/shift.
+
+    This is a pre-solve diagnostic approximation. It reflects request/fixed cells
+    and grade hard rules are evaluated at the group level by the caller. Sequence
+    constraints such as N-rest are handled only in the window-level rough checks.
+    """
+    val = combined_req.get((ni, di), "")
+    text, low, must, cant, annual, full_off = _diagnostic_request_flags(val)
+    shift_key = ["D", "E", "N"][si]
+    if annual:
+        return False, "연차(a)"
+    if "x" in low or "den" in low:
+        return False, "x/전체불가"
+    if any(must) and not must[si]:
+        fixed_to = "/".join([k for k, flag in zip(["D", "E", "N"], must) if flag])
+        return False, f"다른 duty 고정({fixed_to})"
+    if cant[si]:
+        return False, f"{shift_key} 불가"
+    return True, "가능"
+
+
+def _diagnostic_max_workdays_without_consecutive_run(window_len: int, max_consec: int) -> int:
+    """Upper-bound workdays in a window if max_consec consecutive workdays is enforced."""
+    if max_consec <= 0 or window_len <= max_consec:
+        return window_len
+    # In every block of max_consec+1 days, at least one day must be off.
+    return window_len - (window_len // (max_consec + 1))
+
+
+def _diagnostic_max_shift_count_without_long_blocks(window_len: int, max_block: int) -> int:
+    """Upper-bound same-shift count if max_block consecutive shifts is enforced."""
+    if max_block <= 0 or window_len <= max_block:
+        return window_len
+    return window_len - (window_len // (max_block + 1))
+
+
+def run_hard_bottleneck_diagnostics() -> dict:
+    """Run lightweight 1st/2nd-level infeasibility diagnostics.
+
+    1차: 날짜·Duty별 후보 부족, 고년차 부족, 초저년차 제한, hard fixed 초과.
+    2차: 3/5/7일 및 전체 구간에서 필요 근무수와 단순 가능 최대치 비교.
+    """
+    normalize_doctors()
+    normalize_grade_rules()
+    normalize_shift_counts()
+    sync_live_total_summary_inputs(st.session_state.num_days)
+    combined_req = refresh_combined_shift_requests()
+
+    doctors_local = st.session_state.get("doctors", [])
+    n_docs = len(doctors_local)
+    n_days = int(st.session_state.get("num_days", 0))
+    start = st.session_state.get("start_date", date.today())
+    duty_requests = st.session_state.get("duty_requests", {})
+    grade_rules = st.session_state.grade_rules
+    senior_min_grade = int(grade_rules.get("senior_min_grade", DEFAULT_GRADE_RULES["senior_min_grade"]))
+    senior_min_count = int(grade_rules.get("senior_min_count", DEFAULT_GRADE_RULES["senior_min_count"]))
+    ultra_max_grade = int(grade_rules.get("ultra_junior_max_grade", DEFAULT_GRADE_RULES["ultra_junior_max_grade"]))
+    ultra_max_count = int(grade_rules.get("ultra_junior_max_count", DEFAULT_GRADE_RULES["ultra_junior_max_count"]))
+
+    shift_keys = ["D", "E", "N"]
+    duty_rows = []
+
+    for di in range(n_days):
+        d = start + timedelta(days=di)
+        lbl = get_day_label(start, di)
+        date_label = f"{d.strftime('%m/%d')}({lbl})"
+        needs = list(duty_requests.get(di, [0, 0, 0]))
+        if len(needs) < 3:
+            needs = (needs + [0, 0, 0])[:3]
+        for si, shift_key in enumerate(shift_keys):
+            required = int(needs[si])
+            if required <= 0:
+                continue
+            candidates = []
+            excluded_reasons = []
+            forced = []
+            for ni, doc in enumerate(doctors_local):
+                available, reason = _diagnostic_availability_for_shift(ni, di, si, combined_req)
+                text, _low, must, _cant, _annual, _full_off = _diagnostic_request_flags(combined_req.get((ni, di), ""))
+                if available:
+                    candidates.append(ni)
+                    if must[si]:
+                        forced.append(ni)
+                else:
+                    excluded_reasons.append(reason)
+
+            senior_candidates = [ni for ni in candidates if int(doctors_local[ni].get("grade", DEFAULT_DOCTOR_GRADE)) >= senior_min_grade]
+            ultra_candidates = [ni for ni in candidates if int(doctors_local[ni].get("grade", DEFAULT_DOCTOR_GRADE)) <= ultra_max_grade]
+            non_ultra_candidates = [ni for ni in candidates if ni not in ultra_candidates]
+            forced_ultra = [ni for ni in forced if ni in ultra_candidates]
+            effective_possible = len(candidates)
+            if ultra_max_count > 0:
+                effective_possible = len(non_ultra_candidates) + min(len(ultra_candidates), ultra_max_count)
+
+            issues = []
+            status = "가능"
+            if len(forced) > required:
+                issues.append(f"hard fixed {len(forced)}명 > 필요 {required}명")
+            if len(candidates) < required:
+                issues.append(f"가능 후보 {len(candidates)}명 < 필요 {required}명")
+            if senior_min_count > 0 and len(senior_candidates) < senior_min_count:
+                issues.append(f"고년차 후보 {len(senior_candidates)}명 < 최소 {senior_min_count}명")
+            if ultra_max_count > 0 and len(forced_ultra) > ultra_max_count:
+                issues.append(f"초저년차 hard fixed {len(forced_ultra)}명 > 최대 {ultra_max_count}명")
+            if ultra_max_count > 0 and effective_possible < required:
+                issues.append(f"초저년차 제한 적용 후 가능 {effective_possible}명 < 필요 {required}명")
+
+            if issues:
+                status = "불가능 후보"
+            elif len(candidates) == required or effective_possible == required or (senior_min_count > 0 and len(senior_candidates) == senior_min_count):
+                status = "빠듯함"
+            else:
+                continue
+
+            reason_counts = pd.Series(excluded_reasons).value_counts().to_dict() if excluded_reasons else {}
+            reason_text = ", ".join(f"{k} {v}명" for k, v in reason_counts.items())
+            candidate_text = ", ".join(
+                f"{doctors_local[ni]['name']}[{int(doctors_local[ni].get('grade', DEFAULT_DOCTOR_GRADE))}]"
+                for ni in candidates
+            )
+            duty_rows.append({
+                "상태": status,
+                "날짜": date_label,
+                "Duty": shift_key,
+                "필요": required,
+                "가능후보": len(candidates),
+                "고년차후보": len(senior_candidates),
+                "초저년차후보": len(ultra_candidates),
+                "초저년차제한후가능": effective_possible,
+                "hard fixed": len(forced),
+                "주요 이슈": "; ".join(issues) if issues else "여유 없음/빠듯함",
+                "제외 주요 원인": reason_text,
+                "가능 후보": candidate_text,
+            })
+
+    # 개인 fixed count feasibility check.
+    fixed_rows = []
+    for ni, doc in enumerate(doctors_local):
+        sc = st.session_state.shift_counts.get(ni, {})
+        name = doc.get("name", f"doctor_{ni}")
+        for shift_key, si in [("D", 0), ("E", 1), ("N", 2)]:
+            fixed_val = int(sc.get(shift_key, -1)) if isinstance(sc, dict) else -1
+            if fixed_val >= 0:
+                possible = sum(1 for di in range(n_days) if _diagnostic_availability_for_shift(ni, di, si, combined_req)[0])
+                if fixed_val > possible:
+                    fixed_rows.append({
+                        "이름": name,
+                        "항목": f"fixed_{shift_key}",
+                        "고정값": fixed_val,
+                        "단순 가능 최대": possible,
+                        "부족": fixed_val - possible,
+                        "설명": f"{shift_key} 가능 날짜가 고정값보다 적습니다.",
+                    })
+        fixed_total = int(sc.get("Total", -1)) if isinstance(sc, dict) else -1
+        if fixed_total >= 0:
+            possible_days = 0
+            for di in range(n_days):
+                if any(_diagnostic_availability_for_shift(ni, di, si, combined_req)[0] for si in range(3)):
+                    possible_days += 1
+            r = st.session_state.rules.get(ni, DEFAULT_RULES.copy())
+            r6 = int(r.get("rule_max_shifts_per_week", DEFAULT_RULES["rule_max_shifts_per_week"]))
+            r5 = int(r.get("rule_max_consec_days", DEFAULT_RULES["rule_max_consec_days"]))
+            possible_total = possible_days
+            if n_days <= 7 and r6 > 0:
+                possible_total = min(possible_total, r6)
+            possible_total = min(possible_total, _diagnostic_max_workdays_without_consecutive_run(n_days, r5))
+            if fixed_total > possible_total:
+                fixed_rows.append({
+                    "이름": name,
+                    "항목": "fixed_Total",
+                    "고정값": fixed_total,
+                    "단순 가능 최대": possible_total,
+                    "부족": fixed_total - possible_total,
+                    "설명": "연차/x/불가요청 및 연속근무/주간상한을 고려한 단순 최대보다 fixed_Total이 큽니다.",
+                })
+
+    # 2차: window-level bottlenecks. This uses upper-bound availability, so if demand
+    # exceeds this value the window is structurally impossible under current hard inputs.
+    window_rows = []
+    window_lengths = []
+    for length in (3, 5, 7, n_days):
+        if 1 <= length <= n_days and length not in window_lengths:
+            window_lengths.append(length)
+
+    for length in window_lengths:
+        for start_di in range(0, n_days - length + 1):
+            end_di = start_di + length - 1
+            sdate = start + timedelta(days=start_di)
+            edate = start + timedelta(days=end_di)
+            label = f"{sdate.strftime('%m/%d')}~{edate.strftime('%m/%d')}"
+
+            total_need = 0
+            shift_need = {"D": 0, "E": 0, "N": 0}
+            for di in range(start_di, end_di + 1):
+                needs = list(duty_requests.get(di, [0, 0, 0]))
+                if len(needs) < 3:
+                    needs = (needs + [0, 0, 0])[:3]
+                for si, sk in enumerate(shift_keys):
+                    shift_need[sk] += int(needs[si])
+                    total_need += int(needs[si])
+
+            total_possible = 0
+            shift_possible = {"D": 0, "E": 0, "N": 0}
+            for ni in range(n_docs):
+                r = st.session_state.rules.get(ni, DEFAULT_RULES.copy())
+                r6 = int(r.get("rule_max_shifts_per_week", DEFAULT_RULES["rule_max_shifts_per_week"]))
+                r5 = int(r.get("rule_max_consec_days", DEFAULT_RULES["rule_max_consec_days"]))
+                n_max = int(r.get("rule_n_block_max", DEFAULT_RULES["rule_n_block_max"]))
+
+                available_work_days = 0
+                for di in range(start_di, end_di + 1):
+                    if any(_diagnostic_availability_for_shift(ni, di, si, combined_req)[0] for si in range(3)):
+                        available_work_days += 1
+                person_possible = available_work_days
+                if length <= 7 and r6 > 0:
+                    person_possible = min(person_possible, r6)
+                person_possible = min(person_possible, _diagnostic_max_workdays_without_consecutive_run(length, r5))
+                total_possible += person_possible
+
+                for si, sk in enumerate(shift_keys):
+                    avail_shift_days = sum(
+                        1 for di in range(start_di, end_di + 1)
+                        if _diagnostic_availability_for_shift(ni, di, si, combined_req)[0]
+                    )
+                    if sk == "N":
+                        avail_shift_days = min(avail_shift_days, _diagnostic_max_shift_count_without_long_blocks(length, n_max))
+                    if length <= 7 and r6 > 0:
+                        avail_shift_days = min(avail_shift_days, r6)
+                    shift_possible[sk] += avail_shift_days
+
+            if total_need > total_possible:
+                window_rows.append({
+                    "구간": label,
+                    "길이": length,
+                    "항목": "전체근무",
+                    "필요": total_need,
+                    "단순 가능 최대": total_possible,
+                    "부족": total_need - total_possible,
+                    "설명": "x/a/불가요청, 주간상한, 최대연속근무를 반영한 단순 최대보다 필요 근무가 많습니다.",
+                })
+            for sk in shift_keys:
+                if shift_need[sk] > shift_possible[sk]:
+                    window_rows.append({
+                        "구간": label,
+                        "길이": length,
+                        "항목": sk,
+                        "필요": shift_need[sk],
+                        "단순 가능 최대": shift_possible[sk],
+                        "부족": shift_need[sk] - shift_possible[sk],
+                        "설명": f"{sk} 가능 후보의 구간 내 단순 최대보다 {sk} 필요 개수가 많습니다.",
+                    })
+
+    duty_df = pd.DataFrame(duty_rows)
+    fixed_df = pd.DataFrame(fixed_rows)
+    window_df = pd.DataFrame(window_rows)
+    return {
+        "duty_df": duty_df,
+        "fixed_df": fixed_df,
+        "window_df": window_df,
+        "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "note": "이 진단은 1차/2차 병목 후보를 찾는 사전 검사입니다. N-rest, E→D 금지, 연속근무 등 전체 조합 충돌은 일부만 근사하므로, 원인 후보로 해석하세요.",
+    }
+
+
+def render_hard_bottleneck_diagnostics(results: dict):
+    """Render diagnostic result tables."""
+    if not results:
+        return
+    st.markdown('<div class="section-label">🧪 진단모드 결과</div>', unsafe_allow_html=True)
+    st.caption(results.get("note", ""))
+    st.caption(f"생성 시각: {results.get('generated_at', '')}")
+
+    duty_df = results.get("duty_df", pd.DataFrame())
+    fixed_df = results.get("fixed_df", pd.DataFrame())
+    window_df = results.get("window_df", pd.DataFrame())
+
+    st.markdown("**1차 진단 · 날짜/Duty별 후보 부족**")
+    if duty_df is None or duty_df.empty:
+        st.success("날짜·Duty 단위에서 바로 보이는 후보 부족은 발견되지 않았습니다.")
+    else:
+        st.dataframe(duty_df, use_container_width=True, hide_index=True)
+
+    st.markdown("**1차 진단 · 개인 fixed_Total / fixed_D/E/N 가능성**")
+    if fixed_df is None or fixed_df.empty:
+        st.success("개인 fixed count가 단순 가능 최대를 초과하는 경우는 발견되지 않았습니다.")
+    else:
+        st.dataframe(fixed_df, use_container_width=True, hide_index=True)
+
+    st.markdown("**2차 진단 · 구간별 병목 후보**")
+    if window_df is None or window_df.empty:
+        st.success("3/5/7일 및 전체 구간의 단순 가능 최대 부족은 발견되지 않았습니다.")
+    else:
+        st.dataframe(window_df, use_container_width=True, hide_index=True)
+
+
+
+# ── Diagnostic mode helpers ──────────────────────────────────────────────────
+SHIFT_SHORT = ["D", "E", "N"]
+
+
+def _diagnostic_rule_value(doctor_idx: int, key: str, default: int) -> int:
+    try:
+        return int(st.session_state.rules.get(doctor_idx, {}).get(key, default))
+    except (TypeError, ValueError):
+        return int(default)
+
+
+def _diagnostic_daily_capacity_limit(doctor_idx: int, day_idx: int) -> int:
+    """Approximate maximum number of shifts a doctor can take on a day for diagnostic capacity."""
+    r0 = _diagnostic_rule_value(doctor_idx, "rule_max_shifts_per_day", DEFAULT_RULES["rule_max_shifts_per_day"])
+    dtype = st.session_state.day_types.get(day_idx, "평일")
+    is_hol = dtype in ("토", "일", "공")
+    if r0 == 1:
+        return 1
+    if r0 == 2:
+        return 2
+    if r0 == 3:
+        return 3
+    if r0 == 4:
+        return 2 if is_hol else 1
+    if r0 == 5:
+        return 3 if is_hol else 1
+    return max(1, min(3, int(r0)))
+
+
+def _diagnostic_cell_reason(cell_value, target_shift: str) -> tuple[bool, str]:
+    """Return (can_work_target_shift, reason_if_excluded) from a request cell."""
+    text = _clean_shift_request_value(cell_value)
+    if not text:
+        return True, ""
+    lower = text.lower()
+
+    if "a" in lower:
+        return False, "연차(a)"
+    if "x" in lower or "den" in lower:
+        return False, "전체불가(x/den)"
+
+    # Uppercase D/E/N are treated as hard wanted/fixed assignment for diagnosis.
+    hard_shifts = [sh for sh in SHIFT_SHORT if sh in text]
+    if hard_shifts:
+        if target_shift in hard_shifts:
+            return True, ""
+        return False, f"다른 duty 고정/희망({''.join(hard_shifts)})"
+
+    if target_shift.lower() in lower:
+        return False, f"{target_shift} 불가"
+    return True, ""
+
+
+def _diagnostic_can_work_shift(doctor_idx: int, day_idx: int, shift_idx: int, combined_req: dict) -> tuple[bool, str]:
+    target = SHIFT_SHORT[shift_idx]
+    return _diagnostic_cell_reason(combined_req.get((doctor_idx, day_idx), ""), target)
+
+
+def _max_senior_selectable_with_ultra_cap(candidates: list[int], need: int, grades: dict[int, int], senior_min_grade: int, ultra_max_grade: int, ultra_max_count: int) -> int:
+    """Maximum number of seniors selectable among `need` staff under optional ultra-junior cap."""
+    if need <= 0 or not candidates:
+        return 0
+    if ultra_max_count <= 0:
+        return min(need, sum(1 for n in candidates if grades.get(n, DEFAULT_DOCTOR_GRADE) >= senior_min_grade))
+
+    ultra = [n for n in candidates if grades.get(n, DEFAULT_DOCTOR_GRADE) <= ultra_max_grade]
+    non_ultra = [n for n in candidates if n not in set(ultra)]
+    senior_ultra = sum(1 for n in ultra if grades.get(n, DEFAULT_DOCTOR_GRADE) >= senior_min_grade)
+    senior_non_ultra = sum(1 for n in non_ultra if grades.get(n, DEFAULT_DOCTOR_GRADE) >= senior_min_grade)
+
+    best = -1
+    max_ultra_taken = min(len(ultra), ultra_max_count, need)
+    for ultra_taken in range(max_ultra_taken + 1):
+        non_ultra_taken = need - ultra_taken
+        if non_ultra_taken < 0 or non_ultra_taken > len(non_ultra):
+            continue
+        seniors = min(senior_ultra, ultra_taken) + min(senior_non_ultra, non_ultra_taken)
+        best = max(best, seniors)
+    return max(0, best)
+
+
+def _diagnostic_local_grade_messages(candidates: list[int], need: int, grades: dict[int, int], gr: dict) -> list[str]:
+    """Return local hard-rule messages for one date-duty candidate pool."""
+    messages = []
+    if need <= 0:
+        return messages
+
+    senior_min_grade = int(gr.get("senior_min_grade", DEFAULT_GRADE_RULES["senior_min_grade"]))
+    senior_min_count = int(gr.get("senior_min_count", DEFAULT_GRADE_RULES["senior_min_count"]))
+    ultra_max_grade = int(gr.get("ultra_junior_max_grade", DEFAULT_GRADE_RULES["ultra_junior_max_grade"]))
+    ultra_max_count = int(gr.get("ultra_junior_max_count", DEFAULT_GRADE_RULES["ultra_junior_max_count"]))
+
+    if len(candidates) < need:
+        messages.append(f"가능 후보 {len(candidates)}명 < 필요 {need}명")
+
+    if senior_min_count > 0:
+        max_seniors = _max_senior_selectable_with_ultra_cap(
+            candidates, need, grades, senior_min_grade, ultra_max_grade, ultra_max_count
+        )
+        if max_seniors < senior_min_count:
+            senior_pool = sum(1 for n in candidates if grades.get(n, DEFAULT_DOCTOR_GRADE) >= senior_min_grade)
+            messages.append(
+                f"고년차 부족: grade≥{senior_min_grade} 후보 {senior_pool}명, 선택 가능 최대 {max_seniors}명 < 필요 {senior_min_count}명"
+            )
+
+    if ultra_max_count > 0:
+        ultra_count = sum(1 for n in candidates if grades.get(n, DEFAULT_DOCTOR_GRADE) <= ultra_max_grade)
+        non_ultra_count = len(candidates) - ultra_count
+        max_staff_under_ultra_rule = non_ultra_count + min(ultra_count, ultra_max_count)
+        if max_staff_under_ultra_rule < need:
+            messages.append(
+                f"초저년차 제한 병목: grade≤{ultra_max_grade} 최대 {ultra_max_count}명 허용 시 최대 {max_staff_under_ultra_rule}명만 배치 가능"
+            )
+    return messages
+
+
+def run_hard_rule_diagnostics() -> dict:
+    """Run 1st/2nd-stage hard-rule bottleneck diagnostics without solving the full schedule."""
+    normalize_doctors()
+    normalize_grade_rules()
+    normalize_shift_counts()
+    combined_req = refresh_combined_shift_requests()
+
+    doctors = st.session_state.doctors
+    num_docs = len(doctors)
+    num_days = int(st.session_state.num_days)
+    start_date = st.session_state.start_date
+    grades = {ni: int(doc.get("grade", DEFAULT_DOCTOR_GRADE)) for ni, doc in enumerate(doctors)}
+    gr = st.session_state.grade_rules
+
+    # 1차: 날짜/Duty별 후보 부족 진단
+    day_rows = []
+    availability_cache = {}
+    for di in range(num_days):
+        d = start_date + timedelta(days=di)
+        dtype = st.session_state.day_types.get(di, "평일")
+        for si, shift_label in enumerate(SHIFT_SHORT):
+            need = int(st.session_state.duty_requests.get(di, [0, 0, 0])[si])
+            if need <= 0:
+                continue
+            candidates = []
+            excluded_reasons = {}
+            forced = []
+            for ni, doc in enumerate(doctors):
+                can_work, reason = _diagnostic_can_work_shift(ni, di, si, combined_req)
+                availability_cache[(ni, di, si)] = can_work
+                cell = _clean_shift_request_value(combined_req.get((ni, di), ""))
+                if can_work:
+                    candidates.append(ni)
+                    if shift_label in cell:
+                        forced.append(ni)
+                else:
+                    excluded_reasons[reason or "기타"] = excluded_reasons.get(reason or "기타", 0) + 1
+
+            hard_messages = _diagnostic_local_grade_messages(candidates, need, grades, gr)
+            if len(forced) > need:
+                hard_messages.append(f"{shift_label} 고정/희망 인원 {len(forced)}명 > 필요 {need}명")
+
+            if hard_messages:
+                status = "불가능"
+            elif len(candidates) == need:
+                status = "빠듯함"
+            elif len(candidates) <= need + 2:
+                status = "주의"
+            else:
+                status = "가능"
+
+            candidate_names = ", ".join(f"{doctors[n]['name']} [{grades.get(n, DEFAULT_DOCTOR_GRADE)}]" for n in candidates[:12])
+            if len(candidates) > 12:
+                candidate_names += f" 외 {len(candidates)-12}명"
+            excluded_summary = ", ".join(f"{k} {v}명" for k, v in sorted(excluded_reasons.items()))
+            day_rows.append({
+                "날짜": f"{d.strftime('%m/%d')}({get_day_label(start_date, di)})",
+                "DayIdx": di + 1,
+                "유형": dtype,
+                "Duty": shift_label,
+                "필요": need,
+                "가능 후보": len(candidates),
+                "고정/희망": len(forced),
+                "상태": status,
+                "병목 이유": "; ".join(hard_messages),
+                "가능자": candidate_names,
+                "제외 요약": excluded_summary,
+            })
+
+    day_df = pd.DataFrame(day_rows)
+    if not day_df.empty:
+        status_rank = {"불가능": 0, "빠듯함": 1, "주의": 2, "가능": 3}
+        day_df["_rank"] = day_df["상태"].map(status_rank).fillna(9).astype(int)
+        day_df = day_df.sort_values(["_rank", "DayIdx", "Duty"], kind="stable").drop(columns=["_rank"])
+
+    # 2차: 구간별 필요 근무수 vs 단순 가능 최대 진단
+    def possible_shifts_for_doc_day(ni: int, di: int) -> list[int]:
+        out = []
+        for si in range(3):
+            if int(st.session_state.duty_requests.get(di, [0, 0, 0])[si]) <= 0:
+                continue
+            can_work, _ = _diagnostic_can_work_shift(ni, di, si, combined_req)
+            if can_work:
+                out.append(si)
+        return out
+
+    def window_capacity(days: list[int], shift_filter: str) -> int:
+        total = 0
+        for ni in range(num_docs):
+            daily_caps = []
+            for di in days:
+                if shift_filter in SHIFT_SHORT:
+                    si = SHIFT_SHORT.index(shift_filter)
+                    daily_caps.append(1 if _diagnostic_can_work_shift(ni, di, si, combined_req)[0] and int(st.session_state.duty_requests.get(di, [0,0,0])[si]) > 0 else 0)
+                else:
+                    daily_caps.append(min(len(possible_shifts_for_doc_day(ni, di)), _diagnostic_daily_capacity_limit(ni, di)))
+            doc_cap = sum(daily_caps)
+            r6 = _diagnostic_rule_value(ni, "rule_max_shifts_per_week", DEFAULT_RULES["rule_max_shifts_per_week"])
+            if r6 > 0 and len(days) <= 7:
+                doc_cap = min(doc_cap, r6)
+            fixed_total = int(st.session_state.shift_counts.get(ni, {}).get("Total", -1))
+            if fixed_total >= 0:
+                # fixed_Total itself should not create interval proof, but it is still an upper bound on total shifts.
+                doc_cap = min(doc_cap, fixed_total)
+            total += doc_cap
+        return int(total)
+
+    def demand_for_days(days: list[int], shift_filter: str) -> int:
+        if shift_filter in SHIFT_SHORT:
+            si = SHIFT_SHORT.index(shift_filter)
+            return int(sum(st.session_state.duty_requests.get(di, [0,0,0])[si] for di in days))
+        return int(sum(sum(st.session_state.duty_requests.get(di, [0,0,0])) for di in days))
+
+    interval_rows = []
+    window_sizes = [3, 5, 7]
+    if num_days not in window_sizes:
+        window_sizes.append(num_days)
+    for w in window_sizes:
+        if w <= 0 or w > num_days:
+            continue
+        starts = [0] if w == num_days else list(range(0, num_days - w + 1))
+        for start in starts:
+            days = list(range(start, start + w))
+            # 전체, D/E/N separately
+            for item in ["전체", "D", "E", "N"]:
+                demand = demand_for_days(days, item)
+                if demand <= 0:
+                    continue
+                cap = window_capacity(days, item)
+                shortage = max(0, demand - cap)
+                util = round(demand / cap, 2) if cap > 0 else None
+                if shortage > 0:
+                    status = "부족"
+                elif cap > 0 and demand / cap >= 0.9:
+                    status = "빡빡함"
+                elif cap > 0 and demand / cap >= 0.8:
+                    status = "주의"
+                else:
+                    status = "가능"
+                if status == "가능":
+                    continue
+                start_d = start_date + timedelta(days=start)
+                end_d = start_date + timedelta(days=start + w - 1)
+                interval_rows.append({
+                    "구간": f"{start_d.strftime('%m/%d')}~{end_d.strftime('%m/%d')}",
+                    "일수": w,
+                    "항목": item,
+                    "필요": demand,
+                    "단순 가능 최대": cap,
+                    "부족": shortage,
+                    "사용률": "∞" if util is None else f"{int(round(util*100))}%",
+                    "상태": status,
+                    "설명": "N-rest/연속근무/전후일 규칙은 완전 반영 전의 빠른 구간 진단입니다.",
+                })
+
+            holiday_days = [di for di in days if st.session_state.day_types.get(di, "평일") in ("토", "일", "공")]
+            if holiday_days:
+                demand = demand_for_days(holiday_days, "전체")
+                cap = window_capacity(holiday_days, "전체")
+                shortage = max(0, demand - cap)
+                util = round(demand / cap, 2) if cap > 0 else None
+                if shortage > 0:
+                    status = "부족"
+                elif cap > 0 and demand / cap >= 0.9:
+                    status = "빡빡함"
+                elif cap > 0 and demand / cap >= 0.8:
+                    status = "주의"
+                else:
+                    status = "가능"
+                if status != "가능":
+                    start_d = start_date + timedelta(days=holiday_days[0])
+                    end_d = start_date + timedelta(days=holiday_days[-1])
+                    interval_rows.append({
+                        "구간": f"{start_d.strftime('%m/%d')}~{end_d.strftime('%m/%d')}",
+                        "일수": len(holiday_days),
+                        "항목": "휴일전체",
+                        "필요": demand,
+                        "단순 가능 최대": cap,
+                        "부족": shortage,
+                        "사용률": "∞" if util is None else f"{int(round(util*100))}%",
+                        "상태": status,
+                        "설명": "해당 구간 안의 토/일/공 날짜만 모아 계산했습니다.",
+                    })
+
+    interval_df = pd.DataFrame(interval_rows)
+    if not interval_df.empty:
+        status_rank = {"부족": 0, "빡빡함": 1, "주의": 2, "가능": 3}
+        interval_df["_rank"] = interval_df["상태"].map(status_rank).fillna(9).astype(int)
+        interval_df = (
+            interval_df
+            .sort_values(["_rank", "부족", "일수"], ascending=[True, False, True], kind="stable")
+            .drop(columns=["_rank"])
+            .head(80)
+        )
+
+    impossible_count = int((day_df["상태"] == "불가능").sum()) if not day_df.empty else 0
+    tight_count = int(day_df["상태"].isin(["빠듯함", "주의"]).sum()) if not day_df.empty else 0
+    interval_shortage_count = int((interval_df["상태"] == "부족").sum()) if not interval_df.empty else 0
+
+    return {
+        "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "day_duty": day_df,
+        "intervals": interval_df,
+        "summary": {
+            "날짜/Duty 불가능": impossible_count,
+            "날짜/Duty 빠듯/주의": tight_count,
+            "구간 부족": interval_shortage_count,
+        },
+    }
+
+
+def render_hard_rule_diagnostics(diag: dict):
+    """Render stored diagnostic tables in the Results tab."""
+    if not diag:
+        return
+    st.markdown('<div class="section-label">🩺 진단모드 결과</div>', unsafe_allow_html=True)
+    st.caption(
+        "진단모드는 해가 없을 때 원인 후보를 빠르게 좁히는 도구입니다. "
+        "1차는 날짜/Duty별 후보 부족, 2차는 3·5·7일/전체 구간의 필요 근무수와 단순 가능 최대를 봅니다. "
+        "N-rest, 연속근무, 전후일 관계처럼 순서가 얽힌 모든 hard rule을 완전 증명하는 것은 아닙니다."
+    )
+    summary = diag.get("summary", {})
+    sc1, sc2, sc3 = st.columns(3)
+    sc1.metric("날짜/Duty 불가능", summary.get("날짜/Duty 불가능", 0))
+    sc2.metric("날짜/Duty 빠듯/주의", summary.get("날짜/Duty 빠듯/주의", 0))
+    sc3.metric("구간 부족", summary.get("구간 부족", 0))
+
+    day_df = diag.get("day_duty", pd.DataFrame())
+    interval_df = diag.get("intervals", pd.DataFrame())
+
+    st.markdown("**1차: 날짜/Duty별 후보 부족**")
+    if day_df is None or day_df.empty:
+        st.success("날짜/Duty 단독 후보 부족은 발견되지 않았습니다.")
+    else:
+        important_day = day_df[day_df["상태"].isin(["불가능", "빠듯함", "주의"])].copy()
+        if important_day.empty:
+            st.success("날짜/Duty 단독 후보 부족은 발견되지 않았습니다.")
+        else:
+            st.dataframe(important_day, use_container_width=True, hide_index=True)
+        with st.expander("전체 날짜/Duty 후보표 보기"):
+            st.dataframe(day_df, use_container_width=True, hide_index=True)
+
+    st.markdown("**2차: 구간별 병목 검사**")
+    if interval_df is None or interval_df.empty:
+        st.success("3·5·7일/전체 구간에서 단순 capacity 부족은 발견되지 않았습니다.")
+    else:
+        st.dataframe(interval_df, use_container_width=True, hide_index=True)
 
 def read_readme_text() -> str:
     """Load README.md from the same directory as app.py for the in-app guide."""
@@ -1634,59 +2318,90 @@ with tab3:
 if st.session_state.get("trigger_solve"):
     st.session_state["trigger_solve"] = False
 
+    # New solve attempt: clear previous diagnostic state.
+    st.session_state["diagnostic_results"] = None
+    st.session_state["solve_failed"] = False
+    st.session_state["solve_failure_message"] = ""
+
     if not doctors:
         st.error("의사를 먼저 추가해 주세요.")
     else:
         fixed_total_info = get_fixed_total_summary()
+        precheck_error = ""
         if fixed_total_info["fixed_count"] > 0 and fixed_total_info["remaining"] < 0:
-            st.error(
+            precheck_error = (
                 f"fixed_total 합이 Duty 총합보다 {-fixed_total_info['remaining']}개 많습니다. "
                 f"Duty 설정에서 총 근무를 {-fixed_total_info['remaining']}개 추가하거나 fixed_total을 줄여주세요."
             )
-            st.info("📋 Duty 설정 탭 상단의 fixed_total 요약을 확인하세요.")
-            st.stop()
-        if fixed_total_info["fixed_count"] > 0 and fixed_total_info["free_count"] == 0 and fixed_total_info["remaining"] != 0:
-            st.error(
+        elif fixed_total_info["fixed_count"] > 0 and fixed_total_info["free_count"] == 0 and fixed_total_info["remaining"] != 0:
+            precheck_error = (
                 f"모든 의사의 fixed_total이 지정되어 있는데 Duty 총합과 {fixed_total_info['remaining']}개 차이가 납니다. "
                 "Duty 설정 또는 fixed_total을 맞춰주세요."
             )
-            st.info("📋 Duty 설정 탭 상단의 fixed_total 요약을 확인하세요.")
-            st.stop()
 
-        with st.spinner("최적 스케줄을 계산 중입니다..."):
-            try:
-                from scheduler import build_and_solve
+        if precheck_error:
+            st.session_state.solved = False
+            st.session_state.solutions = []
+            st.session_state.summaries = []
+            st.session_state.metrics = []
+            st.session_state["solve_failed"] = True
+            st.session_state["solve_failure_message"] = precheck_error
+            st.error(precheck_error)
+            st.info("📋 Duty 설정 또는 개인 규칙 / Grade 탭의 fixed_total 요약을 확인하세요. 결과 탭에서 진단모드를 실행할 수도 있습니다.")
+        else:
+            with st.spinner("최적 스케줄을 계산 중입니다..."):
+                try:
+                    from scheduler import build_and_solve
 
-                params = {
-                    "doctors": [d["name"] for d in doctors],
-                    "num_days": num_days,
-                    "start_date": str(start_date),
-                    "day_types": st.session_state.day_types,
-                    "duty_requests": st.session_state.duty_requests,
-                    "shift_requests": {f"{k[0]},{k[1]}": v for k, v in refresh_combined_shift_requests().items()},
-                    "rules": {str(k): v for k, v in st.session_state.rules.items()},
-                    "shift_adj": {str(k): v for k, v in st.session_state.shift_adj.items()},
-                    "shift_counts": {str(k): v for k, v in st.session_state.shift_counts.items()},
-                    "grades": {str(i): int(d.get("grade", DEFAULT_DOCTOR_GRADE)) for i, d in enumerate(doctors)},
-                    "grade_rules": {k: int(v) for k, v in st.session_state.grade_rules.items()},
-                    "solver_mode": st.session_state.solver_mode,
-                    "time_max": st.session_state.time_max,
-                    "sol_limit": int(st.session_state.get("sol_limit", 1)),
-                    "adv_limit": int(st.session_state.get("adv_limit", 999)),
-                }
+                    params = {
+                        "doctors": [d["name"] for d in doctors],
+                        "num_days": num_days,
+                        "start_date": str(start_date),
+                        "day_types": st.session_state.day_types,
+                        "duty_requests": st.session_state.duty_requests,
+                        "shift_requests": {f"{k[0]},{k[1]}": v for k, v in refresh_combined_shift_requests().items()},
+                        "rules": {str(k): v for k, v in st.session_state.rules.items()},
+                        "shift_adj": {str(k): v for k, v in st.session_state.shift_adj.items()},
+                        "shift_counts": {str(k): v for k, v in st.session_state.shift_counts.items()},
+                        "grades": {str(i): int(d.get("grade", DEFAULT_DOCTOR_GRADE)) for i, d in enumerate(doctors)},
+                        "grade_rules": {k: int(v) for k, v in st.session_state.grade_rules.items()},
+                        "solver_mode": st.session_state.solver_mode,
+                        "time_max": st.session_state.time_max,
+                        "sol_limit": int(st.session_state.get("sol_limit", 1)),
+                        "adv_limit": int(st.session_state.get("adv_limit", 999)),
+                    }
 
-                solutions, summaries, metrics = build_and_solve(params)
-                st.session_state.solutions = solutions
-                st.session_state.summaries = summaries
-                st.session_state.metrics = metrics
-                st.session_state.sol_idx = 0
-                st.session_state.solved = True
-                st.session_state.pop("prepared_excel_export", None)
-                st.toast(f"✅ {len(solutions)}개의 솔루션을 찾았습니다!", icon="✅")
-            except Exception as e:
-                st.toast(f"❌ 오류 발생: {e}", icon="❌")
-                import traceback
-                st.code(traceback.format_exc())
+                    solutions, summaries, metrics = build_and_solve(params)
+                    st.session_state.solutions = solutions
+                    st.session_state.summaries = summaries
+                    st.session_state.metrics = metrics
+                    st.session_state.sol_idx = 0
+                    st.session_state.solved = True
+                    st.session_state["solve_failed"] = False
+                    st.session_state["solve_failure_message"] = ""
+                    st.session_state["diagnostic_results"] = None
+                    st.session_state.pop("prepared_excel_export", None)
+                    st.toast(f"✅ {len(solutions)}개의 솔루션을 찾았습니다!", icon="✅")
+                except RuntimeError as e:
+                    msg = str(e)
+                    st.session_state.solved = False
+                    st.session_state.solutions = []
+                    st.session_state.summaries = []
+                    st.session_state.metrics = []
+                    st.session_state["solve_failed"] = True
+                    st.session_state["solve_failure_message"] = msg
+                    st.toast(f"❌ 조건을 만족하는 해가 없습니다: {msg}", icon="❌")
+                except Exception as e:
+                    st.session_state.solved = False
+                    st.session_state.solutions = []
+                    st.session_state.summaries = []
+                    st.session_state.metrics = []
+                    st.session_state["solve_failed"] = True
+                    st.session_state["solve_failure_message"] = str(e)
+                    st.toast(f"❌ 오류 발생: {e}", icon="❌")
+                    import traceback
+                    st.code(traceback.format_exc())
+
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1694,7 +2409,18 @@ if st.session_state.get("trigger_solve"):
 # ─────────────────────────────────────────────────────────────────────────────
 with tab4:
     if not st.session_state.solved or not st.session_state.solutions:
-        st.info("← 사이드바에서 **🚀 스케줄 생성** 버튼을 눌러 최적화를 실행하세요.")
+        if st.session_state.get("solve_failed"):
+            st.error("조건을 만족하는 스케줄을 찾지 못했습니다.")
+            if st.session_state.get("solve_failure_message"):
+                st.caption(st.session_state.get("solve_failure_message"))
+            st.info("진단모드는 자동으로 실행하지 않습니다. 아래 버튼을 누르면 1차/2차 hard-rule 병목 후보만 계산합니다.")
+            if st.button("🧪 진단모드 실행", key="btn_run_diagnostics"):
+                st.session_state["diagnostic_results"] = run_hard_bottleneck_diagnostics()
+                st.rerun()
+            if st.session_state.get("diagnostic_results") is not None:
+                render_hard_bottleneck_diagnostics(st.session_state.get("diagnostic_results"))
+        else:
+            st.info("← 사이드바에서 **🚀 스케줄 생성** 버튼을 눌러 최적화를 실행하세요.")
     else:
         solutions = st.session_state.solutions
         summaries = st.session_state.summaries
