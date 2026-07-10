@@ -540,24 +540,46 @@ def build_fixed_total_editor_df() -> pd.DataFrame:
 
 
 def sync_fixed_total_editor_widget():
-    """Callback/sync hook: apply edits from the fixed Total/D/E/N table editor."""
+    """Callback/sync hook: apply edits from the fixed Total/D/E/N table editor.
+
+    Streamlit's data_editor stores edits in session_state as an edit-delta
+    dictionary (edited_rows) in recent versions, while some versions can expose
+    a DataFrame-like value.  Read both formats so the fixed count table is the
+    single source of truth before summaries, pre-checks, diagnostics, and solver
+    params are calculated.
+    """
     key = get_fixed_total_editor_key()
     editor_state = st.session_state.get(key)
-    if not isinstance(editor_state, dict):
-        return
     normalize_shift_counts()
-    edited_rows = editor_state.get("edited_rows", {}) or {}
-    for row_idx, changes in edited_rows.items():
+
+    editable_cols = (("fixed_D", "D"), ("fixed_E", "E"), ("fixed_N", "N"), ("fixed_Total", "Total"))
+
+    # Format used by st.data_editor widget state: only changed cells are present.
+    if isinstance(editor_state, dict):
+        edited_rows = editor_state.get("edited_rows", {}) or {}
+        for row_idx, changes in edited_rows.items():
+            try:
+                ni = int(row_idx)
+            except (TypeError, ValueError):
+                continue
+            if ni < 0 or ni >= len(st.session_state.get("doctors", [])):
+                continue
+            if isinstance(changes, dict):
+                for col, shift_key in editable_cols:
+                    if col in changes:
+                        st.session_state.shift_counts[ni][shift_key] = bounded_int(changes.get(col), -1, -1, 60)
+        return
+
+    # Defensive compatibility for Streamlit versions or testing paths where the
+    # widget state is a full table rather than an edit-delta dictionary.
+    if isinstance(editor_state, pd.DataFrame):
+        apply_fixed_total_editor_df(editor_state)
+        return
+    if isinstance(editor_state, list):
         try:
-            ni = int(row_idx)
-        except (TypeError, ValueError):
-            continue
-        if ni < 0 or ni >= len(st.session_state.get("doctors", [])):
-            continue
-        if isinstance(changes, dict):
-            for col, shift_key in (("fixed_D", "D"), ("fixed_E", "E"), ("fixed_N", "N"), ("fixed_Total", "Total")):
-                if col in changes:
-                    st.session_state.shift_counts[ni][shift_key] = bounded_int(changes.get(col), -1, -1, 60)
+            apply_fixed_total_editor_df(pd.DataFrame(editor_state))
+        except Exception:
+            return
 
 
 def apply_fixed_total_editor_df(edited_df: pd.DataFrame):
@@ -2431,6 +2453,11 @@ if st.session_state.get("trigger_solve"):
     if not doctors:
         st.error("의사를 먼저 추가해 주세요.")
     else:
+        # Make sure the editable fixed count table and duty inputs are reflected
+        # before pre-checks and solver parameters are built. This prevents a
+        # recently edited fixed_D/E/N/Total value from being missed when the user
+        # immediately clicks "스케줄 생성".
+        sync_live_total_summary_inputs(num_days)
         fixed_total_info = get_fixed_total_summary()
         precheck_error = ""
         if fixed_total_info["fixed_count"] > 0 and fixed_total_info["remaining"] < 0:
@@ -2520,6 +2547,7 @@ with tab4:
                 st.caption(st.session_state.get("solve_failure_message"))
             st.info("진단모드는 자동으로 실행하지 않습니다. 아래 버튼을 누르면 1차/2차 hard-rule 병목 후보만 계산합니다.")
             if st.button("🧪 진단모드 실행", key="btn_run_diagnostics"):
+                sync_live_total_summary_inputs(num_days)
                 st.session_state["diagnostic_results"] = run_hard_bottleneck_diagnostics()
                 st.rerun()
             if st.session_state.get("diagnostic_results") is not None:

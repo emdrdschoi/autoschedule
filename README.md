@@ -839,3 +839,18 @@ Lee      fixed_N       7        5               2
 ```
 
 진단 결과에 아무 병목이 안 보이는데도 해가 없다면, 그때는 3차 진단인 relax solver 방식이 필요할 수 있습니다. 현재 버전은 요청대로 2차 진단까지만 포함합니다.
+
+---
+
+## 최근 수정: fixed count 편집표 즉시 반영
+
+개인 규칙 / Grade 탭의 fixed count 편집표에서 `fixed_D`, `fixed_E`, `fixed_N`, `fixed_Total`을 수정한 뒤 바로 스케줄 생성 또는 진단모드를 실행해도, 최신 값이 계산에 반영되도록 보강했습니다.
+
+수정 내용:
+
+- fixed count 편집표의 변경값을 solver 실행 직전에 다시 동기화합니다.
+- Duty 총합 / fixed_total 요약 계산 전에 fixed count 편집표의 변경값을 다시 읽습니다.
+- 진단모드 실행 전에도 같은 동기화를 수행합니다.
+- Streamlit `data_editor`의 edit-delta 형식과 DataFrame 형식을 모두 안전하게 처리합니다.
+
+이제 fixed count 표에서 값을 바꾼 뒤 바로 `스케줄 생성`을 눌러도 이전 값으로 계산되는 문제가 줄어듭니다.
