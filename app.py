@@ -1136,7 +1136,7 @@ with tab3:
     gr = st.session_state.grade_rules
     gcol1, gcol2, gcol3, gcol4, gcol5 = st.columns(5)
     gr["senior_min_grade"] = int(gcol1.number_input(
-        "고년차 기준 grade ≥", min_value=1, max_value=5,
+        "고년차 기준 grade ≥", min_value=1, max_value=10,
         value=int(gr.get("senior_min_grade", DEFAULT_GRADE_RULES["senior_min_grade"])),
         key="grade_senior_min_grade"
     ))
@@ -1146,7 +1146,7 @@ with tab3:
         key="grade_senior_min_count"
     ))
     gr["junior_max_grade"] = int(gcol3.number_input(
-        "저년차 기준 grade ≤", min_value=1, max_value=5,
+        "저년차 기준 grade ≤", min_value=1, max_value=10,
         value=int(gr.get("junior_max_grade", DEFAULT_GRADE_RULES["junior_max_grade"])),
         key="grade_junior_max_grade"
     ))
