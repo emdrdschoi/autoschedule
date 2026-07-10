@@ -594,6 +594,21 @@ def lock_prefix_for_request(val) -> str:
     return "<span class='lock-marker'>🔒</span>" if is_hard_shift_request_value(val) else ""
 
 
+def get_annual_leave_counts_by_doc() -> dict:
+    """Count annual leave requests ('a') by doctor from the effective request layer.
+
+    This is calculated in app.py as a display/export safety net so the Summary
+    table still shows 연차 even when an older solved summary is present in
+    session_state or a legacy scheduler result did not include the column.
+    Fixed request layer overlays base requests, matching the solver input.
+    """
+    counts = {ni: 0 for ni in range(len(st.session_state.get("doctors", [])))}
+    for (ni, _di), val in get_combined_shift_requests().items():
+        if 0 <= int(ni) < len(counts) and "a" in _clean_shift_request_value(val).lower():
+            counts[int(ni)] += 1
+    return counts
+
+
 def read_readme_text() -> str:
     """Load README.md from the same directory as app.py for the in-app guide."""
     readme_path = Path(__file__).with_name("README.md")
@@ -1455,16 +1470,22 @@ with tab4:
         # Tue_N은 더 이상 표시하지 않고, 연차는 Total 바로 옆에 둔다.
         if "Tue_N" in summary_display.columns:
             summary_display = summary_display.drop(columns=["Tue_N"])
-        if "연차" in summary_display.columns and "Total" in summary_display.columns:
-            annual_col = summary_display.pop("연차")
-            insert_at = list(summary_display.columns).index("Total") + 1
-            summary_display.insert(insert_at, "연차", annual_col)
+
+        # 연차는 solver summary에 이미 들어오더라도, 표시/export 단계에서 다시 계산해 보강한다.
+        # 이렇게 하면 이전 solved session이나 legacy summary에도 항상 연차 컬럼이 보인다.
+        annual_counts = get_annual_leave_counts_by_doc()
+        name_to_annual = {doctors[ni]["name"]: int(annual_counts.get(ni, 0)) for ni in range(len(doctors))}
+        annual_col = summary_display["Name"].map(name_to_annual).fillna(0).astype(int)
+        if "연차" in summary_display.columns:
+            summary_display = summary_display.drop(columns=["연차"])
+        insert_at = list(summary_display.columns).index("Total") + 1 if "Total" in summary_display.columns else min(6, len(summary_display.columns))
+        summary_display.insert(insert_at, "연차", annual_col)
 
         # Excel export는 화면 이동 때마다 만들지 않고, 아래의 "Excel 준비" 버튼을 눌렀을 때만 생성합니다.
 
         # Summary stats
         st.markdown('<div class="section-label">근무 통계</div>', unsafe_allow_html=True)
-        st.caption("No는 근무 요청/날짜 설정 탭 및 Excel 입력 순서 기준입니다. Name으로 자동 정렬하지 않습니다.")
+        st.caption("No는 근무 요청/날짜 설정 탭 및 Excel 입력 순서 기준입니다. 연차는 현재 근무 요청의 a 개수 기준으로 표시됩니다.")
         try:
             st.dataframe(
                 summary_display.style.background_gradient(subset=['Total'], cmap='Blues')
