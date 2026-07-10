@@ -531,10 +531,10 @@ def build_fixed_total_editor_df() -> pd.DataFrame:
             "Senior": "Y" if grade >= senior_min_grade else "",
             "Junior": "Y" if grade <= junior_max_grade else "",
             "초저년차": "Y" if grade <= ultra_max_grade else "",
-            "fixed_Total": int(sc.get("Total", -1)),
             "fixed_D": int(sc.get("D", -1)),
             "fixed_E": int(sc.get("E", -1)),
             "fixed_N": int(sc.get("N", -1)),
+            "fixed_Total": int(sc.get("Total", -1)),
         })
     return pd.DataFrame(rows)
 
@@ -555,14 +555,14 @@ def sync_fixed_total_editor_widget():
         if ni < 0 or ni >= len(st.session_state.get("doctors", [])):
             continue
         if isinstance(changes, dict):
-            for col, shift_key in (("fixed_Total", "Total"), ("fixed_D", "D"), ("fixed_E", "E"), ("fixed_N", "N")):
+            for col, shift_key in (("fixed_D", "D"), ("fixed_E", "E"), ("fixed_N", "N"), ("fixed_Total", "Total")):
                 if col in changes:
                     st.session_state.shift_counts[ni][shift_key] = bounded_int(changes.get(col), -1, -1, 60)
 
 
 def apply_fixed_total_editor_df(edited_df: pd.DataFrame):
     """Apply the returned data_editor DataFrame to fixed Total/D/E/N shift_counts."""
-    editable_cols = (("fixed_Total", "Total"), ("fixed_D", "D"), ("fixed_E", "E"), ("fixed_N", "N"))
+    editable_cols = (("fixed_D", "D"), ("fixed_E", "E"), ("fixed_N", "N"), ("fixed_Total", "Total"))
     if edited_df is None or edited_df.empty:
         return
     if not any(col in edited_df.columns for col, _ in editable_cols):
@@ -578,7 +578,7 @@ def apply_fixed_total_editor_df(edited_df: pd.DataFrame):
 
 def render_fixed_total_editor_table():
     """Render an editable fixed Total/D/E/N table below the Duty/fixed_total summary."""
-    st.caption("아래 표에서 fixed_Total / fixed_D / fixed_E / fixed_N을 한 번에 수정할 수 있습니다. -1은 자동 평준화입니다.")
+    st.caption("아래 표에서 fixed_D / fixed_E / fixed_N / fixed_Total을 결과 통계 순서 그대로 한 번에 수정할 수 있습니다. -1은 자동 평준화입니다.")
     key = get_fixed_total_editor_key()
     df = build_fixed_total_editor_df()
     edited_df = st.data_editor(
@@ -595,13 +595,6 @@ def render_fixed_total_editor_table():
             "Senior": st.column_config.TextColumn("Senior", width="small", disabled=True),
             "Junior": st.column_config.TextColumn("Junior", width="small", disabled=True),
             "초저년차": st.column_config.TextColumn("초저년차", width="small", disabled=True),
-            "fixed_Total": st.column_config.NumberColumn(
-                "fixed_Total",
-                min_value=-1,
-                max_value=60,
-                step=1,
-                help="-1 = 자동 평준화, 0 이상 = 해당 의사의 총 D/E/N 근무 수를 정확히 고정",
-            ),
             "fixed_D": st.column_config.NumberColumn(
                 "fixed_D",
                 min_value=-1,
@@ -622,6 +615,13 @@ def render_fixed_total_editor_table():
                 max_value=60,
                 step=1,
                 help="-1 = 자동 평준화, 0 이상 = Night 근무 수를 정확히 고정",
+            ),
+            "fixed_Total": st.column_config.NumberColumn(
+                "fixed_Total",
+                min_value=-1,
+                max_value=60,
+                step=1,
+                help="-1 = 자동 평준화, 0 이상 = 해당 의사의 총 D/E/N 근무 수를 정확히 고정",
             ),
         },
     )
@@ -2318,8 +2318,8 @@ with tab3:
     )
 
     st.divider()
-    st.markdown('<div class="section-label">fixed Total/D/E/N / Duty 총합 확인</div>', unsafe_allow_html=True)
-    st.caption("fixed_Total 또는 fixed_D/E/N, Duty 필요 인원을 바꾸면 아래 요약이 바로 갱신됩니다.")
+    st.markdown('<div class="section-label">fixed D/E/N/Total / Duty 총합 확인</div>', unsafe_allow_html=True)
+    st.caption("fixed_D/E/N/Total 또는 Duty 필요 인원을 바꾸면 아래 요약이 바로 갱신됩니다.")
     render_fixed_total_duty_summary(num_days)
     render_fixed_total_editor_table()
 
