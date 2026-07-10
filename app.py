@@ -360,6 +360,38 @@ def bounded_int(value, default: int, min_value: int, max_value: int) -> int:
         val = int(default)
     return max(int(min_value), min(int(max_value), val))
 
+
+def parse_fixed_count_value(value, default: int = -1, max_value: int = 60) -> int:
+    """Parse fixed count table values. Blank means automatic (-1), 0 means fixed zero."""
+    try:
+        if value is None or pd.isna(value):
+            return -1
+    except TypeError:
+        pass
+    text = str(value).strip()
+    if text == "" or text.lower() in {"nan", "none", "auto", "automatic", "자동"}:
+        return -1
+    try:
+        # Accept values pasted from Excel such as 3.0.
+        val = int(float(text))
+    except (TypeError, ValueError):
+        return int(default)
+    if val < 0:
+        return -1
+    return min(int(max_value), val)
+
+
+def fixed_count_display_value(value) -> str:
+    """Display internal -1 automatic values as a blank cell for easier editing."""
+    val = parse_fixed_count_value(value)
+    return "" if val < 0 else str(val)
+
+
+def fixed_count_excel_value(value):
+    """Save automatic fixed counts as blank in Excel; keep 0 and positive counts."""
+    val = parse_fixed_count_value(value)
+    return "" if val < 0 else int(val)
+
 DEFAULT_GRADE_RULES = {
     "senior_min_grade": 2,       # grade >= this is treated as senior
     "senior_min_count": 1,       # hard: at least this many seniors per duty
@@ -531,10 +563,10 @@ def build_fixed_total_editor_df() -> pd.DataFrame:
             "Senior": "Y" if grade >= senior_min_grade else "",
             "Junior": "Y" if grade <= junior_max_grade else "",
             "초저년차": "Y" if grade <= ultra_max_grade else "",
-            "fixed_D": int(sc.get("D", -1)),
-            "fixed_E": int(sc.get("E", -1)),
-            "fixed_N": int(sc.get("N", -1)),
-            "fixed_Total": int(sc.get("Total", -1)),
+            "fixed_D": fixed_count_display_value(sc.get("D", -1)),
+            "fixed_E": fixed_count_display_value(sc.get("E", -1)),
+            "fixed_N": fixed_count_display_value(sc.get("N", -1)),
+            "fixed_Total": fixed_count_display_value(sc.get("Total", -1)),
         })
     return pd.DataFrame(rows)
 
@@ -567,7 +599,7 @@ def sync_fixed_total_editor_widget():
             if isinstance(changes, dict):
                 for col, shift_key in editable_cols:
                     if col in changes:
-                        st.session_state.shift_counts[ni][shift_key] = bounded_int(changes.get(col), -1, -1, 60)
+                        st.session_state.shift_counts[ni][shift_key] = parse_fixed_count_value(changes.get(col))
         return
 
     # Defensive compatibility for Streamlit versions or testing paths where the
@@ -595,12 +627,12 @@ def apply_fixed_total_editor_df(edited_df: pd.DataFrame):
             break
         for col, shift_key in editable_cols:
             if col in edited_df.columns:
-                st.session_state.shift_counts[pos][shift_key] = bounded_int(row.get(col, -1), -1, -1, 60)
+                st.session_state.shift_counts[pos][shift_key] = parse_fixed_count_value(row.get(col, ""))
 
 
 def render_fixed_total_editor_table():
     """Render an editable fixed Total/D/E/N table below the Duty/fixed_total summary."""
-    st.caption("아래 표에서 fixed_D / fixed_E / fixed_N / fixed_Total을 결과 통계 순서 그대로 한 번에 수정할 수 있습니다. -1은 자동 평준화입니다.")
+    st.caption("아래 표에서 fixed_D / fixed_E / fixed_N / fixed_Total을 결과 통계 순서 그대로 수정합니다. 빈칸 = 자동 평준화, 0 = 해당 근무 없음, 1 이상 = 그 개수로 고정입니다.")
     key = get_fixed_total_editor_key()
     df = build_fixed_total_editor_df()
     edited_df = st.data_editor(
@@ -617,33 +649,25 @@ def render_fixed_total_editor_table():
             "Senior": st.column_config.TextColumn("Senior", width="small", disabled=True),
             "Junior": st.column_config.TextColumn("Junior", width="small", disabled=True),
             "초저년차": st.column_config.TextColumn("초저년차", width="small", disabled=True),
-            "fixed_D": st.column_config.NumberColumn(
+            "fixed_D": st.column_config.TextColumn(
                 "fixed_D",
-                min_value=-1,
-                max_value=60,
-                step=1,
-                help="-1 = 자동 평준화, 0 이상 = Day 근무 수를 정확히 고정",
+                width="small",
+                help="빈칸 = 자동 평준화, 0 = Day 근무 없음, 1 이상 = Day 근무 수 고정",
             ),
-            "fixed_E": st.column_config.NumberColumn(
+            "fixed_E": st.column_config.TextColumn(
                 "fixed_E",
-                min_value=-1,
-                max_value=60,
-                step=1,
-                help="-1 = 자동 평준화, 0 이상 = Evening 근무 수를 정확히 고정",
+                width="small",
+                help="빈칸 = 자동 평준화, 0 = Evening 근무 없음, 1 이상 = Evening 근무 수 고정",
             ),
-            "fixed_N": st.column_config.NumberColumn(
+            "fixed_N": st.column_config.TextColumn(
                 "fixed_N",
-                min_value=-1,
-                max_value=60,
-                step=1,
-                help="-1 = 자동 평준화, 0 이상 = Night 근무 수를 정확히 고정",
+                width="small",
+                help="빈칸 = 자동 평준화, 0 = Night 근무 없음, 1 이상 = Night 근무 수 고정",
             ),
-            "fixed_Total": st.column_config.NumberColumn(
+            "fixed_Total": st.column_config.TextColumn(
                 "fixed_Total",
-                min_value=-1,
-                max_value=60,
-                step=1,
-                help="-1 = 자동 평준화, 0 이상 = 해당 의사의 총 D/E/N 근무 수를 정확히 고정",
+                width="small",
+                help="빈칸 = 자동 평준화, 0 = 총근무 없음, 1 이상 = 총 D/E/N 근무 수 고정",
             ),
         },
     )
@@ -1849,10 +1873,10 @@ with st.sidebar:
             r  = st.session_state.rules.get(ni, {})
             sc = st.session_state.shift_counts.get(ni, {"D": -1, "E": -1, "N": -1, "Total": -1})
             row = {key: r.get(key, '') for key in RULE_COL_ORDER}
-            row["fixed_D"] = sc.get("D", -1)
-            row["fixed_E"] = sc.get("E", -1)
-            row["fixed_N"] = sc.get("N", -1)
-            row["fixed_Total"] = sc.get("Total", -1)
+            row["fixed_D"] = fixed_count_excel_value(sc.get("D", -1))
+            row["fixed_E"] = fixed_count_excel_value(sc.get("E", -1))
+            row["fixed_N"] = fixed_count_excel_value(sc.get("N", -1))
+            row["fixed_Total"] = fixed_count_excel_value(sc.get("Total", -1))
             rules_rows.append(row)
         df_rules = pd.DataFrame(rules_rows, index=doctor_names)
         df_rules.index.name = 'Name'
