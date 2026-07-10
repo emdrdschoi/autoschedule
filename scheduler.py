@@ -102,7 +102,7 @@ def build_and_solve(params: dict[str, Any]):
         "junior_soft_max_count": 1,
         "junior_penalty_weight": 1,
         "ultra_junior_max_grade": 1,
-        "ultra_junior_forbid_at_or_above": 0,
+        "ultra_junior_max_count": 0,
         "weight_de_dev": 1,
         "weight_holiday_dev": 3,
         "weight_total_dev": 5,
@@ -113,6 +113,12 @@ def build_and_solve(params: dict[str, Any]):
         key: int(grade_rules_raw.get(key, default))
         for key, default in default_grade_rules.items()
     }
+    # Backward compatibility with older app/config versions:
+    # old ultra_junior_forbid_at_or_above = X meant "X명 이상 불가",
+    # which is equivalent to new ultra_junior_max_count = X - 1.
+    if "ultra_junior_max_count" not in grade_rules_raw and "ultra_junior_forbid_at_or_above" in grade_rules_raw:
+        old_cutoff = int(grade_rules_raw.get("ultra_junior_forbid_at_or_above", 0))
+        grade_rules["ultra_junior_max_count"] = max(0, old_cutoff - 1) if old_cutoff > 0 else 0
     solver_mode  = params["solver_mode"]
     time_max     = int(params["time_max"])
     sol_limit    = int(params["sol_limit"])
@@ -134,7 +140,7 @@ def build_and_solve(params: dict[str, Any]):
     junior_soft_max_count = grade_rules["junior_soft_max_count"]
     junior_penalty_weight = grade_rules["junior_penalty_weight"]
     ultra_junior_max_grade = grade_rules["ultra_junior_max_grade"]
-    ultra_junior_forbid_at_or_above = grade_rules["ultra_junior_forbid_at_or_above"]
+    ultra_junior_max_count = grade_rules["ultra_junior_max_count"]
     weight_de_dev      = grade_rules["weight_de_dev"]
     weight_holiday_dev = grade_rules["weight_holiday_dev"]
     weight_total_dev   = grade_rules["weight_total_dev"]
@@ -167,18 +173,17 @@ def build_and_solve(params: dict[str, Any]):
                     )
 
     # Validate ultra-junior hard rule before building the full model.
-    # ultra_junior_forbid_at_or_above = X means X or more ultra-juniors in one duty is forbidden,
-    # so at most X-1 ultra-juniors can be assigned to each active duty.
-    if ultra_junior_forbid_at_or_above > 0:
-        allowed_ultra = max(0, ultra_junior_forbid_at_or_above - 1)
-        max_possible_staff = len(non_ultra_junior_doctors) + min(len(ultra_junior_doctors), allowed_ultra)
+    # ultra_junior_max_count = maximum ultra-juniors allowed in one active D/E/N duty.
+    # 0 disables this hard rule; 1 means at most one ultra-junior per duty.
+    if ultra_junior_max_count > 0:
+        max_possible_staff = len(non_ultra_junior_doctors) + min(len(ultra_junior_doctors), ultra_junior_max_count)
         for d in all_days:
             for s in all_shifts:
                 if duty_requests[d][s] > max_possible_staff:
                     raise RuntimeError(
                         f"초저년차 hard rule 불가능: day {d+1}, shift {['D','E','N'][s]} 필요 인원은 "
                         f"{duty_requests[d][s]}명인데, grade <= {ultra_junior_max_grade} 인원은 "
-                        f"한 duty에 {ultra_junior_forbid_at_or_above}명 이상 함께 근무할 수 없도록 설정되어 있습니다. "
+                        f"한 duty에 최대 {ultra_junior_max_count}명까지만 허용되도록 설정되어 있습니다. "
                         f"현재 조건에서는 이 duty에 최대 {max_possible_staff}명까지만 배정 가능합니다."
                     )
 
@@ -447,14 +452,13 @@ def build_and_solve(params: dict[str, Any]):
                 if duty_requests[d][s] > 0:
                     model.Add(sum(shifts[(n,d,s)] for n in senior_doctors) >= senior_min_count)
 
-    # Ultra-junior hard rule: forbid X or more ultra-juniors in the same active duty.
-    # Example: X=2 means at most 1 ultra-junior per D/E/N duty.
-    if ultra_junior_forbid_at_or_above > 0 and ultra_junior_doctors:
-        allowed_ultra = max(0, ultra_junior_forbid_at_or_above - 1)
+    # Ultra-junior hard rule: maximum ultra-juniors allowed in the same active duty.
+    # Example: max_count=1 means at most one ultra-junior per D/E/N duty.
+    if ultra_junior_max_count > 0 and ultra_junior_doctors:
         for d in all_days:
             for s in all_shifts:
                 if duty_requests[d][s] > 0:
-                    model.Add(sum(shifts[(n,d,s)] for n in ultra_junior_doctors) <= allowed_ultra)
+                    model.Add(sum(shifts[(n,d,s)] for n in ultra_junior_doctors) <= ultra_junior_max_count)
 
     # Cannot-work constraints
     for n in all_doctors:
@@ -715,7 +719,7 @@ def build_and_solve(params: dict[str, Any]):
             "junior_soft_max_count": junior_soft_max_count,
             "junior_penalty_weight": junior_penalty_weight,
             "ultra_junior_max_grade": ultra_junior_max_grade,
-            "ultra_junior_forbid_at_or_above": ultra_junior_forbid_at_or_above,
+            "ultra_junior_max_count": ultra_junior_max_count,
             "weight_de_dev": weight_de_dev,
             "weight_holiday_dev": weight_holiday_dev,
             "weight_total_dev": weight_total_dev,

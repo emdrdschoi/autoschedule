@@ -300,7 +300,7 @@ def _init_state():
             "junior_soft_max_count": 1,
             "junior_penalty_weight": 1,
             "ultra_junior_max_grade": 1,
-            "ultra_junior_forbid_at_or_above": 0,
+            "ultra_junior_max_count": 0,
             "weight_de_dev": 1,
             "weight_holiday_dev": 3,
             "weight_total_dev": 5,
@@ -364,7 +364,7 @@ DEFAULT_GRADE_RULES = {
     "junior_soft_max_count": 1,  # soft: try not to exceed this many juniors per duty
     "junior_penalty_weight": 1,  # soft penalty weight per excess junior assignment
     "ultra_junior_max_grade": 1, # grade <= this is treated as ultra-junior for hard rule
-    "ultra_junior_forbid_at_or_above": 0, # 0=disabled; X means X or more ultra-juniors in one duty is forbidden
+    "ultra_junior_max_count": 0, # 0=disabled; maximum ultra-juniors allowed in one active duty
     "weight_de_dev": 1,          # objective weight for D/E imbalance
     "weight_holiday_dev": 3,     # objective weight for holiday imbalance
     "weight_total_dev": 5,       # objective weight for total-duty imbalance
@@ -378,7 +378,7 @@ GRADE_RULE_LABELS = {
     "junior_soft_max_count": "각 duty별 저년차 권장 최대 인원 (soft)",
     "junior_penalty_weight": "저년차 초과 penalty 가중치",
     "ultra_junior_max_grade": "초저년차 기준 grade 이하",
-    "ultra_junior_forbid_at_or_above": "초저년차 동시근무 금지 기준 (hard, 0=사용안함)",
+    "ultra_junior_max_count": "초저년차 duty당 최대 허용 인원 (hard, 0=사용안함)",
     "weight_de_dev": "D/E 편차 가중치",
     "weight_holiday_dev": "휴일 편차 가중치",
     "weight_total_dev": "총 근무 편차 가중치",
@@ -402,6 +402,11 @@ def normalize_grade_rules():
     """Ensure global GradeRules exist and stay within Streamlit widget bounds."""
     if "grade_rules" not in st.session_state or not isinstance(st.session_state.grade_rules, dict):
         st.session_state.grade_rules = DEFAULT_GRADE_RULES.copy()
+    # Backward compatibility: older configs used ultra_junior_forbid_at_or_above.
+    # Old X meant "X명 이상 불가", so it becomes max_count = X - 1.
+    if "ultra_junior_max_count" not in st.session_state.grade_rules and "ultra_junior_forbid_at_or_above" in st.session_state.grade_rules:
+        old_cutoff = bounded_int(st.session_state.grade_rules.get("ultra_junior_forbid_at_or_above", 0), 0, 0, 10)
+        st.session_state.grade_rules["ultra_junior_max_count"] = max(0, old_cutoff - 1) if old_cutoff > 0 else 0
     bounds = {
         "senior_min_grade": (GRADE_MIN_VALUE, GRADE_MAX_VALUE),
         "senior_min_count": (0, 10),
@@ -409,7 +414,7 @@ def normalize_grade_rules():
         "junior_soft_max_count": (0, 10),
         "junior_penalty_weight": (0, 100),
         "ultra_junior_max_grade": (GRADE_MIN_VALUE, GRADE_MAX_VALUE),
-        "ultra_junior_forbid_at_or_above": (0, 10),
+        "ultra_junior_max_count": (0, 10),
         "weight_de_dev": (0, 100),
         "weight_holiday_dev": (0, 100),
         "weight_total_dev": (0, 100),
@@ -588,10 +593,15 @@ def grade_rules_from_df(df: pd.DataFrame) -> dict:
     if df is None or df.empty:
         return rules
     if {"key", "value"}.issubset(df.columns):
+        old_ultra_cutoff = None
         for _, row in df.iterrows():
             key = str(row.get("key", "")).strip()
+            if key == "ultra_junior_forbid_at_or_above" and pd.notna(row.get("value")):
+                old_ultra_cutoff = int(row.get("value"))
             if key in rules and pd.notna(row.get("value")):
                 rules[key] = int(row.get("value"))
+        if "ultra_junior_max_count" not in set(str(k).strip() for k in df.get("key", [])) and old_ultra_cutoff is not None:
+            rules["ultra_junior_max_count"] = max(0, old_ultra_cutoff - 1) if old_ultra_cutoff > 0 else 0
     return rules
 
 
@@ -1436,25 +1446,22 @@ with tab3:
         key=f"grade_junior_penalty_weight_v{gr_ver}"
     ))
 
-    st.markdown('<div class="section-label">초저년차 Hard Rule</div>', unsafe_allow_html=True)
-    st.caption("초저년차가 같은 날짜·같은 D/E/N duty에 X명 이상 함께 들어가는 것을 절대 금지합니다. 0이면 사용하지 않습니다.")
+    st.caption("초저년차 hard rule도 Grade 정책 안에서 함께 설정합니다. 0이면 사용하지 않고, 1이면 한 duty에 초저년차 최대 1명까지만 허용합니다.")
     ucol1, ucol2, ucol3 = st.columns([1, 1, 3])
     gr["ultra_junior_max_grade"] = int(ucol1.number_input(
         "초저년차 기준 grade ≤", min_value=GRADE_MIN_VALUE, max_value=GRADE_MAX_VALUE,
         value=bounded_int(gr.get("ultra_junior_max_grade", DEFAULT_GRADE_RULES["ultra_junior_max_grade"]), DEFAULT_GRADE_RULES["ultra_junior_max_grade"], GRADE_MIN_VALUE, GRADE_MAX_VALUE),
         key=f"grade_ultra_junior_max_grade_v{gr_ver}"
     ))
-    gr["ultra_junior_forbid_at_or_above"] = int(ucol2.number_input(
-        "X명 이상 불가", min_value=0, max_value=10,
-        value=bounded_int(gr.get("ultra_junior_forbid_at_or_above", DEFAULT_GRADE_RULES["ultra_junior_forbid_at_or_above"]), DEFAULT_GRADE_RULES["ultra_junior_forbid_at_or_above"], 0, 10),
-        key=f"grade_ultra_junior_forbid_at_or_above_v{gr_ver}"
+    gr["ultra_junior_max_count"] = int(ucol2.number_input(
+        "초저년차 최대 허용", min_value=0, max_value=10,
+        value=bounded_int(gr.get("ultra_junior_max_count", DEFAULT_GRADE_RULES["ultra_junior_max_count"]), DEFAULT_GRADE_RULES["ultra_junior_max_count"], 0, 10),
+        key=f"grade_ultra_junior_max_count_v{gr_ver}"
     ))
-    if gr["ultra_junior_forbid_at_or_above"] > 0:
-        allowed_ultra = max(0, gr["ultra_junior_forbid_at_or_above"] - 1)
+    if gr["ultra_junior_max_count"] > 0:
         ucol3.info(
-            f"Hard: grade ≤ {gr['ultra_junior_max_grade']} 인원은 한 duty에 "
-            f"{gr['ultra_junior_forbid_at_or_above']}명 이상 함께 근무할 수 없습니다. "
-            f"즉 최대 {allowed_ultra}명까지 허용됩니다."
+            f"Hard: grade ≤ {gr['ultra_junior_max_grade']} 인원은 같은 날짜·같은 D/E/N duty에 "
+            f"최대 {gr['ultra_junior_max_count']}명까지만 허용됩니다."
         )
     else:
         ucol3.caption("0이면 초저년차 동시근무 hard rule은 적용하지 않습니다.")
@@ -1493,8 +1500,8 @@ with tab3:
         f"Hard: 각 duty마다 <b>grade ≥ {gr['senior_min_grade']}</b> 인원이 최소 <b>{gr['senior_min_count']}</b>명 필요합니다. "
         f"Soft: <b>grade ≤ {gr['junior_max_grade']}</b> 인원이 duty별 <b>{gr['junior_soft_max_count']}</b>명을 초과하면 "
         f"초과 1건당 <b>{gr['junior_penalty_weight']}</b>점 penalty를 줍니다. "
-        f"Ultra-hard: <b>grade ≤ {gr.get('ultra_junior_max_grade', 1)}</b> 인원이 duty별 "
-        f"<b>{gr.get('ultra_junior_forbid_at_or_above', 0)}</b>명 이상이면 금지합니다(0=사용안함)."
+        f"Ultra-hard: <b>grade ≤ {gr.get('ultra_junior_max_grade', 1)}</b> 인원은 duty별 "
+        f"최대 <b>{gr.get('ultra_junior_max_count', 0)}</b>명까지 허용합니다(0=사용안함)."
         f"</div>",
         unsafe_allow_html=True
     )
@@ -1769,7 +1776,7 @@ with tab4:
                 f"| **저년차 초과:** {m.get('junior_excess', 0)}×{m.get('junior_penalty_weight', gr.get('junior_penalty_weight', 1))} "
                 f"= **{m.get('junior_penalty', 0)}** "
                 f"| **초저년차 hard:** grade≤{m.get('ultra_junior_max_grade', gr.get('ultra_junior_max_grade', 1))}, "
-                f"{m.get('ultra_junior_forbid_at_or_above', gr.get('ultra_junior_forbid_at_or_above', 0))}명 이상 불가</div>",
+                f"최대 {m.get('ultra_junior_max_count', gr.get('ultra_junior_max_count', 0))}명 허용</div>",
                 unsafe_allow_html=True
             )
 
