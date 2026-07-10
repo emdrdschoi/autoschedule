@@ -429,6 +429,62 @@ def normalize_shift_counts():
                 sc[key] = -1
         st.session_state.shift_counts[ni] = sc
 
+def sync_live_total_summary_inputs(num_days: int | None = None):
+    """Synchronize live number_input widget values before rendering fixed_total summary.
+
+    Streamlit executes the page from top to bottom. The fixed_total summary is drawn
+    above the Duty/Total input grids, so without this sync it can show the previous
+    run's values until another widget triggers a rerun. Reading the widget keys here
+    makes the summary reflect the most recent DutyRequests and fixed_Total edits.
+    """
+    if num_days is None:
+        num_days = int(st.session_state.get("num_days", 0))
+
+    # DutyRequests widgets live in Tab 2.
+    if "duty_requests" not in st.session_state or not isinstance(st.session_state.duty_requests, dict):
+        st.session_state.duty_requests = {}
+    duty_ver = st.session_state.get("duty_req_version", 0)
+    for di in range(int(num_days)):
+        vals = list(st.session_state.duty_requests.get(di, [1, 1, 1]))
+        if len(vals) < 3:
+            vals = (vals + [1, 1, 1])[:3]
+        for shift_i in range(3):
+            widget_key = f"duty_{di}_{shift_i}_v{duty_ver}"
+            if widget_key in st.session_state:
+                vals[shift_i] = bounded_int(st.session_state.get(widget_key), vals[shift_i], 0, max(0, len(st.session_state.get("doctors", []))))
+        st.session_state.duty_requests[di] = [int(vals[0]), int(vals[1]), int(vals[2])]
+
+    # fixed Total/D/E/N widgets live in Tab 3.
+    normalize_shift_counts()
+    sc_ver = st.session_state.get("shift_count_version", 0)
+    for ni in range(len(st.session_state.get("doctors", []))):
+        if ni not in st.session_state.shift_counts:
+            st.session_state.shift_counts[ni] = {"D": -1, "E": -1, "N": -1, "Total": -1}
+        for shift_key in ("Total", "D", "E", "N"):
+            widget_key = f"sc_{shift_key}_{ni}_v{sc_ver}"
+            if widget_key in st.session_state:
+                st.session_state.shift_counts[ni][shift_key] = bounded_int(st.session_state.get(widget_key), -1, -1, 60)
+
+
+def sync_duty_request_widget(di: int, shift_i: int, widget_key: str):
+    """Callback: immediately write a Duty number_input value into duty_requests."""
+    if "duty_requests" not in st.session_state or not isinstance(st.session_state.duty_requests, dict):
+        st.session_state.duty_requests = {}
+    vals = list(st.session_state.duty_requests.get(di, [1, 1, 1]))
+    if len(vals) < 3:
+        vals = (vals + [1, 1, 1])[:3]
+    vals[shift_i] = bounded_int(st.session_state.get(widget_key), vals[shift_i], 0, max(0, len(st.session_state.get("doctors", []))))
+    st.session_state.duty_requests[di] = [int(vals[0]), int(vals[1]), int(vals[2])]
+
+
+def sync_shift_count_widget(ni: int, shift_key: str, widget_key: str):
+    """Callback: immediately write a fixed Total/D/E/N value into shift_counts."""
+    normalize_shift_counts()
+    if ni not in st.session_state.shift_counts:
+        st.session_state.shift_counts[ni] = {"D": -1, "E": -1, "N": -1, "Total": -1}
+    st.session_state.shift_counts[ni][shift_key] = bounded_int(st.session_state.get(widget_key), -1, -1, 60)
+
+
 def get_total_duty_count() -> int:
     """Total number of required assignments in DutyRequests."""
     return int(sum(sum(map(int, st.session_state.duty_requests.get(di, [0, 0, 0]))) for di in range(st.session_state.num_days)))
@@ -456,6 +512,7 @@ def get_fixed_total_summary():
 
 def render_fixed_total_duty_summary(num_days: int):
     """Render a compact mismatch/remaining summary for DutyRequests vs fixed_total."""
+    sync_live_total_summary_inputs(num_days)
     fixed_total_info = get_fixed_total_summary()
     d_total = sum(st.session_state.duty_requests.get(di, [0, 0, 0])[0] for di in range(num_days))
     e_total = sum(st.session_state.duty_requests.get(di, [0, 0, 0])[1] for di in range(num_days))
@@ -1151,10 +1208,13 @@ with tab2:
                 if di < num_days:
                     cur_val = st.session_state.duty_requests.get(di, [1,1,1])[shift_i]
                     duty_ver = st.session_state.get("duty_req_version", 0)
+                    duty_key = f"duty_{di}_{shift_i}_v{duty_ver}"
                     new_val = cols2[ci+1].number_input(
                         f"duty_{di}_{shift_i}", min_value=0, max_value=len(doctors),
                         value=cur_val, label_visibility="collapsed",
-                        key=f"duty_{di}_{shift_i}_v{duty_ver}"
+                        key=duty_key,
+                        on_change=sync_duty_request_widget,
+                        args=(di, shift_i, duty_key),
                     )
                     if di not in st.session_state.duty_requests:
                         st.session_state.duty_requests[di] = [1,1,1]
@@ -1252,6 +1312,11 @@ with tab3:
     )
 
     st.divider()
+    st.markdown('<div class="section-label">fixed_total / Duty 총합 확인</div>', unsafe_allow_html=True)
+    st.caption("Total 고정값 또는 Duty 필요 인원을 바꾸면 아래 요약이 바로 갱신됩니다.")
+    render_fixed_total_duty_summary(num_days)
+
+    st.divider()
     st.markdown('<div class="section-label">개인별 Grade & 근무 규칙 설정</div>', unsafe_allow_html=True)
     st.caption("7명씩 나눠서 표시됩니다. Grade와 규칙명 옆으로 의사별 설정을 입력하세요.")
 
@@ -1328,9 +1393,12 @@ with tab3:
                     st.session_state.shift_counts[ni]["Total"] = -1
                 cur = int(st.session_state.shift_counts[ni].get(shift_key, -1))
                 sc_ver = st.session_state.get("shift_count_version", 0)
+                sc_key = f"sc_{shift_key}_{ni}_v{sc_ver}"
                 new_val = sc_cols[ci+1].number_input(
                     f"sc_{shift_key}_{ni}", min_value=-1, max_value=60,
-                    value=cur, label_visibility="collapsed", key=f"sc_{shift_key}_{ni}_v{sc_ver}"
+                    value=cur, label_visibility="collapsed", key=sc_key,
+                    on_change=sync_shift_count_widget,
+                    args=(ni, shift_key, sc_key),
                 )
                 st.session_state.shift_counts[ni][shift_key] = int(new_val)
 
