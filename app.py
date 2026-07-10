@@ -1722,13 +1722,17 @@ with tab4:
                 grades_for_shift = [int(doctors[ni].get('grade', DEFAULT_DOCTOR_GRADE)) for ni in staff]
                 avg_grade = round(sum(grades_for_shift) / len(grades_for_shift), 2) if grades_for_shift else None
                 required = st.session_state.duty_requests.get(di, [0, 0, 0])[si]
+                staff_with_grade = ", ".join(
+                    f"{doctors[ni]['name']} [{int(doctors[ni].get('grade', DEFAULT_DOCTOR_GRADE))}]"
+                    for ni in staff
+                )
                 duty_summary_rows.append({
                     "날짜": date_label,
                     "유형": dtype,
                     "Duty": shift_key,
                     "인원/필요": f"{len(staff)}/{required}",
                     "평균 Grade": avg_grade if avg_grade is not None else "-",
-                    "근무자": ", ".join(doctors[ni]['name'] for ni in staff),
+                    "근무자": staff_with_grade,
                     "_is_holiday": is_holiday_type,
                 })
 
