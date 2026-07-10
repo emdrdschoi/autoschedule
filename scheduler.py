@@ -101,6 +101,8 @@ def build_and_solve(params: dict[str, Any]):
         "junior_max_grade": 1,
         "junior_soft_max_count": 1,
         "junior_penalty_weight": 1,
+        "ultra_junior_max_grade": 1,
+        "ultra_junior_forbid_at_or_above": 0,
         "weight_de_dev": 1,
         "weight_holiday_dev": 3,
         "weight_total_dev": 5,
@@ -131,6 +133,8 @@ def build_and_solve(params: dict[str, Any]):
     junior_max_grade = grade_rules["junior_max_grade"]
     junior_soft_max_count = grade_rules["junior_soft_max_count"]
     junior_penalty_weight = grade_rules["junior_penalty_weight"]
+    ultra_junior_max_grade = grade_rules["ultra_junior_max_grade"]
+    ultra_junior_forbid_at_or_above = grade_rules["ultra_junior_forbid_at_or_above"]
     weight_de_dev      = grade_rules["weight_de_dev"]
     weight_holiday_dev = grade_rules["weight_holiday_dev"]
     weight_total_dev   = grade_rules["weight_total_dev"]
@@ -139,6 +143,8 @@ def build_and_solve(params: dict[str, Any]):
 
     senior_doctors = [n for n in all_doctors if grades.get(n, 2) >= senior_min_grade]
     junior_doctors = [n for n in all_doctors if grades.get(n, 2) <= junior_max_grade]
+    ultra_junior_doctors = [n for n in all_doctors if grades.get(n, 2) <= ultra_junior_max_grade]
+    non_ultra_junior_doctors = [n for n in all_doctors if n not in ultra_junior_doctors]
 
     day_names_list = [_get_day_label(start_date, d) for d in all_days]
 
@@ -158,6 +164,22 @@ def build_and_solve(params: dict[str, Any]):
                     raise RuntimeError(
                         f"고년차 hard rule 불가능: day {d+1}, shift {['D','E','N'][s]} 필요 인원은 "
                         f"{duty_requests[d][s]}명인데 고년차 최소 {senior_min_count}명으로 설정되어 있습니다."
+                    )
+
+    # Validate ultra-junior hard rule before building the full model.
+    # ultra_junior_forbid_at_or_above = X means X or more ultra-juniors in one duty is forbidden,
+    # so at most X-1 ultra-juniors can be assigned to each active duty.
+    if ultra_junior_forbid_at_or_above > 0:
+        allowed_ultra = max(0, ultra_junior_forbid_at_or_above - 1)
+        max_possible_staff = len(non_ultra_junior_doctors) + min(len(ultra_junior_doctors), allowed_ultra)
+        for d in all_days:
+            for s in all_shifts:
+                if duty_requests[d][s] > max_possible_staff:
+                    raise RuntimeError(
+                        f"초저년차 hard rule 불가능: day {d+1}, shift {['D','E','N'][s]} 필요 인원은 "
+                        f"{duty_requests[d][s]}명인데, grade <= {ultra_junior_max_grade} 인원은 "
+                        f"한 duty에 {ultra_junior_forbid_at_or_above}명 이상 함께 근무할 수 없도록 설정되어 있습니다. "
+                        f"현재 조건에서는 이 duty에 최대 {max_possible_staff}명까지만 배정 가능합니다."
                     )
 
     # shift_requests[n][d][s] = 1 if doctor n cannot work shift s on day d
@@ -425,6 +447,15 @@ def build_and_solve(params: dict[str, Any]):
                 if duty_requests[d][s] > 0:
                     model.Add(sum(shifts[(n,d,s)] for n in senior_doctors) >= senior_min_count)
 
+    # Ultra-junior hard rule: forbid X or more ultra-juniors in the same active duty.
+    # Example: X=2 means at most 1 ultra-junior per D/E/N duty.
+    if ultra_junior_forbid_at_or_above > 0 and ultra_junior_doctors:
+        allowed_ultra = max(0, ultra_junior_forbid_at_or_above - 1)
+        for d in all_days:
+            for s in all_shifts:
+                if duty_requests[d][s] > 0:
+                    model.Add(sum(shifts[(n,d,s)] for n in ultra_junior_doctors) <= allowed_ultra)
+
     # Cannot-work constraints
     for n in all_doctors:
         for d in all_days:
@@ -651,6 +682,7 @@ def build_and_solve(params: dict[str, Any]):
                 'Grade': grades.get(n, 2),
                 'Senior': 'Y' if grades.get(n, 2) >= senior_min_grade else '',
                 'Junior': 'Y' if grades.get(n, 2) <= junior_max_grade else '',
+                '초저년차': 'Y' if grades.get(n, 2) <= ultra_junior_max_grade else '',
                 'D': d_cnt, 'E': e_cnt, 'N': n_cnt,
                 'Total': tot, '연차': annual_cnt, 'Holiday': hol,
                 'Fri_N': fri_n,
@@ -682,6 +714,8 @@ def build_and_solve(params: dict[str, Any]):
             "junior_max_grade": junior_max_grade,
             "junior_soft_max_count": junior_soft_max_count,
             "junior_penalty_weight": junior_penalty_weight,
+            "ultra_junior_max_grade": ultra_junior_max_grade,
+            "ultra_junior_forbid_at_or_above": ultra_junior_forbid_at_or_above,
             "weight_de_dev": weight_de_dev,
             "weight_holiday_dev": weight_holiday_dev,
             "weight_total_dev": weight_total_dev,

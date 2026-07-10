@@ -299,6 +299,8 @@ def _init_state():
             "junior_max_grade": 1,
             "junior_soft_max_count": 1,
             "junior_penalty_weight": 1,
+            "ultra_junior_max_grade": 1,
+            "ultra_junior_forbid_at_or_above": 0,
             "weight_de_dev": 1,
             "weight_holiday_dev": 3,
             "weight_total_dev": 5,
@@ -361,6 +363,8 @@ DEFAULT_GRADE_RULES = {
     "junior_max_grade": 1,       # grade <= this is treated as junior
     "junior_soft_max_count": 1,  # soft: try not to exceed this many juniors per duty
     "junior_penalty_weight": 1,  # soft penalty weight per excess junior assignment
+    "ultra_junior_max_grade": 1, # grade <= this is treated as ultra-junior for hard rule
+    "ultra_junior_forbid_at_or_above": 0, # 0=disabled; X means X or more ultra-juniors in one duty is forbidden
     "weight_de_dev": 1,          # objective weight for D/E imbalance
     "weight_holiday_dev": 3,     # objective weight for holiday imbalance
     "weight_total_dev": 5,       # objective weight for total-duty imbalance
@@ -373,6 +377,8 @@ GRADE_RULE_LABELS = {
     "junior_max_grade": "저년차 기준 grade 이하",
     "junior_soft_max_count": "각 duty별 저년차 권장 최대 인원 (soft)",
     "junior_penalty_weight": "저년차 초과 penalty 가중치",
+    "ultra_junior_max_grade": "초저년차 기준 grade 이하",
+    "ultra_junior_forbid_at_or_above": "초저년차 동시근무 금지 기준 (hard, 0=사용안함)",
     "weight_de_dev": "D/E 편차 가중치",
     "weight_holiday_dev": "휴일 편차 가중치",
     "weight_total_dev": "총 근무 편차 가중치",
@@ -402,6 +408,8 @@ def normalize_grade_rules():
         "junior_max_grade": (GRADE_MIN_VALUE, GRADE_MAX_VALUE),
         "junior_soft_max_count": (0, 10),
         "junior_penalty_weight": (0, 100),
+        "ultra_junior_max_grade": (GRADE_MIN_VALUE, GRADE_MAX_VALUE),
+        "ultra_junior_forbid_at_or_above": (0, 10),
         "weight_de_dev": (0, 100),
         "weight_holiday_dev": (0, 100),
         "weight_total_dev": (0, 100),
@@ -585,6 +593,103 @@ def grade_rules_from_df(df: pd.DataFrame) -> dict:
             if key in rules and pd.notna(row.get("value")):
                 rules[key] = int(row.get("value"))
     return rules
+
+
+def read_config_sheet(xls: pd.ExcelFile, sheet_name: str, index_col=None) -> pd.DataFrame:
+    """Read an optional config sheet. Missing old-version sheets become empty DataFrames."""
+    if sheet_name not in xls.sheet_names:
+        return pd.DataFrame()
+    try:
+        return pd.read_excel(xls, sheet_name=sheet_name, index_col=index_col)
+    except Exception:
+        return pd.DataFrame()
+
+
+def _norm_col_name(col) -> str:
+    return str(col).strip().lower().replace(" ", "_")
+
+
+def row_get_any(row, names, default=None):
+    """Return the first non-empty value from row using case/space-insensitive aliases."""
+    if row is None:
+        return default
+    normalized = {_norm_col_name(c): c for c in row.index}
+    for name in names:
+        key = _norm_col_name(name)
+        if key in normalized:
+            val = row[normalized[key]]
+            if pd.notna(val):
+                return val
+    return default
+
+
+def safe_int(value, default: int = 0, min_value: int | None = None, max_value: int | None = None) -> int:
+    """Safe int conversion for old Excel files with blanks/NaN/text."""
+    try:
+        if value is None or pd.isna(value):
+            val = int(default)
+        else:
+            val = int(value)
+    except (TypeError, ValueError):
+        val = int(default)
+    if min_value is not None:
+        val = max(int(min_value), val)
+    if max_value is not None:
+        val = min(int(max_value), val)
+    return int(val)
+
+
+def find_row_by_name_or_position(df: pd.DataFrame, name: str, pos: int):
+    """Find a settings row by doctor name first, then by row position."""
+    if df is None or df.empty:
+        return None
+    target = str(name).strip()
+    for i, idx in enumerate(df.index):
+        if str(idx).strip() == target:
+            return df.iloc[i]
+    if 0 <= pos < len(df):
+        return df.iloc[pos]
+    return None
+
+
+def derive_doctor_names_from_old_config(*dfs) -> list[str]:
+    """Fallback for very old config files that do not have a Doctors sheet."""
+    names = []
+    for df in dfs:
+        if df is None or df.empty:
+            continue
+        for idx in df.index:
+            text = str(idx).strip()
+            if not text or text.lower() in {"nan", "none"}:
+                continue
+            if text not in names:
+                names.append(text)
+        if names:
+            break
+    return names
+
+
+def duty_value_from_row(row, shift_label: str, fallback_pos: int) -> int:
+    """Read D/E/N from either named columns or the first 3 columns of older files."""
+    if row is None:
+        return 1
+    val = row_get_any(row, [shift_label, shift_label.upper(), shift_label.lower()], default=None)
+    if val is None and fallback_pos < len(row.index):
+        val = row.iloc[fallback_pos]
+    return safe_int(val, 1, 0, max(0, len(st.session_state.get("doctors", []))))
+
+
+def parse_start_date_from_duty_index(df_duty: pd.DataFrame, fallback: date) -> date:
+    """Use the first DutyRequests index as start_date when it looks like a date."""
+    if df_duty is None or df_duty.empty:
+        return fallback
+    try:
+        parsed = pd.to_datetime(df_duty.index[0], errors="coerce")
+        if pd.notna(parsed):
+            return parsed.date()
+    except Exception:
+        pass
+    return fallback
 
 
 HARD_SHIFT_VALUES = {"D", "E", "N", "x", "a"}
@@ -953,66 +1058,121 @@ with st.sidebar:
         if st.button("📤 불러오기 적용", use_container_width=True, key="btn_load_config"):
             try:
                 xls = pd.ExcelFile(uploaded_file)
-                df_doctors = pd.read_excel(xls, sheet_name='Doctors')
-                df_rules = pd.read_excel(xls, sheet_name='Rules', index_col=0)
-                df_duty = pd.read_excel(xls, sheet_name='DutyRequests', index_col=0)
-                df_shift = pd.read_excel(xls, sheet_name='ShiftRequests', index_col=0)
-                df_fixed_shift = pd.read_excel(xls, sheet_name='FixedShiftRequests', index_col=0) if 'FixedShiftRequests' in xls.sheet_names else pd.DataFrame()
-                df_grade_rules = pd.read_excel(xls, sheet_name='GradeRules') if 'GradeRules' in xls.sheet_names else pd.DataFrame()
 
-                # 1) 의사 정보: grade 포함해서 읽기 (없으면 기본값)
+                # 이전 버전 config 호환: 새 시트/컬럼이 없어도 empty/default로 처리한다.
+                df_doctors = read_config_sheet(xls, 'Doctors')
+                df_rules = read_config_sheet(xls, 'Rules', index_col=0)
+                df_duty = read_config_sheet(xls, 'DutyRequests', index_col=0)
+                df_shift = read_config_sheet(xls, 'ShiftRequests', index_col=0)
+                df_fixed_shift = read_config_sheet(xls, 'FixedShiftRequests', index_col=0)
+                df_grade_rules = read_config_sheet(xls, 'GradeRules')
+
+                # 1) 의사 정보: Doctors 시트가 없거나 grade/shift_adj 컬럼이 없어도 기본값으로 복원
                 new_doctors = []
-                for _, row in df_doctors.iterrows():
-                    name = str(row.get('name', '')).strip()
-                    if not name:
-                        continue
-                    grade = int(row['grade']) if 'grade' in row and pd.notna(row.get('grade')) else DEFAULT_DOCTOR_GRADE
-                    adj = int(row['shift_adj']) if 'shift_adj' in row and pd.notna(row.get('shift_adj')) else 0
-                    new_doctors.append({"name": name, "shift_adj": adj, "grade": grade})
-                st.session_state.doctors = new_doctors
+                if df_doctors is not None and not df_doctors.empty:
+                    for row_pos, row in df_doctors.iterrows():
+                        name_val = row_get_any(row, ['name', 'Name', '이름', 'doctor', 'Doctor'], default=None)
+                        # 아주 오래된 파일에서 첫 번째 컬럼이 이름인 경우까지 허용
+                        if name_val is None and len(row.index) > 0:
+                            name_val = row.iloc[0]
+                        name = str(name_val).strip() if name_val is not None else ''
+                        if not name or name.lower() in {'nan', 'none'}:
+                            continue
+                        grade = safe_int(row_get_any(row, ['grade', 'Grade'], DEFAULT_DOCTOR_GRADE), DEFAULT_DOCTOR_GRADE, GRADE_MIN_VALUE, GRADE_MAX_VALUE)
+                        adj = safe_int(row_get_any(row, ['shift_adj', 'Shift_adj', '근무 조정값', 'adjustment'], 0), 0, -60, 60)
+                        new_doctors.append({"name": name, "shift_adj": adj, "grade": grade})
+                else:
+                    fallback_names = derive_doctor_names_from_old_config(df_rules, df_shift, df_fixed_shift)
+                    new_doctors = [
+                        {"name": name, "shift_adj": 0, "grade": DEFAULT_DOCTOR_GRADE}
+                        for name in fallback_names
+                    ]
 
-                # 2) Rules + shift_counts
+                if not new_doctors:
+                    raise ValueError("Doctors 시트 또는 Rules/ShiftRequests 행 이름에서 의사 이름을 찾을 수 없습니다.")
+
+                st.session_state.doctors = new_doctors
+                normalize_doctors()
+
+                # 2) Rules + shift_counts: 새 rule/fixed_Total 컬럼이 없으면 현재 앱 기본값 사용
+                rule_aliases = {
+                    "rule_max_shifts_per_day": ["rule_max_shifts_per_day", "하루 근무 횟수"],
+                    "rule_n_block_max": ["rule_n_block_max", "N 뭉치 최대 길이"],
+                    "rule_n_rest": ["rule_n_rest", "N뭉치 후 완전 Off 의무일", "N뭉치 후 완전Off 의무일"],
+                    "rule_n_gap": ["rule_n_gap", "N뭉치 후 다음 N까지 총 간격", "N뭉치 후 다음N까지 총 간격"],
+                    "rule_no_day_after_eve": ["rule_no_day_after_eve", "Evening 후 Day 금지"],
+                    "rule_no_3eve_consec": ["rule_no_3eve_consec", "Evening 3연속 금지"],
+                    "rule_no_3eve_in_4days": ["rule_no_3eve_in_4days", "4일내 Evening 3회 금지"],
+                    "rule_max_consec_days": ["rule_max_consec_days", "최대 연속 근무일수"],
+                    "rule_max_shifts_per_week": ["rule_max_shifts_per_week", "7일 구간 최대 근무수", "7일 구간 최대 근무수 (0=무제한)"],
+                    "rule_no_3day_consec": ["rule_no_3day_consec", "Day 3연속 금지"],
+                }
+                fixed_aliases = {
+                    "D": ["fixed_D", "fixed_d", "D 고정"],
+                    "E": ["fixed_E", "fixed_e", "E 고정"],
+                    "N": ["fixed_N", "fixed_n", "N 고정"],
+                    "Total": ["fixed_Total", "fixed_total", "fixed_TOTAL", "Total 고정", "fixed total"],
+                }
+
                 new_rules = {}
                 new_shift_counts = {}
-                for i in range(len(df_rules)):
-                    row = df_rules.iloc[i]
-                    new_rules[i] = {key: int(row[key]) if key in row.index and pd.notna(row[key]) else DEFAULT_RULES.get(key, 0)
-                                    for key in RULE_COL_ORDER}
+                for i, doc in enumerate(st.session_state.doctors):
+                    row = find_row_by_name_or_position(df_rules, doc['name'], i)
+                    base_rule = DEFAULT_RULES.copy()
+                    for key in RULE_COL_ORDER:
+                        base_rule[key] = safe_int(
+                            row_get_any(row, rule_aliases.get(key, [key]), DEFAULT_RULES.get(key, 0)),
+                            DEFAULT_RULES.get(key, 0),
+                            0,
+                            60,
+                        )
+                    new_rules[i] = base_rule
                     new_shift_counts[i] = {
-                        "D": int(row["fixed_D"]) if "fixed_D" in row.index and pd.notna(row["fixed_D"]) else -1,
-                        "E": int(row["fixed_E"]) if "fixed_E" in row.index and pd.notna(row["fixed_E"]) else -1,
-                        "N": int(row["fixed_N"]) if "fixed_N" in row.index and pd.notna(row["fixed_N"]) else -1,
-                        "Total": int(row["fixed_Total"]) if "fixed_Total" in row.index and pd.notna(row["fixed_Total"]) else -1,
+                        shift_key: safe_int(row_get_any(row, aliases, -1), -1, -1, 60)
+                        for shift_key, aliases in fixed_aliases.items()
                     }
+
                 st.session_state.rules = new_rules
                 st.session_state.shift_counts = new_shift_counts
                 normalize_shift_counts()
-                # Excel 불러오기 후 Total/D/E/N 고정 개수 입력 위젯이
-                # 이전 값을 붙잡지 않도록 key version을 갱신한다.
+                # Excel 불러오기 후 Total/D/E/N 고정 개수 입력 위젯이 이전 값을 붙잡지 않도록 key version 갱신
                 st.session_state["shift_count_version"] = st.session_state.get("shift_count_version", 0) + 1
 
-                # shift_adj도 Doctors 시트에서 복원
+                # shift_adj도 Doctors 시트에서 복원. 없으면 0.
                 st.session_state.shift_adj = {
-                    i: int(st.session_state.doctors[i].get('shift_adj', 0))
+                    i: safe_int(st.session_state.doctors[i].get('shift_adj', 0), 0, -60, 60)
                     for i in range(len(st.session_state.doctors))
                 }
 
-                # GradeRules
+                # GradeRules: 시트/새 key가 없으면 DEFAULT_GRADE_RULES로 채움
                 st.session_state.grade_rules = grade_rules_from_df(df_grade_rules)
                 normalize_grade_rules()
-                # Excel 불러오기 후 GradeRules/개인 Grade number_input이 이전 값을 붙잡지 않도록 key version을 갱신한다.
+                # Excel 불러오기 후 GradeRules/개인 Grade number_input이 이전 값을 붙잡지 않도록 key version 갱신
                 st.session_state["grade_rule_version"] = st.session_state.get("grade_rule_version", 0) + 1
                 st.session_state["grade_version"] = st.session_state.get("grade_version", 0) + 1
 
-                # 3) DutyRequests
-                loaded_duty = {i: [int(df_duty.iloc[i]['D']), int(df_duty.iloc[i]['E']), int(df_duty.iloc[i]['N'])]
-                               for i in range(len(df_duty))}
+                # 3) DutyRequests: D/E/N 컬럼 또는 첫 3개 컬럼을 읽고, 없으면 기본 1/1/1
+                loaded_duty = {}
+                if df_duty is not None and not df_duty.empty:
+                    parsed_start = parse_start_date_from_duty_index(df_duty, st.session_state.start_date)
+                    st.session_state.start_date = parsed_start
+                    for i in range(len(df_duty)):
+                        row = df_duty.iloc[i]
+                        loaded_duty[i] = [
+                            duty_value_from_row(row, 'D', 0),
+                            duty_value_from_row(row, 'E', 1),
+                            duty_value_from_row(row, 'N', 2),
+                        ]
+                else:
+                    fallback_days = int(st.session_state.get("num_days", 31))
+                    loaded_duty = {i: [1, 1, 1] for i in range(fallback_days)}
+
                 st.session_state.duty_requests = loaded_duty
                 st.session_state.num_days = len(loaded_duty)
                 st.session_state.day_types = auto_day_types(st.session_state.start_date, st.session_state.num_days)
                 st.session_state["duty_req_version"] = st.session_state.get("duty_req_version", 0) + 1
 
-                # 4) ShiftRequests
+                # 4) ShiftRequests: 없으면 빈 요청으로 시작. FixedShiftRequests도 optional.
                 name_to_doc_idx = {doc['name']: i for i, doc in enumerate(st.session_state.doctors)}
 
                 def _grid_to_shift_dict(df_grid, hard_only=False):
@@ -1020,11 +1180,15 @@ with st.sidebar:
                     if df_grid is None or df_grid.empty:
                         return out
                     max_days = min(len(df_grid.columns), st.session_state.num_days)
-                    for row_name, row in df_grid.iterrows():
+                    for row_pos, (row_name, row) in enumerate(df_grid.iterrows()):
                         doc_name = str(row_name).strip()
-                        if doc_name not in name_to_doc_idx:
+                        if doc_name in name_to_doc_idx:
+                            doc_idx = name_to_doc_idx[doc_name]
+                        elif 0 <= row_pos < len(st.session_state.doctors):
+                            # index 이름이 깨진 오래된 파일은 행 순서 기준으로 복원
+                            doc_idx = row_pos
+                        else:
                             continue
-                        doc_idx = name_to_doc_idx[doc_name]
                         for day_idx in range(max_days):
                             val = _clean_shift_request_value(row.iloc[day_idx])
                             if not val:
@@ -1034,8 +1198,7 @@ with st.sidebar:
                             out[(doc_idx, day_idx)] = val
                     return out
 
-                # ShiftRequests = user-entered base layer.
-                # FixedShiftRequests = result-grid lock overlay.
+                # ShiftRequests = user-entered base layer. FixedShiftRequests = result-grid lock overlay.
                 st.session_state.base_shift_requests = _grid_to_shift_dict(df_shift, hard_only=False)
                 st.session_state.fixed_shift_requests = _grid_to_shift_dict(df_fixed_shift, hard_only=True)
                 st.session_state["shift_request_layers_initialized"] = True
@@ -1273,6 +1436,29 @@ with tab3:
         key=f"grade_junior_penalty_weight_v{gr_ver}"
     ))
 
+    st.markdown('<div class="section-label">초저년차 Hard Rule</div>', unsafe_allow_html=True)
+    st.caption("초저년차가 같은 날짜·같은 D/E/N duty에 X명 이상 함께 들어가는 것을 절대 금지합니다. 0이면 사용하지 않습니다.")
+    ucol1, ucol2, ucol3 = st.columns([1, 1, 3])
+    gr["ultra_junior_max_grade"] = int(ucol1.number_input(
+        "초저년차 기준 grade ≤", min_value=GRADE_MIN_VALUE, max_value=GRADE_MAX_VALUE,
+        value=bounded_int(gr.get("ultra_junior_max_grade", DEFAULT_GRADE_RULES["ultra_junior_max_grade"]), DEFAULT_GRADE_RULES["ultra_junior_max_grade"], GRADE_MIN_VALUE, GRADE_MAX_VALUE),
+        key=f"grade_ultra_junior_max_grade_v{gr_ver}"
+    ))
+    gr["ultra_junior_forbid_at_or_above"] = int(ucol2.number_input(
+        "X명 이상 불가", min_value=0, max_value=10,
+        value=bounded_int(gr.get("ultra_junior_forbid_at_or_above", DEFAULT_GRADE_RULES["ultra_junior_forbid_at_or_above"]), DEFAULT_GRADE_RULES["ultra_junior_forbid_at_or_above"], 0, 10),
+        key=f"grade_ultra_junior_forbid_at_or_above_v{gr_ver}"
+    ))
+    if gr["ultra_junior_forbid_at_or_above"] > 0:
+        allowed_ultra = max(0, gr["ultra_junior_forbid_at_or_above"] - 1)
+        ucol3.info(
+            f"Hard: grade ≤ {gr['ultra_junior_max_grade']} 인원은 한 duty에 "
+            f"{gr['ultra_junior_forbid_at_or_above']}명 이상 함께 근무할 수 없습니다. "
+            f"즉 최대 {allowed_ultra}명까지 허용됩니다."
+        )
+    else:
+        ucol3.caption("0이면 초저년차 동시근무 hard rule은 적용하지 않습니다.")
+
     st.markdown('<div class="section-label">편차 가중치 설정</div>', unsafe_allow_html=True)
     st.caption("Objective = D/E 편차×가중치 + 휴일 편차×가중치 + 총근무 편차×가중치 + N 편차×가중치 + Grade 편차×가중치 + 저년차 초과×가중치")
     wcol1, wcol2, wcol3, wcol4, wcol5 = st.columns(5)
@@ -1306,7 +1492,9 @@ with tab3:
         f"<div style='font-size:0.82rem; color:var(--text-dim);'>"
         f"Hard: 각 duty마다 <b>grade ≥ {gr['senior_min_grade']}</b> 인원이 최소 <b>{gr['senior_min_count']}</b>명 필요합니다. "
         f"Soft: <b>grade ≤ {gr['junior_max_grade']}</b> 인원이 duty별 <b>{gr['junior_soft_max_count']}</b>명을 초과하면 "
-        f"초과 1건당 <b>{gr['junior_penalty_weight']}</b>점 penalty를 줍니다."
+        f"초과 1건당 <b>{gr['junior_penalty_weight']}</b>점 penalty를 줍니다. "
+        f"Ultra-hard: <b>grade ≤ {gr.get('ultra_junior_max_grade', 1)}</b> 인원이 duty별 "
+        f"<b>{gr.get('ultra_junior_forbid_at_or_above', 0)}</b>명 이상이면 금지합니다(0=사용안함)."
         f"</div>",
         unsafe_allow_html=True
     )
@@ -1579,7 +1767,9 @@ with tab4:
                 f"| **k3 N:** {m.get('k3')}×{m.get('weight_n_dev', gr.get('weight_n_dev', 5))} "
                 f"| **k4 Grade편차:** {m.get('k4', 0)} (실제±{round(m.get('k4',0)/10,1)})×{m.get('weight_grade_dev', gr.get('weight_grade_dev', 3))} "
                 f"| **저년차 초과:** {m.get('junior_excess', 0)}×{m.get('junior_penalty_weight', gr.get('junior_penalty_weight', 1))} "
-                f"= **{m.get('junior_penalty', 0)}**</div>",
+                f"= **{m.get('junior_penalty', 0)}** "
+                f"| **초저년차 hard:** grade≤{m.get('ultra_junior_max_grade', gr.get('ultra_junior_max_grade', 1))}, "
+                f"{m.get('ultra_junior_forbid_at_or_above', gr.get('ultra_junior_forbid_at_or_above', 0))}명 이상 불가</div>",
                 unsafe_allow_html=True
             )
 

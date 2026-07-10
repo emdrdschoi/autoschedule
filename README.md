@@ -1,7 +1,7 @@
 # SHIFT SCHEDULER 사용 설명서
 
 의료진 D/E/N 근무표를 자동 생성하는 스케줄러입니다.  
-날짜별 필요 인원, 개인별 근무 불가/희망, 연차, 야간 후 휴식, 연속근무 제한, grade 기반 고년차 배정, 저년차 분산, 개인별 D/E/N/Total 고정 개수, 결과표 셀 고정 등을 반영하여 OR-Tools CP-SAT solver로 근무표를 만듭니다.
+날짜별 필요 인원, 개인별 근무 불가/희망, 연차, 야간 후 휴식, 연속근무 제한, grade 기반 고년차 배정, 저년차 분산, 초저년차 동시근무 hard rule, 개인별 D/E/N/Total 고정 개수, 결과표 셀 고정 등을 반영하여 OR-Tools CP-SAT solver로 근무표를 만듭니다.
 
 ---
 
@@ -12,7 +12,7 @@
 | Duty 설정 | 날짜별 D/E/N 필요 인원 | 8/1 D 3명, E 2명, N 1명 |
 | 근무 요청 / 날짜 설정 | 개인별 특정 날짜의 불가/희망/연차 입력 | `d`, `x`, `a`, `N` |
 | 개인 규칙 / Grade | 개인별 grade, 근무 조정값, D/E/N/Total 고정, 근무 패턴 제한 | grade 8, Total 고정 10, N 후 2일 off |
-| Grade 정책 | 전체 스케줄에 적용되는 고년차/저년차 기준 | grade ≥ 6이면 고년차, duty마다 고년차 1명 이상 |
+| Grade 정책 | 전체 스케줄에 적용되는 고년차/저년차/초저년차 기준 | grade ≥ 6이면 고년차, grade ≤ 1 초저년차 2명 이상 동시근무 금지 |
 | 결과표 셀 고정 | 결과표에서 선택한 셀을 다음 실행에도 유지 | 특정 날짜 특정 의사를 D로 고정 |
 | Soft penalty | 가능한 한 공평하게 맞추는 기준 | 총근무, N, 휴일, D/E, grade 편차 |
 
@@ -20,7 +20,7 @@
 
 | 종류 | 설명 | 예시 |
 |---|---|---|
-| Hard rule | 반드시 지켜야 하는 조건. 불가능하면 해가 나오지 않음 | Duty 필요 인원, 대문자 D/E/N 강제, x/a 불가, fixed_Total, 고년차 최소 인원 |
+| Hard rule | 반드시 지켜야 하는 조건. 불가능하면 해가 나오지 않음 | Duty 필요 인원, 대문자 D/E/N 강제, x/a 불가, fixed_Total, 고년차 최소 인원, 초저년차 동시근무 금지 |
 | Soft rule | 가능하면 맞추는 조건. 어기면 penalty가 붙음 | 총근무 균형, N 균형, 휴일 균형, 저년차 초과 배치 최소화 |
 
 ---
@@ -234,10 +234,14 @@ Grade는 개인의 숙련도/연차를 숫자로 표현한 값입니다. 현재 
 | 저년차 기준 grade ≤ | 이 grade 이하이면 저년차 | 3 |
 | Duty별 저년차 권장 최대 | 한 duty에 들어가도 좋은 저년차 수 | 1 |
 | 저년차 초과 penalty | 저년차가 권장 최대를 넘을 때 penalty | 1 |
+| 초저년차 기준 grade ≤ | 이 grade 이하이면 초저년차 hard rule 대상 | 1 |
+| X명 이상 불가 | 초저년차가 같은 날짜·같은 D/E/N duty에 X명 이상 함께 근무하는 것을 금지. 0=사용안함 | 2 |
 
 고년차 최소 인원은 hard rule입니다. 예를 들어 `고년차 기준 grade ≥ 6`, `Duty별 고년차 최소 1`이면 모든 D/E/N duty에 grade 6 이상이 최소 1명 필요합니다.
 
 저년차 제한은 soft rule입니다. 초과하면 penalty가 붙지만, 다른 조건 때문에 필요하면 허용될 수 있습니다.
+
+초저년차 동시근무 제한은 hard rule입니다. 예를 들어 `초저년차 기준 grade ≤ 1`, `X명 이상 불가 = 2`이면 grade 1 의사는 같은 날짜·같은 D/E/N duty에 2명 이상 같이 들어갈 수 없습니다. 즉 한 duty에 grade 1은 최대 1명까지만 허용됩니다. `X명 이상 불가 = 0`이면 이 hard rule은 적용하지 않습니다.
 
 ### 6.3 편차 가중치 설정
 
@@ -344,6 +348,7 @@ Grade는 개인의 숙련도/연차를 숫자로 표현한 값입니다. 현재 
 | Grade | 개인 grade |
 | Senior | 고년차 여부 또는 관련 표시 |
 | Junior | 저년차 여부 또는 관련 표시 |
+| 초저년차 | 초저년차 hard rule 대상 여부 |
 | D | Day 근무 수 |
 | E | Evening 근무 수 |
 | N | Night 근무 수 |
@@ -513,6 +518,8 @@ fixed_Total
 | junior_max_grade | 저년차 기준 grade 이하 |
 | junior_soft_max_count | 각 duty별 저년차 권장 최대 인원 |
 | junior_penalty_weight | 저년차 초과 penalty 가중치 |
+| ultra_junior_max_grade | 초저년차 기준 grade 이하 |
+| ultra_junior_forbid_at_or_above | 초저년차 동시근무 금지 기준. 0=사용안함, 2=2명 이상 불가 |
 | weight_de_dev | D/E 편차 가중치 |
 | weight_holiday_dev | 휴일 편차 가중치 |
 | weight_total_dev | 총근무 편차 가중치 |
@@ -606,10 +613,11 @@ Schedule과 Summary는 앱 화면과 같은 입력 순서를 유지합니다.
 3. fixed_D/E/N 합이 fixed_Total보다 크지 않은지 확인합니다.
 4. 고년차 최소 인원이 duty 필요 인원보다 크지 않은지 확인합니다.
 5. 고년차 기준에 해당하는 사람이 충분한지 확인합니다.
-6. 대문자 `D/E/N` 강제 요청이 너무 많지 않은지 확인합니다.
-7. `x`, `a`, `den`으로 전체 불가인 날이 너무 많지 않은지 확인합니다.
-8. N 후 휴식, 최대 연속 근무, 7일 구간 최대 근무수가 너무 엄격하지 않은지 확인합니다.
-9. solver 탐색 시간을 늘려봅니다.
+6. 초저년차 hard rule이 너무 엄격하지 않은지 확인합니다. 예: 초저년차가 많고 duty 필요 인원이 큰데 `2명 이상 불가`로 설정하면 해가 없을 수 있습니다.
+7. 대문자 `D/E/N` 강제 요청이 너무 많지 않은지 확인합니다.
+8. `x`, `a`, `den`으로 전체 불가인 날이 너무 많지 않은지 확인합니다.
+9. N 후 휴식, 최대 연속 근무, 7일 구간 최대 근무수가 너무 엄격하지 않은지 확인합니다.
+10. solver 탐색 시간을 늘려봅니다.
 
 ---
 
@@ -622,8 +630,9 @@ Schedule과 Summary는 앱 화면과 같은 입력 순서를 유지합니다.
 | 휴일이 불공평 | 휴일 편차 가중치 증가 |
 | D/E가 불공평 | D/E 편차 가중치 증가 |
 | duty별 grade 평균이 너무 낮음 | Grade 편차 가중치 증가, 고년차 최소 인원 조정 |
-| 저년차가 너무 몰림 | 저년차 penalty 증가 |
+| 저년차가 너무 몰림 | 저년차 penalty 증가 또는 초저년차 hard rule 사용 |
 | 저년차 penalty가 너무 지배적 | 저년차 penalty 감소 |
+| 초저년차가 같은 duty에 같이 들어가면 안 됨 | 초저년차 기준 grade와 `X명 이상 불가` 설정 |
 | 특정 사람이 평균보다 많이/적게 해야 함 | 근무 조정값 또는 fixed_Total 조정 |
 | 연차자가 너무 많이 배정되는 느낌 | 연차는 `a`, 전체 불가는 `x`로 정확히 입력했는지 확인 |
 
@@ -651,10 +660,49 @@ Schedule과 Summary는 앱 화면과 같은 입력 순서를 유지합니다.
 [ ] DutyRequests의 D/E/N 필요 인원 확인
 [ ] ShiftRequests의 d/e/n/x/a/D/E/N 입력 확인
 [ ] 연차는 a로 입력했는지 확인
-[ ] GradeRules의 고년차/저년차 기준 확인
+[ ] GradeRules의 고년차/저년차/초저년차 기준 확인
 [ ] fixed_Total 및 fixed_D/E/N 확인
 [ ] Duty 설정 탭 상단의 차이 / 남은 근무수 확인
 [ ] 최대 연속 근무일수와 7일 구간 최대 근무수 확인
 [ ] solver mode와 탐색 시간 확인
 [ ] 결과 탭의 근무 통계, 연차, Daily duty 구성 요약 확인
+```
+
+---
+
+## 이전 버전 설정 Excel 호환
+
+이 버전부터는 과거 버전에서 저장한 `scheduler_config.xlsx`도 최대한 그대로 불러올 수 있도록 보완했습니다.
+
+불러오기 시 다음 항목이 없어도 앱이 멈추지 않고 현재 버전의 기본값으로 채웁니다.
+
+```text
+- GradeRules 시트 없음
+- FixedShiftRequests 시트 없음
+- Rules 시트에 fixed_Total 없음
+- Rules 시트에 새 rule 컬럼 없음
+- Doctors 시트에 grade 없음
+- Doctors 시트에 shift_adj 없음
+- GradeRules 시트에 ultra_junior_* 항목 없음
+```
+
+기본값 예시는 다음과 같습니다.
+
+```text
+grade 없음                → 기본 grade 2
+shift_adj 없음            → 0
+fixed_D/E/N/Total 없음    → -1, 즉 자동 평준화
+GradeRules 없음           → 현재 앱의 기본 Grade 정책 사용
+초저년차 hard rule 없음   → 사용 안 함, 즉 X명 이상 불가 = 0
+FixedShiftRequests 없음   → 결과표 고정 셀 없음
+```
+
+불러온 뒤 다시 `설정 Excel 저장`을 누르면 최신 형식의 Excel로 다시 저장됩니다.  
+즉, 예전 설정 파일을 한 번 불러온 뒤 저장하면 새 시트와 새 컬럼이 포함된 최신 config로 업그레이드됩니다.
+
+주의할 점:
+
+```text
+Doctors 시트가 없는 아주 오래된 파일은 Rules 또는 ShiftRequests의 행 이름에서 의사 이름을 추정합니다.
+DutyRequests 시트가 없으면 날짜별 D/E/N 필요 인원은 기본 1/1/1로 생성됩니다.
 ```
