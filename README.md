@@ -223,7 +223,7 @@ fixed_total 미지정 인원: 0
 → Duty를 7개 늘리거나 fixed_Total을 7개 줄여야 함
 ```
 
-이 박스는 Total 고정값 또는 Duty 필요 인원을 바꾼 뒤 바로 갱신되도록 앱 내부에서 입력 위젯 값을 먼저 동기화합니다.
+이 박스는 저장된 fixed count와 현재 Duty 필요 인원을 기준으로 계산됩니다. fixed count 표를 여러 칸 수정한 뒤에는 아래의 `fixed count 저장 / 요약에 반영` 버튼을 눌러야 요약, solve, 진단 입력값에 반영됩니다.
 
 요약 박스 바로 아래에는 `fixed_D / fixed_E / fixed_N / fixed_Total` 편집 표가 표시됩니다. 결과 탭의 근무 통계처럼 입력 순서 기준 `No / Name / Grade / Senior / Junior / 초저년차`를 함께 보여주고, 고정값 네 칸을 직접 수정할 수 있습니다.
 
@@ -241,7 +241,7 @@ No | Name | Grade | Senior | Junior | 초저년차 | fixed_D | fixed_E | fixed_N
 
 이전 버전과의 호환을 위해 Excel에 `-1`이 들어 있어도 자동 평준화로 읽지만, 앱 화면과 새로 저장되는 Excel에서는 자동값을 빈칸으로 표시합니다.
 
-이 표에서 fixed_D/E/N/Total을 수정하면 위의 `Duty 총합 / fixed_total 합 / 차이 / 남은 근무수` 요약과 solve/진단 입력값에 바로 반영됩니다. 기존처럼 아래 개인별 규칙 영역에 D/E/N 고정 줄을 따로 두지 않고, 이 표에서 한 번에 관리합니다.
+이 표는 form 안에 있으므로 칸을 하나하나 바꿀 때마다 즉시 반영/갱신되지 않습니다. 여러 칸을 수정하거나 Excel에서 복사해 붙여넣은 뒤 `💾 fixed count 저장 / 요약에 반영` 버튼을 누르면 그때 한 번에 저장되고, 위의 `Duty 총합 / fixed_total 합 / 차이 / 남은 근무수` 요약과 solve/진단 입력값에 반영됩니다. 기존처럼 아래 개인별 규칙 영역에 D/E/N 고정 줄을 따로 두지 않고, 이 표에서 한 번에 관리합니다.
 
 ### 6.2 Grade 정책 설정
 
@@ -527,7 +527,7 @@ fixed_N
 fixed_Total
 ```
 
-`fixed_D/E/N/Total`은 `-1`이면 자동 평준화입니다.
+`fixed_D/E/N/Total`은 내부적으로는 `-1`이면 자동 평준화입니다. 앱 화면과 새로 저장되는 Excel에서는 자동값을 빈칸으로 표시합니다.
 
 ### 8.3 GradeRules sheet
 

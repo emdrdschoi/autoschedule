@@ -502,9 +502,10 @@ def sync_live_total_summary_inputs(num_days: int | None = None):
                 vals[shift_i] = bounded_int(st.session_state.get(widget_key), vals[shift_i], 0, max(0, len(st.session_state.get("doctors", []))))
         st.session_state.duty_requests[di] = [int(vals[0]), int(vals[1]), int(vals[2])]
 
-    # fixed_Total/D/E/N are edited together in the fixed count table.
+    # fixed_Total/D/E/N are edited in the fixed count table and applied only when
+    # the user presses the save/apply button. Do not read unsaved editor state here;
+    # otherwise every cell edit behaves like it has already been committed.
     normalize_shift_counts()
-    sync_fixed_total_editor_widget()
     # Backward compatibility: if an older page version still has per-doctor D/E/N
     # number_input keys in session_state, read them safely. New versions edit these
     # values in the fixed count table above.
@@ -631,47 +632,64 @@ def apply_fixed_total_editor_df(edited_df: pd.DataFrame):
 
 
 def render_fixed_total_editor_table():
-    """Render an editable fixed Total/D/E/N table below the Duty/fixed_total summary."""
-    st.caption("아래 표에서 fixed_D / fixed_E / fixed_N / fixed_Total을 결과 통계 순서 그대로 수정합니다. 빈칸 = 자동 평준화, 0 = 해당 근무 없음, 1 이상 = 그 개수로 고정입니다.")
+    """Render a batched fixed Total/D/E/N editor below the Duty/fixed_total summary.
+
+    The editor is inside a form so Streamlit does not apply every single cell edit
+    immediately.  Users can paste/edit many cells, then press one button to commit
+    the values to session_state.shift_counts.
+    """
+    st.caption(
+        "아래 표에서 fixed_D / fixed_E / fixed_N / fixed_Total을 결과 통계 순서 그대로 수정합니다. "
+        "빈칸 = 자동 평준화, 0 = 해당 근무 없음, 1 이상 = 그 개수로 고정입니다. "
+        "여러 칸을 한 번에 수정한 뒤 아래 저장 버튼을 눌러 반영하세요."
+    )
     key = get_fixed_total_editor_key()
     df = build_fixed_total_editor_df()
-    edited_df = st.data_editor(
-        df,
-        hide_index=True,
-        use_container_width=True,
-        key=key,
-        on_change=sync_fixed_total_editor_widget,
-        disabled=["No", "Name", "Grade", "Senior", "Junior", "초저년차"],
-        column_config={
-            "No": st.column_config.NumberColumn("No", width="small", disabled=True),
-            "Name": st.column_config.TextColumn("Name", width="medium", disabled=True),
-            "Grade": st.column_config.NumberColumn("Grade", width="small", disabled=True),
-            "Senior": st.column_config.TextColumn("Senior", width="small", disabled=True),
-            "Junior": st.column_config.TextColumn("Junior", width="small", disabled=True),
-            "초저년차": st.column_config.TextColumn("초저년차", width="small", disabled=True),
-            "fixed_D": st.column_config.TextColumn(
-                "fixed_D",
-                width="small",
-                help="빈칸 = 자동 평준화, 0 = Day 근무 없음, 1 이상 = Day 근무 수 고정",
-            ),
-            "fixed_E": st.column_config.TextColumn(
-                "fixed_E",
-                width="small",
-                help="빈칸 = 자동 평준화, 0 = Evening 근무 없음, 1 이상 = Evening 근무 수 고정",
-            ),
-            "fixed_N": st.column_config.TextColumn(
-                "fixed_N",
-                width="small",
-                help="빈칸 = 자동 평준화, 0 = Night 근무 없음, 1 이상 = Night 근무 수 고정",
-            ),
-            "fixed_Total": st.column_config.TextColumn(
-                "fixed_Total",
-                width="small",
-                help="빈칸 = 자동 평준화, 0 = 총근무 없음, 1 이상 = 총 D/E/N 근무 수 고정",
-            ),
-        },
-    )
-    apply_fixed_total_editor_df(edited_df)
+
+    with st.form("fixed_counts_editor_form", clear_on_submit=False):
+        edited_df = st.data_editor(
+            df,
+            hide_index=True,
+            use_container_width=True,
+            key=key,
+            disabled=["No", "Name", "Grade", "Senior", "Junior", "초저년차"],
+            column_config={
+                "No": st.column_config.NumberColumn("No", width="small", disabled=True),
+                "Name": st.column_config.TextColumn("Name", width="medium", disabled=True),
+                "Grade": st.column_config.NumberColumn("Grade", width="small", disabled=True),
+                "Senior": st.column_config.TextColumn("Senior", width="small", disabled=True),
+                "Junior": st.column_config.TextColumn("Junior", width="small", disabled=True),
+                "초저년차": st.column_config.TextColumn("초저년차", width="small", disabled=True),
+                "fixed_D": st.column_config.TextColumn(
+                    "fixed_D",
+                    width="small",
+                    help="빈칸 = 자동 평준화, 0 = Day 근무 없음, 1 이상 = Day 근무 수 고정",
+                ),
+                "fixed_E": st.column_config.TextColumn(
+                    "fixed_E",
+                    width="small",
+                    help="빈칸 = 자동 평준화, 0 = Evening 근무 없음, 1 이상 = Evening 근무 수 고정",
+                ),
+                "fixed_N": st.column_config.TextColumn(
+                    "fixed_N",
+                    width="small",
+                    help="빈칸 = 자동 평준화, 0 = Night 근무 없음, 1 이상 = Night 근무 수 고정",
+                ),
+                "fixed_Total": st.column_config.TextColumn(
+                    "fixed_Total",
+                    width="small",
+                    help="빈칸 = 자동 평준화, 0 = 총근무 없음, 1 이상 = 총 D/E/N 근무 수 고정",
+                ),
+            },
+        )
+        submitted = st.form_submit_button("💾 fixed count 저장 / 요약에 반영", use_container_width=True)
+
+    if submitted:
+        apply_fixed_total_editor_df(edited_df)
+        # Recreate the editor from committed values and refresh the summary boxes above.
+        st.session_state["shift_count_version"] = st.session_state.get("shift_count_version", 0) + 1
+        st.toast("✅ fixed count가 저장되었습니다.", icon="✅")
+        st.rerun()
 
 
 def get_total_duty_count() -> int:
