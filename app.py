@@ -5,7 +5,6 @@ from io import BytesIO
 from pathlib import Path
 import calendar
 import json
-import math
     
 st.set_page_config(
     page_title="스케줄 최적화",
@@ -393,52 +392,6 @@ def fixed_count_excel_value(value):
     val = parse_fixed_count_value(value)
     return "" if val < 0 else int(val)
 
-
-def round_shift_adj_difference(diff: float) -> int:
-    """Round a fixed_Total - estimated_average difference to an integer shift_adj.
-
-    Differences smaller than 1 duty are ignored.  Otherwise, use ordinary
-    half-away-from-zero rounding so 19 vs 20.7 becomes -2 and 19 vs 20.2
-    becomes -1.
-    """
-    try:
-        diff = float(diff)
-    except (TypeError, ValueError):
-        return 0
-    if abs(diff) < 1.0:
-        return 0
-    if diff >= 0:
-        return int(math.floor(diff + 0.5))
-    return int(math.ceil(diff - 0.5))
-
-
-def get_estimated_average_total() -> float:
-    """Return the simple overall average total duty count per doctor."""
-    doctor_count = len(st.session_state.get("doctors", []))
-    if doctor_count <= 0:
-        return 0.0
-    return get_total_duty_count() / doctor_count
-
-
-def apply_fixed_total_to_shift_adj() -> tuple[float, int]:
-    """Assign shift_adj from fixed_Total for doctors with fixed_Total.
-
-    fixed_Total is a hard total count.  This helper writes the implied difference
-    from the overall estimated average into the visible shift_adj field so the
-    existing balance penalty logic follows that fixed total scale.
-    """
-    normalize_shift_counts()
-    avg = get_estimated_average_total()
-    applied = 0
-    for ni in range(len(st.session_state.get("doctors", []))):
-        fixed_total = int(st.session_state.shift_counts.get(ni, {}).get("Total", -1))
-        if fixed_total >= 0:
-            adj = bounded_int(round_shift_adj_difference(fixed_total - avg), 0, -60, 60)
-            st.session_state.shift_adj[ni] = adj
-            st.session_state.doctors[ni]["shift_adj"] = adj
-            applied += 1
-    return avg, applied
-
 DEFAULT_GRADE_RULES = {
     "senior_min_grade": 2,       # grade >= this is treated as senior
     "senior_min_count": 1,       # hard: at least this many seniors per duty
@@ -590,6 +543,63 @@ def get_fixed_total_editor_key() -> str:
     return f"fixed_counts_editor_v{st.session_state.get('shift_count_version', 0)}"
 
 
+def get_estimated_average_total() -> float:
+    """Estimated average total duty count per doctor from current DutyRequests."""
+    doctor_count = len(st.session_state.get("doctors", []))
+    if doctor_count <= 0:
+        return 0.0
+    return get_total_duty_count() / doctor_count
+
+
+def round_shift_adj_diff(diff: float) -> int:
+    """Round a total-duty difference to an integer shift_adj.
+
+    A difference below 1 duty is treated as 0 so tiny fractional average effects
+    do not create confusing +/-1 adjustments.  Larger differences are rounded to
+    the nearest integer, away from zero at .5.
+    """
+    try:
+        diff = float(diff)
+    except (TypeError, ValueError):
+        return 0
+    if abs(diff) < 1:
+        return 0
+    return int(diff + 0.5) if diff > 0 else int(diff - 0.5)
+
+
+def recommended_shift_adj_for_doc(fixed_total: int, annual_count: int, estimated_average: float) -> int:
+    """Return the recommended explicit shift_adj for one doctor.
+
+    - If fixed_Total is set, use fixed_Total - estimated average.
+    - If fixed_Total is blank, use -annual leave count.
+
+    Annual leave and fixed_Total no longer create hidden internal adjustment in
+    scheduler.py. This helper only fills the visible shift_adj field when the
+    user presses the auto-calculate button.
+    """
+    if fixed_total >= 0:
+        return bounded_int(round_shift_adj_diff(fixed_total - estimated_average), 0, -60, 60)
+    return bounded_int(-int(annual_count or 0), 0, -60, 60)
+
+
+def apply_recommended_shift_adj_from_current_inputs() -> tuple[float, int]:
+    """Write recommended shift_adj values into session_state for all doctors."""
+    normalize_shift_counts()
+    annual_counts = get_annual_leave_counts_by_doc()
+    estimated_average = get_estimated_average_total()
+    updated = 0
+    for ni in range(len(st.session_state.get("doctors", []))):
+        sc = st.session_state.shift_counts.get(ni, {})
+        fixed_total = parse_fixed_count_value(sc.get("Total", -1))
+        annual_count = int(annual_counts.get(ni, 0))
+        adj = recommended_shift_adj_for_doc(fixed_total, annual_count, estimated_average)
+        st.session_state.shift_adj[ni] = adj
+        if ni < len(st.session_state.get("doctors", [])):
+            st.session_state.doctors[ni]["shift_adj"] = adj
+        updated += 1
+    return estimated_average, updated
+
+
 def build_fixed_total_editor_df() -> pd.DataFrame:
     """Build an input-order fixed Total/D/E/N table similar to the result summary table."""
     normalize_doctors()
@@ -600,10 +610,15 @@ def build_fixed_total_editor_df() -> pd.DataFrame:
     junior_max_grade = int(gr.get("junior_max_grade", DEFAULT_GRADE_RULES["junior_max_grade"]))
     ultra_max_grade = int(gr.get("ultra_junior_max_grade", DEFAULT_GRADE_RULES.get("ultra_junior_max_grade", 1)))
 
+    annual_counts = get_annual_leave_counts_by_doc()
+    estimated_average = get_estimated_average_total()
+
     rows = []
     for ni, doc in enumerate(st.session_state.get("doctors", [])):
         grade = bounded_int(doc.get("grade", DEFAULT_DOCTOR_GRADE), DEFAULT_DOCTOR_GRADE, GRADE_MIN_VALUE, GRADE_MAX_VALUE)
         sc = st.session_state.shift_counts.get(ni, {})
+        fixed_total_val = parse_fixed_count_value(sc.get("Total", -1))
+        annual_count = int(annual_counts.get(ni, 0))
         rows.append({
             "No": ni + 1,
             "Name": doc.get("name", ""),
@@ -611,6 +626,7 @@ def build_fixed_total_editor_df() -> pd.DataFrame:
             "Senior": "Y" if grade >= senior_min_grade else "",
             "Junior": "Y" if grade <= junior_max_grade else "",
             "초저년차": "Y" if grade <= ultra_max_grade else "",
+            "연차(a)": annual_count,
             "근무조정값": int(st.session_state.shift_adj.get(ni, doc.get("shift_adj", 0))),
             "fixed_D": fixed_count_display_value(sc.get("D", -1)),
             "fixed_E": fixed_count_display_value(sc.get("E", -1)),
@@ -695,11 +711,12 @@ def render_fixed_total_editor_table():
     immediately.  Users can paste/edit many cells, then press one button to commit
     the values to session_state.shift_counts.
     """
+    estimated_average = get_estimated_average_total()
     st.caption(
-        "아래 표에서 근무 조정값과 fixed_D / fixed_E / fixed_N / fixed_Total을 함께 수정합니다. "
+        "아래 표에서 연차(a) 개수, 근무 조정값과 fixed_D / fixed_E / fixed_N / fixed_Total을 함께 확인/수정합니다. "
+        "연차(a)는 현재 근무 요청의 a 개수입니다. 자동계산 버튼을 누르면 연차(a) 또는 fixed_Total 기준 권장값이 실제 근무조정값 칸에 입력됩니다. "
         "fixed count는 빈칸 = 자동 평준화, 0 = 해당 근무 없음, 1 이상 = 그 개수로 고정입니다. "
-        "여러 칸을 한 번에 수정한 뒤 저장하세요. fixed_Total 기준 자동계산 버튼은 "
-        "fixed_Total이 있는 사람의 근무조정값을 fixed_Total - 전체 평균 근무수 기준으로 채웁니다."
+        f"현재 estimated average는 약 {estimated_average:.1f}개/명입니다."
     )
     key = get_fixed_total_editor_key()
     df = build_fixed_total_editor_df()
@@ -710,7 +727,7 @@ def render_fixed_total_editor_table():
             hide_index=True,
             use_container_width=True,
             key=key,
-            disabled=["No", "Name", "Grade", "Senior", "Junior", "초저년차"],
+            disabled=["No", "Name", "Grade", "Senior", "Junior", "초저년차", "연차(a)"],
             column_config={
                 "No": st.column_config.NumberColumn("No", width="small", disabled=True),
                 "Name": st.column_config.TextColumn("Name", width="medium", disabled=True),
@@ -718,6 +735,12 @@ def render_fixed_total_editor_table():
                 "Senior": st.column_config.TextColumn("Senior", width="small", disabled=True),
                 "Junior": st.column_config.TextColumn("Junior", width="small", disabled=True),
                 "초저년차": st.column_config.TextColumn("초저년차", width="small", disabled=True),
+                "연차(a)": st.column_config.NumberColumn(
+                    "연차(a)",
+                    width="small",
+                    disabled=True,
+                    help="현재 근무 요청에서 a로 입력된 연차 개수입니다. solver 내부에서 자동 shift_adj로 처리하지 않습니다.",
+                ),
                 "근무조정값": st.column_config.NumberColumn(
                     "근무조정값",
                     width="small",
@@ -749,18 +772,17 @@ def render_fixed_total_editor_table():
                 ),
             },
         )
-        save_col, auto_col = st.columns(2)
-        submitted = save_col.form_submit_button("💾 근무 조정값 / fixed count 저장", use_container_width=True)
-        auto_submitted = auto_col.form_submit_button("↔ fixed_Total 기준 shift_adj 자동계산 + 저장", use_container_width=True)
+        btn_col1, btn_col2 = st.columns(2)
+        with btn_col1:
+            submitted = st.form_submit_button("💾 근무 조정값 / fixed count 저장", use_container_width=True)
+        with btn_col2:
+            auto_submitted = st.form_submit_button("↔ 연차/fixed_Total 기준 shift_adj 자동계산 + 저장", use_container_width=True)
 
     if submitted or auto_submitted:
         apply_fixed_total_editor_df(edited_df)
         if auto_submitted:
-            avg, applied = apply_fixed_total_to_shift_adj()
-            st.toast(
-                f"✅ fixed_Total이 있는 {applied}명의 근무조정값을 평균 {avg:.1f} 기준으로 자동계산했습니다.",
-                icon="✅",
-            )
+            avg, updated = apply_recommended_shift_adj_from_current_inputs()
+            st.toast(f"✅ estimated average 약 {avg:.1f}개/명 기준으로 {updated}명의 shift_adj를 자동 계산했습니다.", icon="✅")
         else:
             st.toast("✅ 근무 조정값과 fixed count가 저장되었습니다.", icon="✅")
         # Recreate the editor from committed values and refresh the summary boxes above.
@@ -800,6 +822,7 @@ def render_fixed_total_duty_summary(num_days: int):
     d_total = sum(st.session_state.duty_requests.get(di, [0, 0, 0])[0] for di in range(num_days))
     e_total = sum(st.session_state.duty_requests.get(di, [0, 0, 0])[1] for di in range(num_days))
     n_total = sum(st.session_state.duty_requests.get(di, [0, 0, 0])[2] for di in range(num_days))
+    annual_total = int(sum(get_annual_leave_counts_by_doc().values()))
     remaining = fixed_total_info["remaining"]
     diff_text = f"{remaining:+d}"
     free_count = int(fixed_total_info.get("free_count", 0))
@@ -847,6 +870,7 @@ def render_fixed_total_duty_summary(num_days: int):
             <div>
                 <span style='color:#ffffff;'>Duty 총합:</span> <b style='color:#ffffff;'>{fixed_total_info['total_duty']}</b>
                 <span style='color:#e5e7eb;'>(D {d_total} / E {e_total} / N {n_total})</span>
+                &nbsp;|&nbsp; <span style='color:#ffffff;'>연차(a) 총합:</span> <b style='color:#ffffff;'>{annual_total}</b>
                 &nbsp;|&nbsp; <span style='color:#ffffff;'>fixed_total 합:</span> <b style='color:#ffffff;'>{fixed_total_info['fixed_sum']}</b>
                 &nbsp;|&nbsp; <span style='color:#ffffff;'>fixed_total 미지정 인원:</span> <b style='color:#ffffff;'>{fixed_total_info['free_count']}</b>
                 &nbsp;|&nbsp; <span style='color:#ffffff;'>차이:</span> <b style='color:#ffffff;'>{diff_text}</b>
@@ -2231,7 +2255,7 @@ with tab1:
     st.caption("셀을 클릭해서 날짜 유형과 의사별로 원하는/못하는 근무를 설정합니다.")
 
     # Combined table: Day types + Per-doctor shift requests
-    st.markdown("**날짜 유형 & 개인별 근무 요청** · `d/e/n` = 못하는 근무 | `D/E/N` = 원하는 근무 | `x` = 전체 불가 | `a` = 연차(off, 근무조정 -1 효과)")
+    st.markdown("**날짜 유형 & 개인별 근무 요청** · `d/e/n` = 못하는 근무 | `D/E/N` = 원하는 근무 | `x` = 전체 불가 | `a` = 연차/off, 근무조정값 자동계산 버튼으로 반영 가능")
     st.caption("🔒 fixed 표시가 있는 칸은 결과표에서 고정된 셀이므로 여기서는 수정할 수 없습니다. 결과 탭에서 고정 해제 후 수정하세요.")
     SHIFT_OPTIONS = ['', 'd', 'e', 'n', 'x', 'a', 'de', 'dn', 'en', 'den', 'D', 'E', 'N']
     day_type_options = ['평일', '토', '일', '공']

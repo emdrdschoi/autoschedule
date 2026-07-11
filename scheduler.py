@@ -260,11 +260,12 @@ def build_and_solve(params: dict[str, Any]):
                 f"모두 고정한 경우 두 값이 같아야 합니다."
             )
 
-    # Annual leave ('a') is treated as hard off like x, but for balancing it acts
-    # like an extra -1 shift adjustment per leave day. This does not change any
-    # fixed_Total hard constraint: doctors with fixed_Total keep their hard total.
+    # Annual leave ('a') is treated as hard off like x and counted in the summary,
+    # but it no longer creates a hidden internal shift_adj effect.  If annual leave
+    # or fixed_Total should change balancing targets, app.py can write the explicit
+    # value into the visible shift_adj table via the auto-calculate button.
     balance_shift_adj = {
-        n: shift_adj.get(n, 0) - (0 if n in fixed_total_by_doc else annual_leave_counts.get(n, 0))
+        n: shift_adj.get(n, 0)
         for n in all_doctors
     }
 
