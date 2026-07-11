@@ -758,6 +758,12 @@ def render_fixed_total_editor_table():
         st.info("자동계산 결과가 화면 표에만 반영되어 있습니다. 실제 설정에 반영하려면 저장을 누르세요.")
 
     with st.form("fixed_counts_editor_form", clear_on_submit=False):
+        btn_col1, btn_col2 = st.columns(2)
+        with btn_col1:
+            submitted = st.form_submit_button("저장", use_container_width=True)
+        with btn_col2:
+            auto_submitted = st.form_submit_button("자동계산", use_container_width=True)
+
         edited_df = st.data_editor(
             df,
             hide_index=True,
@@ -808,12 +814,6 @@ def render_fixed_total_editor_table():
                 ),
             },
         )
-        btn_col1, btn_col2 = st.columns(2)
-        with btn_col1:
-            submitted = st.form_submit_button("저장", use_container_width=True)
-        with btn_col2:
-            auto_submitted = st.form_submit_button("자동계산", use_container_width=True)
-
     if auto_submitted:
         preview_df, avg, updated = calculate_shift_adj_preview_df(edited_df)
         st.session_state["fixed_counts_editor_pending_df"] = preview_df
@@ -2254,10 +2254,22 @@ with st.sidebar:
 
     st.divider()
 
-    # Schedule generation button
+    # Schedule generation button: two-step confirmation so users save forms first.
+    st.caption("스케줄 생성은 각 탭에서 저장된 설정만 사용합니다.")
     if st.button("🚀 스케줄 생성", use_container_width=True, key="btn_solve"):
-        st.session_state["trigger_solve"] = True
+        st.session_state["solve_confirm_pending"] = True
         st.rerun()
+
+    if st.session_state.get("solve_confirm_pending"):
+        st.warning("변경한 탭을 저장했나요? 저장된 설정으로 스케줄을 생성합니다.")
+        solve_c1, solve_c2 = st.columns(2)
+        if solve_c1.button("생성", use_container_width=True, key="btn_solve_confirm"):
+            st.session_state["solve_confirm_pending"] = False
+            st.session_state["trigger_solve"] = True
+            st.rerun()
+        if solve_c2.button("취소", use_container_width=True, key="btn_solve_cancel"):
+            st.session_state["solve_confirm_pending"] = False
+            st.rerun()
 
     st.caption("by DS Choi 2026.03.19")
 
@@ -2286,6 +2298,7 @@ if not st.session_state.day_types or len(st.session_state.day_types) != num_days
 if not st.session_state.duty_requests or len(st.session_state.duty_requests) != st.session_state.num_days:
     st.session_state.duty_requests = {i: [1, 1, 1] for i in range(st.session_state.num_days)}
 
+st.info("각 탭의 변경사항은 저장 버튼을 눌러야 반영됩니다. 스케줄 생성 전에는 관련 탭을 저장했는지 확인하세요.")
 tab1, tab2, tab3, tab4 = st.tabs(["📅 근무 요청 / 날짜 설정", "📋 Duty 설정", "⚙ 개인 규칙 / Grade", "📊 결과"])
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -2295,138 +2308,155 @@ with tab1:
     st.markdown('<div class="section-label">날짜 유형 & 개인 근무 요청</div>', unsafe_allow_html=True)
     st.caption("셀을 클릭해서 날짜 유형과 의사별로 원하는/못하는 근무를 설정합니다.")
 
-    # Combined table: Day types + Per-doctor shift requests
-    st.markdown("**날짜 유형 & 개인별 근무 요청** · `d/e/n` = 못하는 근무 | `D/E/N` = 원하는 근무 | `x` = 전체 불가 | `a` = 연차/off, 근무조정값 자동계산 버튼으로 반영 가능")
-    st.caption("🔒 fixed 표시가 있는 칸은 결과표에서 고정된 셀이므로 여기서는 수정할 수 없습니다. 결과 탭에서 고정 해제 후 수정하세요.")
-    SHIFT_OPTIONS = ['', 'd', 'e', 'n', 'x', 'a', 'de', 'dn', 'en', 'den', 'D', 'E', 'N']
-    day_type_options = ['평일', '토', '일', '공']
+    with st.form("shift_requests_form", clear_on_submit=False):
+        save_shift_requests = st.form_submit_button("저장", use_container_width=True)
+        st.caption("여러 칸을 수정한 뒤 저장을 눌러야 실제 설정에 반영됩니다.")
+        # Combined table: Day types + Per-doctor shift requests
+        st.markdown("**날짜 유형 & 개인별 근무 요청** · `d/e/n` = 못하는 근무 | `D/E/N` = 원하는 근무 | `x` = 전체 불가 | `a` = 연차/off, 근무조정값 자동계산 버튼으로 반영 가능")
+        st.caption("🔒 fixed 표시가 있는 칸은 결과표에서 고정된 셀이므로 여기서는 수정할 수 없습니다. 결과 탭에서 고정 해제 후 수정하세요.")
+        SHIFT_OPTIONS = ['', 'd', 'e', 'n', 'x', 'a', 'de', 'dn', 'en', 'den', 'D', 'E', 'N']
+        day_type_options = ['평일', '토', '일', '공']
 
 
-    for chunk_start in range(0, num_days, CHUNK):
-        chunk_end = min(chunk_start + CHUNK, num_days)
-        cols = st.columns(CHUNK + 1)  # Always 8 columns (1 + 7)
+        for chunk_start in range(0, num_days, CHUNK):
+            chunk_end = min(chunk_start + CHUNK, num_days)
+            cols = st.columns(CHUNK + 1)  # Always 8 columns (1 + 7)
 
-        # First row: Day types
-        cols[0].markdown(f"<span style='font-family:var(--mono);font-size:0.7rem;color:var(--text-dim);font-weight:600'>날짜유형</span>", unsafe_allow_html=True)
-        for ci in range(CHUNK):
-            di = chunk_start + ci
-            if di < num_days:
-                d = start_date + timedelta(days=di)
-                lbl = get_day_label(start_date, di)
-                default_type = st.session_state.day_types.get(di, '평일')
-                color = "#e05c5c" if default_type in ('토','일','공') else "#4f8ef7"
-                cols[ci+1].markdown(f"<div style='text-align:center;font-family:var(--mono);font-size:0.72rem'><span style='color:{color}'>{d.strftime('%m/%d')}</span><br><span style='color:#6b7280'>{lbl}</span></div>", unsafe_allow_html=True)
-                new_type = cols[ci+1].selectbox(
-                    f"d{di}", day_type_options,
-                    index=day_type_options.index(default_type),
-                    label_visibility="collapsed", key=f"dtype_{di}"
-                )
-                st.session_state.day_types[di] = new_type
-            else:
-                cols[ci+1].empty()  # Empty cell for missing days
-
-        # Subsequent rows: Per-doctor shift requests
-        for ni, doc in enumerate(doctors):
-            cols2 = st.columns(CHUNK + 1)  # Always 16 columns
-            cols2[0].markdown(f"<span style='font-family:var(--mono);font-size:0.8rem;color:var(--accent);font-weight:600'>[{ni}] {doc['name']}</span>", unsafe_allow_html=True)
+            # First row: Day types
+            cols[0].markdown(f"<span style='font-family:var(--mono);font-size:0.7rem;color:var(--text-dim);font-weight:600'>날짜유형</span>", unsafe_allow_html=True)
             for ci in range(CHUNK):
                 di = chunk_start + ci
                 if di < num_days:
-                    ver = st.session_state.get("shift_req_version", 0)
-                    key = f"sr_{ni}_{di}_v{ver}"
-                    base_val = st.session_state.base_shift_requests.get((ni, di), '')
-                    fixed_val = st.session_state.fixed_shift_requests.get((ni, di), '')
-                    cur = fixed_val if fixed_val else base_val
-                    options = SHIFT_OPTIONS
-                    if cur and cur not in options:
-                        options = [cur] + options
-                    idx = options.index(cur) if cur in options else 0
-
-                    if fixed_val:
-                        base_label = base_val if base_val else "빈칸"
-                        cols2[ci+1].markdown(
-                            f"<div class='fixed-request-note'>🔒 fixed {fixed_val}<br><span>원래 입력: {base_label}</span></div>",
-                            unsafe_allow_html=True,
-                        )
-                        cols2[ci+1].selectbox(
-                            f"sr{ni}{di}", options,
-                            index=idx,
-                            label_visibility="collapsed", key=key,
-                            disabled=True,
-                            help="결과표에서 고정된 셀입니다. 수정하려면 결과 탭에서 먼저 고정 해제하세요.",
-                        )
-                    else:
-                        new_val = cols2[ci+1].selectbox(
-                            f"sr{ni}{di}", options,
-                            index=idx,
-                            label_visibility="collapsed", key=key
-                        )
-                        if new_val:
-                            st.session_state.base_shift_requests[(ni, di)] = new_val
-                        else:
-                            st.session_state.base_shift_requests.pop((ni, di), None)
-                    refresh_combined_shift_requests()
+                    d = start_date + timedelta(days=di)
+                    lbl = get_day_label(start_date, di)
+                    default_type = st.session_state.day_types.get(di, '평일')
+                    color = "#e05c5c" if default_type in ('토','일','공') else "#4f8ef7"
+                    cols[ci+1].markdown(f"<div style='text-align:center;font-family:var(--mono);font-size:0.72rem'><span style='color:{color}'>{d.strftime('%m/%d')}</span><br><span style='color:#6b7280'>{lbl}</span></div>", unsafe_allow_html=True)
+                    new_type = cols[ci+1].selectbox(
+                        f"d{di}", day_type_options,
+                        index=day_type_options.index(default_type),
+                        label_visibility="collapsed", key=f"dtype_{di}"
+                    )
+                    st.session_state.day_types[di] = new_type
                 else:
-                    cols2[ci+1].empty()  # Empty cell for missing days
+                    cols[ci+1].empty()  # Empty cell for missing days
 
-        st.divider()
+            # Subsequent rows: Per-doctor shift requests
+            for ni, doc in enumerate(doctors):
+                cols2 = st.columns(CHUNK + 1)  # Always 16 columns
+                cols2[0].markdown(f"<span style='font-family:var(--mono);font-size:0.8rem;color:var(--accent);font-weight:600'>[{ni}] {doc['name']}</span>", unsafe_allow_html=True)
+                for ci in range(CHUNK):
+                    di = chunk_start + ci
+                    if di < num_days:
+                        ver = st.session_state.get("shift_req_version", 0)
+                        key = f"sr_{ni}_{di}_v{ver}"
+                        base_val = st.session_state.base_shift_requests.get((ni, di), '')
+                        fixed_val = st.session_state.fixed_shift_requests.get((ni, di), '')
+                        cur = fixed_val if fixed_val else base_val
+                        options = SHIFT_OPTIONS
+                        if cur and cur not in options:
+                            options = [cur] + options
+                        idx = options.index(cur) if cur in options else 0
 
+                        if fixed_val:
+                            base_label = base_val if base_val else "빈칸"
+                            cols2[ci+1].markdown(
+                                f"<div class='fixed-request-note'>🔒 fixed {fixed_val}<br><span>원래 입력: {base_label}</span></div>",
+                                unsafe_allow_html=True,
+                            )
+                            cols2[ci+1].selectbox(
+                                f"sr{ni}{di}", options,
+                                index=idx,
+                                label_visibility="collapsed", key=key,
+                                disabled=True,
+                                help="결과표에서 고정된 셀입니다. 수정하려면 결과 탭에서 먼저 고정 해제하세요.",
+                            )
+                        else:
+                            new_val = cols2[ci+1].selectbox(
+                                f"sr{ni}{di}", options,
+                                index=idx,
+                                label_visibility="collapsed", key=key
+                            )
+                            if new_val:
+                                st.session_state.base_shift_requests[(ni, di)] = new_val
+                            else:
+                                st.session_state.base_shift_requests.pop((ni, di), None)
+                        refresh_combined_shift_requests()
+                    else:
+                        cols2[ci+1].empty()  # Empty cell for missing days
+
+            st.divider()
+
+
+
+    if save_shift_requests:
+        refresh_combined_shift_requests()
+        st.session_state["shift_req_version"] = st.session_state.get("shift_req_version", 0) + 1
+        st.toast("✅ 근무 요청 / 날짜 설정이 저장되었습니다.", icon="✅")
+        st.rerun()
 
 # ─────────────────────────────────────────────────────────────────────────────
 # TAB 2: Duty requests (how many D/E/N per day)
 # ─────────────────────────────────────────────────────────────────────────────
 with tab2:
-    st.markdown('<div class="section-label">날짜별 필요 인원 설정</div>', unsafe_allow_html=True)
-    st.caption("각 날짜마다 Day / Evening / Night 에 필요한 의사 수를 설정합니다.")
-    st.caption("아래 요약에서 Duty 총합과 fixed_total 합을 먼저 확인하세요. 숫자가 맞지 않으면 solver가 해를 찾을 수 없습니다.")
-    render_fixed_total_duty_summary(num_days)
+    with st.form("duty_settings_form", clear_on_submit=False):
+        save_duty_settings = st.form_submit_button("저장", use_container_width=True)
+        st.caption("Duty 숫자를 여러 칸 수정한 뒤 저장을 눌러야 실제 설정에 반영됩니다.")
+        st.markdown('<div class="section-label">날짜별 필요 인원 설정</div>', unsafe_allow_html=True)
+        st.caption("각 날짜마다 Day / Evening / Night 에 필요한 의사 수를 설정합니다.")
+        st.caption("아래 요약에서 Duty 총합과 fixed_total 합을 먼저 확인하세요. 숫자가 맞지 않으면 solver가 해를 찾을 수 없습니다.")
+        render_fixed_total_duty_summary(num_days)
 
-    for chunk_start in range(0, num_days, CHUNK):
-        cols = st.columns(CHUNK + 1)  # Always 8 columns (1 + 7)
-        cols[0].markdown("<span style='font-family:var(--mono);font-size:0.7rem;color:var(--text-dim)'>Duty</span>", unsafe_allow_html=True)
+        for chunk_start in range(0, num_days, CHUNK):
+            cols = st.columns(CHUNK + 1)  # Always 8 columns (1 + 7)
+            cols[0].markdown("<span style='font-family:var(--mono);font-size:0.7rem;color:var(--text-dim)'>Duty</span>", unsafe_allow_html=True)
 
-        # Header row
-        for ci in range(CHUNK):
-            di = chunk_start + ci
-            if di < num_days:
-                d = start_date + timedelta(days=di)
-                lbl = get_day_label(start_date, di)
-                dtype = st.session_state.day_types.get(di, '평일')
-                color = "#e05c5c" if dtype in ('토','일','공') else "#4f8ef7"
-                cols[ci+1].markdown(
-                    f"<div style='text-align:center;font-size:0.72rem;font-family:var(--mono)'>"
-                    f"<span style='color:{color}'>{d.strftime('%m/%d')}</span><br>"
-                    f"<span style='color:#6b7280'>{lbl}</span></div>",
-                    unsafe_allow_html=True
-                )
-            else:
-                cols[ci+1].empty()
-
-        # D / E / N rows
-        for shift_i, shift_lbl in enumerate(['D (Day)', 'E (Evening)', 'N (Night)']):
-            cols2 = st.columns(CHUNK + 1)  # Always 16 columns
-            cols2[0].markdown(f"<span style='font-family:var(--mono);font-size:0.75rem;color:{'#4f8ef7' if shift_i==0 else '#f0a040' if shift_i==1 else '#8080f0'}'>{shift_lbl}</span>", unsafe_allow_html=True)
+            # Header row
             for ci in range(CHUNK):
                 di = chunk_start + ci
                 if di < num_days:
-                    cur_val = st.session_state.duty_requests.get(di, [1,1,1])[shift_i]
-                    duty_ver = st.session_state.get("duty_req_version", 0)
-                    duty_key = f"duty_{di}_{shift_i}_v{duty_ver}"
-                    new_val = cols2[ci+1].number_input(
-                        f"duty_{di}_{shift_i}", min_value=0, max_value=len(doctors),
-                        value=cur_val, label_visibility="collapsed",
-                        key=duty_key,
-                        on_change=sync_duty_request_widget,
-                        args=(di, shift_i, duty_key),
+                    d = start_date + timedelta(days=di)
+                    lbl = get_day_label(start_date, di)
+                    dtype = st.session_state.day_types.get(di, '평일')
+                    color = "#e05c5c" if dtype in ('토','일','공') else "#4f8ef7"
+                    cols[ci+1].markdown(
+                        f"<div style='text-align:center;font-size:0.72rem;font-family:var(--mono)'>"
+                        f"<span style='color:{color}'>{d.strftime('%m/%d')}</span><br>"
+                        f"<span style='color:#6b7280'>{lbl}</span></div>",
+                        unsafe_allow_html=True
                     )
-                    if di not in st.session_state.duty_requests:
-                        st.session_state.duty_requests[di] = [1,1,1]
-                    st.session_state.duty_requests[di][shift_i] = int(new_val)
                 else:
-                    cols2[ci+1].empty()
+                    cols[ci+1].empty()
 
-        st.divider()
+            # D / E / N rows
+            for shift_i, shift_lbl in enumerate(['D (Day)', 'E (Evening)', 'N (Night)']):
+                cols2 = st.columns(CHUNK + 1)  # Always 16 columns
+                cols2[0].markdown(f"<span style='font-family:var(--mono);font-size:0.75rem;color:{'#4f8ef7' if shift_i==0 else '#f0a040' if shift_i==1 else '#8080f0'}'>{shift_lbl}</span>", unsafe_allow_html=True)
+                for ci in range(CHUNK):
+                    di = chunk_start + ci
+                    if di < num_days:
+                        cur_val = st.session_state.duty_requests.get(di, [1,1,1])[shift_i]
+                        duty_ver = st.session_state.get("duty_req_version", 0)
+                        duty_key = f"duty_{di}_{shift_i}_v{duty_ver}"
+                        new_val = cols2[ci+1].number_input(
+                            f"duty_{di}_{shift_i}", min_value=0, max_value=len(doctors),
+                            value=cur_val, label_visibility="collapsed",
+                            key=duty_key,
+                        )
+                        if di not in st.session_state.duty_requests:
+                            st.session_state.duty_requests[di] = [1,1,1]
+                        st.session_state.duty_requests[di][shift_i] = int(new_val)
+                    else:
+                        cols2[ci+1].empty()
 
+            st.divider()
+
+
+
+    if save_duty_settings:
+        st.session_state["duty_req_version"] = st.session_state.get("duty_req_version", 0) + 1
+        st.toast("✅ Duty 설정이 저장되었습니다.", icon="✅")
+        st.rerun()
 
 # ─────────────────────────────────────────────────────────────────────────────
 # TAB 3: Per-doctor rules
@@ -2444,185 +2474,196 @@ for ni in range(len(doctors)):
         st.session_state.shift_adj[ni] = 0
 
 with tab3:
-    st.markdown('<div class="section-label">Grade 정책 설정</div>', unsafe_allow_html=True)
-    st.caption("Grade는 개인 속성이고, 고년차/저년차 기준과 objective 가중치는 전체 스케줄에 적용되는 전역 rule입니다.")
+    with st.form("grade_rule_settings_form", clear_on_submit=False):
+        save_grade_rule_settings = st.form_submit_button("저장", use_container_width=True)
+        st.caption("Grade 정책, 가중치, 개인별 Grade/규칙은 여러 항목을 수정한 뒤 저장을 눌러야 실제 설정에 반영됩니다.")
+        st.markdown('<div class="section-label">Grade 정책 설정</div>', unsafe_allow_html=True)
+        st.caption("Grade는 개인 속성이고, 고년차/저년차 기준과 objective 가중치는 전체 스케줄에 적용되는 전역 rule입니다.")
 
-    gr = st.session_state.grade_rules
-    gr_ver = st.session_state.get("grade_rule_version", 0)
-    gcol1, gcol2, gcol3, gcol4, gcol5 = st.columns(5)
-    gr["senior_min_grade"] = int(gcol1.number_input(
-        "고년차 기준 grade ≥", min_value=GRADE_MIN_VALUE, max_value=GRADE_MAX_VALUE,
-        value=bounded_int(gr.get("senior_min_grade", DEFAULT_GRADE_RULES["senior_min_grade"]), DEFAULT_GRADE_RULES["senior_min_grade"], GRADE_MIN_VALUE, GRADE_MAX_VALUE),
-        key=f"grade_senior_min_grade_v{gr_ver}"
-    ))
-    gr["senior_min_count"] = int(gcol2.number_input(
-        "Duty별 고년차 최소", min_value=0, max_value=10,
-        value=bounded_int(gr.get("senior_min_count", DEFAULT_GRADE_RULES["senior_min_count"]), DEFAULT_GRADE_RULES["senior_min_count"], 0, 10),
-        key=f"grade_senior_min_count_v{gr_ver}"
-    ))
-    gr["junior_max_grade"] = int(gcol3.number_input(
-        "저년차 기준 grade ≤", min_value=GRADE_MIN_VALUE, max_value=GRADE_MAX_VALUE,
-        value=bounded_int(gr.get("junior_max_grade", DEFAULT_GRADE_RULES["junior_max_grade"]), DEFAULT_GRADE_RULES["junior_max_grade"], GRADE_MIN_VALUE, GRADE_MAX_VALUE),
-        key=f"grade_junior_max_grade_v{gr_ver}"
-    ))
-    gr["junior_soft_max_count"] = int(gcol4.number_input(
-        "Duty별 저년차 권장 최대", min_value=0, max_value=10,
-        value=bounded_int(gr.get("junior_soft_max_count", DEFAULT_GRADE_RULES["junior_soft_max_count"]), DEFAULT_GRADE_RULES["junior_soft_max_count"], 0, 10),
-        key=f"grade_junior_soft_max_count_v{gr_ver}"
-    ))
-    gr["junior_penalty_weight"] = int(gcol5.number_input(
-        "저년차 초과 penalty", min_value=0, max_value=100,
-        value=bounded_int(gr.get("junior_penalty_weight", DEFAULT_GRADE_RULES["junior_penalty_weight"]), DEFAULT_GRADE_RULES["junior_penalty_weight"], 0, 100),
-        key=f"grade_junior_penalty_weight_v{gr_ver}"
-    ))
+        gr = st.session_state.grade_rules
+        gr_ver = st.session_state.get("grade_rule_version", 0)
+        gcol1, gcol2, gcol3, gcol4, gcol5 = st.columns(5)
+        gr["senior_min_grade"] = int(gcol1.number_input(
+            "고년차 기준 grade ≥", min_value=GRADE_MIN_VALUE, max_value=GRADE_MAX_VALUE,
+            value=bounded_int(gr.get("senior_min_grade", DEFAULT_GRADE_RULES["senior_min_grade"]), DEFAULT_GRADE_RULES["senior_min_grade"], GRADE_MIN_VALUE, GRADE_MAX_VALUE),
+            key=f"grade_senior_min_grade_v{gr_ver}"
+        ))
+        gr["senior_min_count"] = int(gcol2.number_input(
+            "Duty별 고년차 최소", min_value=0, max_value=10,
+            value=bounded_int(gr.get("senior_min_count", DEFAULT_GRADE_RULES["senior_min_count"]), DEFAULT_GRADE_RULES["senior_min_count"], 0, 10),
+            key=f"grade_senior_min_count_v{gr_ver}"
+        ))
+        gr["junior_max_grade"] = int(gcol3.number_input(
+            "저년차 기준 grade ≤", min_value=GRADE_MIN_VALUE, max_value=GRADE_MAX_VALUE,
+            value=bounded_int(gr.get("junior_max_grade", DEFAULT_GRADE_RULES["junior_max_grade"]), DEFAULT_GRADE_RULES["junior_max_grade"], GRADE_MIN_VALUE, GRADE_MAX_VALUE),
+            key=f"grade_junior_max_grade_v{gr_ver}"
+        ))
+        gr["junior_soft_max_count"] = int(gcol4.number_input(
+            "Duty별 저년차 권장 최대", min_value=0, max_value=10,
+            value=bounded_int(gr.get("junior_soft_max_count", DEFAULT_GRADE_RULES["junior_soft_max_count"]), DEFAULT_GRADE_RULES["junior_soft_max_count"], 0, 10),
+            key=f"grade_junior_soft_max_count_v{gr_ver}"
+        ))
+        gr["junior_penalty_weight"] = int(gcol5.number_input(
+            "저년차 초과 penalty", min_value=0, max_value=100,
+            value=bounded_int(gr.get("junior_penalty_weight", DEFAULT_GRADE_RULES["junior_penalty_weight"]), DEFAULT_GRADE_RULES["junior_penalty_weight"], 0, 100),
+            key=f"grade_junior_penalty_weight_v{gr_ver}"
+        ))
 
-    st.caption("초저년차 hard rule도 Grade 정책 안에서 함께 설정합니다. 0이면 사용하지 않고, 1이면 한 duty에 초저년차 최대 1명까지만 허용합니다.")
-    ucol1, ucol2, ucol3 = st.columns([1, 1, 3])
-    gr["ultra_junior_max_grade"] = int(ucol1.number_input(
-        "초저년차 기준 grade ≤", min_value=GRADE_MIN_VALUE, max_value=GRADE_MAX_VALUE,
-        value=bounded_int(gr.get("ultra_junior_max_grade", DEFAULT_GRADE_RULES["ultra_junior_max_grade"]), DEFAULT_GRADE_RULES["ultra_junior_max_grade"], GRADE_MIN_VALUE, GRADE_MAX_VALUE),
-        key=f"grade_ultra_junior_max_grade_v{gr_ver}"
-    ))
-    gr["ultra_junior_max_count"] = int(ucol2.number_input(
-        "초저년차 최대 허용", min_value=0, max_value=10,
-        value=bounded_int(gr.get("ultra_junior_max_count", DEFAULT_GRADE_RULES["ultra_junior_max_count"]), DEFAULT_GRADE_RULES["ultra_junior_max_count"], 0, 10),
-        key=f"grade_ultra_junior_max_count_v{gr_ver}"
-    ))
-    if gr["ultra_junior_max_count"] > 0:
-        ucol3.info(
-            f"Hard: grade ≤ {gr['ultra_junior_max_grade']} 인원은 같은 날짜·같은 D/E/N duty에 "
-            f"최대 {gr['ultra_junior_max_count']}명까지만 허용됩니다."
+        st.caption("초저년차 hard rule도 Grade 정책 안에서 함께 설정합니다. 0이면 사용하지 않고, 1이면 한 duty에 초저년차 최대 1명까지만 허용합니다.")
+        ucol1, ucol2, ucol3 = st.columns([1, 1, 3])
+        gr["ultra_junior_max_grade"] = int(ucol1.number_input(
+            "초저년차 기준 grade ≤", min_value=GRADE_MIN_VALUE, max_value=GRADE_MAX_VALUE,
+            value=bounded_int(gr.get("ultra_junior_max_grade", DEFAULT_GRADE_RULES["ultra_junior_max_grade"]), DEFAULT_GRADE_RULES["ultra_junior_max_grade"], GRADE_MIN_VALUE, GRADE_MAX_VALUE),
+            key=f"grade_ultra_junior_max_grade_v{gr_ver}"
+        ))
+        gr["ultra_junior_max_count"] = int(ucol2.number_input(
+            "초저년차 최대 허용", min_value=0, max_value=10,
+            value=bounded_int(gr.get("ultra_junior_max_count", DEFAULT_GRADE_RULES["ultra_junior_max_count"]), DEFAULT_GRADE_RULES["ultra_junior_max_count"], 0, 10),
+            key=f"grade_ultra_junior_max_count_v{gr_ver}"
+        ))
+        if gr["ultra_junior_max_count"] > 0:
+            ucol3.info(
+                f"Hard: grade ≤ {gr['ultra_junior_max_grade']} 인원은 같은 날짜·같은 D/E/N duty에 "
+                f"최대 {gr['ultra_junior_max_count']}명까지만 허용됩니다."
+            )
+        else:
+            ucol3.caption("0이면 초저년차 동시근무 hard rule은 적용하지 않습니다.")
+
+        st.markdown('<div class="section-label">편차 가중치 설정</div>', unsafe_allow_html=True)
+        st.caption("Objective = D/E 편차×가중치 + 휴일 편차×가중치 + 총근무 편차×가중치 + N 편차×가중치 + Grade 편차×가중치 + 저년차 초과×가중치")
+        wcol1, wcol2, wcol3, wcol4, wcol5 = st.columns(5)
+        gr["weight_de_dev"] = int(wcol1.number_input(
+            "D/E 편차 가중치", min_value=0, max_value=100,
+            value=bounded_int(gr.get("weight_de_dev", DEFAULT_GRADE_RULES["weight_de_dev"]), DEFAULT_GRADE_RULES["weight_de_dev"], 0, 100),
+            key=f"weight_de_dev_v{gr_ver}"
+        ))
+        gr["weight_holiday_dev"] = int(wcol2.number_input(
+            "휴일 편차 가중치", min_value=0, max_value=100,
+            value=bounded_int(gr.get("weight_holiday_dev", DEFAULT_GRADE_RULES["weight_holiday_dev"]), DEFAULT_GRADE_RULES["weight_holiday_dev"], 0, 100),
+            key=f"weight_holiday_dev_v{gr_ver}"
+        ))
+        gr["weight_total_dev"] = int(wcol3.number_input(
+            "총 근무 편차 가중치", min_value=0, max_value=100,
+            value=bounded_int(gr.get("weight_total_dev", DEFAULT_GRADE_RULES["weight_total_dev"]), DEFAULT_GRADE_RULES["weight_total_dev"], 0, 100),
+            key=f"weight_total_dev_v{gr_ver}"
+        ))
+        gr["weight_n_dev"] = int(wcol4.number_input(
+            "N 편차 가중치", min_value=0, max_value=100,
+            value=bounded_int(gr.get("weight_n_dev", DEFAULT_GRADE_RULES["weight_n_dev"]), DEFAULT_GRADE_RULES["weight_n_dev"], 0, 100),
+            key=f"weight_n_dev_v{gr_ver}"
+        ))
+        gr["weight_grade_dev"] = int(wcol5.number_input(
+            "Grade 편차 가중치", min_value=0, max_value=100,
+            value=bounded_int(gr.get("weight_grade_dev", DEFAULT_GRADE_RULES.get("weight_grade_dev", 3)), DEFAULT_GRADE_RULES.get("weight_grade_dev", 3), 0, 100),
+            key=f"weight_grade_dev_v{gr_ver}"
+        ))
+        st.session_state.grade_rules = gr
+        st.markdown(
+            f"<div style='font-size:0.82rem; color:var(--text-dim);'>"
+            f"Hard: 각 duty마다 <b>grade ≥ {gr['senior_min_grade']}</b> 인원이 최소 <b>{gr['senior_min_count']}</b>명 필요합니다. "
+            f"Soft: <b>grade ≤ {gr['junior_max_grade']}</b> 인원이 duty별 <b>{gr['junior_soft_max_count']}</b>명을 초과하면 "
+            f"초과 1건당 <b>{gr['junior_penalty_weight']}</b>점 penalty를 줍니다. "
+            f"Ultra-hard: <b>grade ≤ {gr.get('ultra_junior_max_grade', 1)}</b> 인원은 duty별 "
+            f"최대 <b>{gr.get('ultra_junior_max_count', 0)}</b>명까지 허용합니다(0=사용안함)."
+            f"</div>",
+            unsafe_allow_html=True
         )
-    else:
-        ucol3.caption("0이면 초저년차 동시근무 hard rule은 적용하지 않습니다.")
 
-    st.markdown('<div class="section-label">편차 가중치 설정</div>', unsafe_allow_html=True)
-    st.caption("Objective = D/E 편차×가중치 + 휴일 편차×가중치 + 총근무 편차×가중치 + N 편차×가중치 + Grade 편차×가중치 + 저년차 초과×가중치")
-    wcol1, wcol2, wcol3, wcol4, wcol5 = st.columns(5)
-    gr["weight_de_dev"] = int(wcol1.number_input(
-        "D/E 편차 가중치", min_value=0, max_value=100,
-        value=bounded_int(gr.get("weight_de_dev", DEFAULT_GRADE_RULES["weight_de_dev"]), DEFAULT_GRADE_RULES["weight_de_dev"], 0, 100),
-        key=f"weight_de_dev_v{gr_ver}"
-    ))
-    gr["weight_holiday_dev"] = int(wcol2.number_input(
-        "휴일 편차 가중치", min_value=0, max_value=100,
-        value=bounded_int(gr.get("weight_holiday_dev", DEFAULT_GRADE_RULES["weight_holiday_dev"]), DEFAULT_GRADE_RULES["weight_holiday_dev"], 0, 100),
-        key=f"weight_holiday_dev_v{gr_ver}"
-    ))
-    gr["weight_total_dev"] = int(wcol3.number_input(
-        "총 근무 편차 가중치", min_value=0, max_value=100,
-        value=bounded_int(gr.get("weight_total_dev", DEFAULT_GRADE_RULES["weight_total_dev"]), DEFAULT_GRADE_RULES["weight_total_dev"], 0, 100),
-        key=f"weight_total_dev_v{gr_ver}"
-    ))
-    gr["weight_n_dev"] = int(wcol4.number_input(
-        "N 편차 가중치", min_value=0, max_value=100,
-        value=bounded_int(gr.get("weight_n_dev", DEFAULT_GRADE_RULES["weight_n_dev"]), DEFAULT_GRADE_RULES["weight_n_dev"], 0, 100),
-        key=f"weight_n_dev_v{gr_ver}"
-    ))
-    gr["weight_grade_dev"] = int(wcol5.number_input(
-        "Grade 편차 가중치", min_value=0, max_value=100,
-        value=bounded_int(gr.get("weight_grade_dev", DEFAULT_GRADE_RULES.get("weight_grade_dev", 3)), DEFAULT_GRADE_RULES.get("weight_grade_dev", 3), 0, 100),
-        key=f"weight_grade_dev_v{gr_ver}"
-    ))
-    st.session_state.grade_rules = gr
-    st.markdown(
-        f"<div style='font-size:0.82rem; color:var(--text-dim);'>"
-        f"Hard: 각 duty마다 <b>grade ≥ {gr['senior_min_grade']}</b> 인원이 최소 <b>{gr['senior_min_count']}</b>명 필요합니다. "
-        f"Soft: <b>grade ≤ {gr['junior_max_grade']}</b> 인원이 duty별 <b>{gr['junior_soft_max_count']}</b>명을 초과하면 "
-        f"초과 1건당 <b>{gr['junior_penalty_weight']}</b>점 penalty를 줍니다. "
-        f"Ultra-hard: <b>grade ≤ {gr.get('ultra_junior_max_grade', 1)}</b> 인원은 duty별 "
-        f"최대 <b>{gr.get('ultra_junior_max_count', 0)}</b>명까지 허용합니다(0=사용안함)."
-        f"</div>",
-        unsafe_allow_html=True
-    )
+
+        st.divider()
+        st.markdown('<div class="section-label">개인별 Grade & 근무 규칙 설정</div>', unsafe_allow_html=True)
+        st.caption("7명씩 나눠서 표시됩니다. Grade와 개인 rule을 입력하세요. 근무 조정값과 fixed count는 위 표에서 수정합니다.")
+
+        doc_names = [d["name"] for d in doctors]
+        DOC_CHUNK = 7
+
+        RULE_DEFS = [
+            ("rule_max_shifts_per_day",  "하루 근무 횟수",                          "select", RULE0_OPTIONS, RULE0_LABELS),
+            ("rule_n_block_max",         "N 뭉치 최대 길이",                        "select", [1,2,3], ["1개(NN불가)","2개(NNN불가)","3개(NNNN불가)"]),
+            ("rule_n_rest",              "N뭉치 후 완전 Off 의무일",                "number", 0, 5),
+            ("rule_n_gap",               "N뭉치 후 다음 N까지 총 간격",             "number", 0, 10),
+            ("rule_no_day_after_eve",    "Evening 후 Day 금지",                     "bool",   None, None),
+            ("rule_no_3eve_consec",      "Evening 3연속 금지",                      "bool",   None, None),
+            ("rule_no_3eve_in_4days",    "4일내 Evening 3회 금지",                  "bool",   None, None),
+            ("rule_max_consec_days", "최대 연속 근무일수", "number", 0, 30),
+            ("rule_max_shifts_per_week", "7일 구간 최대 근무수 (0=무제한)",             "number", 0, 7),
+            ("rule_no_3day_consec",      "Day 3연속 금지",                          "bool",   None, None),
+        ]
+
+        for chunk_start in range(0, len(doc_names), DOC_CHUNK):
+            chunk_end = min(chunk_start + DOC_CHUNK, len(doc_names))
+            chunk_names = doc_names[chunk_start:chunk_end]
+            chunk_size = len(chunk_names)
+
+            st.markdown(
+                f"<div style='font-family:var(--mono);font-size:0.75rem;color:var(--accent);margin:1rem 0 0.4rem'>"
+                f"의사 {chunk_start+1} ~ {chunk_end}</div>",
+                unsafe_allow_html=True
+            )
+
+            # 헤더
+            header_cols = st.columns([2] + [1] * chunk_size)
+            header_cols[0].markdown("<span style='font-family:var(--mono);font-size:0.75rem;color:var(--text-dim)'>규칙</span>", unsafe_allow_html=True)
+            for ci, name in enumerate(chunk_names):
+                header_cols[ci+1].markdown(f"<span style='font-family:var(--mono);font-size:0.78rem;font-weight:600;color:var(--accent)'>{name}</span>", unsafe_allow_html=True)
+
+            # grade
+            grade_cols = st.columns([2] + [1] * chunk_size)
+            grade_cols[0].markdown("<span style='font-size:0.75rem'>Grade</span>", unsafe_allow_html=True)
+            for ci, ni in enumerate(range(chunk_start, chunk_end)):
+                grade_ver = st.session_state.get("grade_version", 0)
+                cur_grade = bounded_int(doctors[ni].get("grade", DEFAULT_DOCTOR_GRADE), DEFAULT_DOCTOR_GRADE, GRADE_MIN_VALUE, GRADE_MAX_VALUE)
+                new_grade = grade_cols[ci+1].number_input(
+                    f"grade_{ni}", min_value=GRADE_MIN_VALUE, max_value=GRADE_MAX_VALUE,
+                    value=cur_grade, label_visibility="collapsed", key=f"doc_grade_{ni}_v{grade_ver}"
+                )
+                doctors[ni]["grade"] = int(new_grade)
+
+            # 근무 조정값과 fixed Total/D/E/N counts are edited in the table above.
+
+            # 규칙 rows
+            for key, label, rtype, opt1, opt2 in RULE_DEFS:
+                row_cols = st.columns([2] + [1] * chunk_size)
+                row_cols[0].markdown(f"<span style='font-size:0.75rem'>{label}</span>", unsafe_allow_html=True)
+                for ci, ni in enumerate(range(chunk_start, chunk_end)):
+                    rules = st.session_state.rules.get(ni, DEFAULT_RULES.copy())
+                    if rtype == "select":
+                        opts, labels = opt1, opt2
+                        cur = int(rules.get(key, opts[0]))
+                        idx = opts.index(cur) if cur in opts else 0
+                        new_val = row_cols[ci+1].selectbox(
+                            f"r_{key}_{ni}", options=labels, index=idx, label_visibility="collapsed"
+                        )
+                        st.session_state.rules[ni][key] = opts[labels.index(new_val)]
+                    elif rtype == "number":
+                        cur = int(rules.get(key, opt1))
+                        new_val = row_cols[ci+1].number_input(
+                            f"r_{key}_{ni}", min_value=opt1, max_value=opt2,
+                            value=cur, label_visibility="collapsed"
+                        )
+                        st.session_state.rules[ni][key] = int(new_val)
+                    elif rtype == "bool":
+                        cur = bool(rules.get(key, 0))
+                        new_val = row_cols[ci+1].checkbox(
+                            "", value=cur, key=f"r_{key}_{ni}", label_visibility="collapsed"
+                        )
+                        st.session_state.rules[ni][key] = 1 if new_val else 0
+
+            st.divider()
+
+
+
+    if save_grade_rule_settings:
+        st.session_state["grade_rule_version"] = st.session_state.get("grade_rule_version", 0) + 1
+        st.session_state["grade_version"] = st.session_state.get("grade_version", 0) + 1
+        st.toast("✅ 개인 규칙 / Grade 설정이 저장되었습니다.", icon="✅")
+        st.rerun()
 
     st.divider()
     st.markdown('<div class="section-label">근무 조정값 & fixed D/E/N/Total / Duty 총합 확인</div>', unsafe_allow_html=True)
     st.caption("근무 조정값과 fixed_D/E/N/Total은 아래 표에서 한 번에 수정한 뒤 저장합니다. Duty 필요 인원과 fixed_Total 요약도 여기서 확인합니다.")
     render_fixed_total_duty_summary(num_days)
     render_fixed_total_editor_table()
-
-    st.divider()
-    st.markdown('<div class="section-label">개인별 Grade & 근무 규칙 설정</div>', unsafe_allow_html=True)
-    st.caption("7명씩 나눠서 표시됩니다. Grade와 개인 rule을 입력하세요. 근무 조정값과 fixed count는 위 표에서 수정합니다.")
-
-    doc_names = [d["name"] for d in doctors]
-    DOC_CHUNK = 7
-
-    RULE_DEFS = [
-        ("rule_max_shifts_per_day",  "하루 근무 횟수",                          "select", RULE0_OPTIONS, RULE0_LABELS),
-        ("rule_n_block_max",         "N 뭉치 최대 길이",                        "select", [1,2,3], ["1개(NN불가)","2개(NNN불가)","3개(NNNN불가)"]),
-        ("rule_n_rest",              "N뭉치 후 완전 Off 의무일",                "number", 0, 5),
-        ("rule_n_gap",               "N뭉치 후 다음 N까지 총 간격",             "number", 0, 10),
-        ("rule_no_day_after_eve",    "Evening 후 Day 금지",                     "bool",   None, None),
-        ("rule_no_3eve_consec",      "Evening 3연속 금지",                      "bool",   None, None),
-        ("rule_no_3eve_in_4days",    "4일내 Evening 3회 금지",                  "bool",   None, None),
-        ("rule_max_consec_days", "최대 연속 근무일수", "number", 0, 30),
-        ("rule_max_shifts_per_week", "7일 구간 최대 근무수 (0=무제한)",             "number", 0, 7),
-        ("rule_no_3day_consec",      "Day 3연속 금지",                          "bool",   None, None),
-    ]
-
-    for chunk_start in range(0, len(doc_names), DOC_CHUNK):
-        chunk_end = min(chunk_start + DOC_CHUNK, len(doc_names))
-        chunk_names = doc_names[chunk_start:chunk_end]
-        chunk_size = len(chunk_names)
-
-        st.markdown(
-            f"<div style='font-family:var(--mono);font-size:0.75rem;color:var(--accent);margin:1rem 0 0.4rem'>"
-            f"의사 {chunk_start+1} ~ {chunk_end}</div>",
-            unsafe_allow_html=True
-        )
-
-        # 헤더
-        header_cols = st.columns([2] + [1] * chunk_size)
-        header_cols[0].markdown("<span style='font-family:var(--mono);font-size:0.75rem;color:var(--text-dim)'>규칙</span>", unsafe_allow_html=True)
-        for ci, name in enumerate(chunk_names):
-            header_cols[ci+1].markdown(f"<span style='font-family:var(--mono);font-size:0.78rem;font-weight:600;color:var(--accent)'>{name}</span>", unsafe_allow_html=True)
-
-        # grade
-        grade_cols = st.columns([2] + [1] * chunk_size)
-        grade_cols[0].markdown("<span style='font-size:0.75rem'>Grade</span>", unsafe_allow_html=True)
-        for ci, ni in enumerate(range(chunk_start, chunk_end)):
-            grade_ver = st.session_state.get("grade_version", 0)
-            cur_grade = bounded_int(doctors[ni].get("grade", DEFAULT_DOCTOR_GRADE), DEFAULT_DOCTOR_GRADE, GRADE_MIN_VALUE, GRADE_MAX_VALUE)
-            new_grade = grade_cols[ci+1].number_input(
-                f"grade_{ni}", min_value=GRADE_MIN_VALUE, max_value=GRADE_MAX_VALUE,
-                value=cur_grade, label_visibility="collapsed", key=f"doc_grade_{ni}_v{grade_ver}"
-            )
-            doctors[ni]["grade"] = int(new_grade)
-
-        # 근무 조정값과 fixed Total/D/E/N counts are edited in the table above.
-
-        # 규칙 rows
-        for key, label, rtype, opt1, opt2 in RULE_DEFS:
-            row_cols = st.columns([2] + [1] * chunk_size)
-            row_cols[0].markdown(f"<span style='font-size:0.75rem'>{label}</span>", unsafe_allow_html=True)
-            for ci, ni in enumerate(range(chunk_start, chunk_end)):
-                rules = st.session_state.rules.get(ni, DEFAULT_RULES.copy())
-                if rtype == "select":
-                    opts, labels = opt1, opt2
-                    cur = int(rules.get(key, opts[0]))
-                    idx = opts.index(cur) if cur in opts else 0
-                    new_val = row_cols[ci+1].selectbox(
-                        f"r_{key}_{ni}", options=labels, index=idx, label_visibility="collapsed"
-                    )
-                    st.session_state.rules[ni][key] = opts[labels.index(new_val)]
-                elif rtype == "number":
-                    cur = int(rules.get(key, opt1))
-                    new_val = row_cols[ci+1].number_input(
-                        f"r_{key}_{ni}", min_value=opt1, max_value=opt2,
-                        value=cur, label_visibility="collapsed"
-                    )
-                    st.session_state.rules[ni][key] = int(new_val)
-                elif rtype == "bool":
-                    cur = bool(rules.get(key, 0))
-                    new_val = row_cols[ci+1].checkbox(
-                        "", value=cur, key=f"r_{key}_{ni}", label_visibility="collapsed"
-                    )
-                    st.session_state.rules[ni][key] = 1 if new_val else 0
-
-        st.divider()
-
 
 # ─────────────────────────────────────────────────────────────────────────────
 # SOLVER (triggered from sidebar button)
@@ -2975,62 +3016,83 @@ with tab4:
                 positions.append((ni, col_idx))
             return positions
 
-        lock_col1, lock_col2, lock_col3 = st.columns([1, 1, 3])
-        if lock_col1.button("🔒 선택 셀 고정", key="btn_lock_apply"):
+        pending_locks = dict(st.session_state.get("pending_result_fixed_locks", {}))
+        pending_releases = set(st.session_state.get("pending_result_fixed_releases", set()))
+        pending_count = len(pending_locks) + len(pending_releases)
+        if pending_count:
+            st.info(f"결과 고정 변경 예정: {pending_count}개. 저장을 눌러야 근무 요청/fixed layer에 반영됩니다.")
+
+        lock_col1, lock_col2, lock_col3, lock_col4 = st.columns([1, 1, 1, 3])
+        if lock_col1.button("🔒 고정 예정", key="btn_lock_apply"):
             positions = _selected_to_positions(selected_cells)
             if not positions:
                 st.warning("선택된 셀이 없어요. 고정할 셀을 먼저 클릭해서 선택해주세요.")
             else:
-                new_fixed_req = dict(st.session_state.fixed_shift_requests)
                 for ni, di in positions:
                     current_req = _clean_shift_request_value(combined_req.get((ni, di), ''))
                     if current_req.lower() == 'a':
-                        new_fixed_req[(ni, di)] = 'a'
+                        pending_locks[(ni, di)] = 'a'
                     else:
                         val = sol.get((ni, di), '')
-                        new_fixed_req[(ni, di)] = val.upper() if val else 'x'
-
-                st.session_state.fixed_shift_requests = new_fixed_req
-                combined_req = refresh_combined_shift_requests()
-
-                # 모든 날이 hard-coded 된 의사는 shift_counts 자동 계산
-                new_shift_counts = dict(st.session_state.shift_counts)
-                for ni, row_label in editor_row_order:
-                    total_fixed = sum(
-                        1 for di in range(num_days)
-                        if combined_req.get((ni, di), '') in ('D', 'E', 'N', 'x', 'a')
-                    )
-                    if total_fixed == num_days:
-                        d_cnt = sum(1 for di in range(num_days) if combined_req.get((ni, di), '') == 'D')
-                        e_cnt = sum(1 for di in range(num_days) if combined_req.get((ni, di), '') == 'E')
-                        n_cnt = sum(1 for di in range(num_days) if combined_req.get((ni, di), '') == 'N')
-                        new_shift_counts[ni] = {"D": d_cnt, "E": e_cnt, "N": n_cnt, "Total": d_cnt + e_cnt + n_cnt}
-                st.session_state.shift_counts = new_shift_counts
-                st.session_state["shift_req_version"] = st.session_state.get("shift_req_version", 0) + 1
-                st.toast(f"🔒 {len(positions)}개 셀 고정 완료!", icon="🔒")
+                        pending_locks[(ni, di)] = val.upper() if val else 'x'
+                    pending_releases.discard((ni, di))
+                st.session_state["pending_result_fixed_locks"] = pending_locks
+                st.session_state["pending_result_fixed_releases"] = pending_releases
+                st.toast(f"🔒 {len(positions)}개 셀을 고정 예정으로 표시했습니다. 저장을 눌러 반영하세요.", icon="🔒")
                 st.rerun()
 
-        if lock_col2.button("🔓 선택 셀 고정 해제", key="btn_lock_release"):
+        if lock_col2.button("🔓 해제 예정", key="btn_lock_release"):
             positions = _selected_to_positions(selected_cells)
             if not positions:
                 st.warning("선택된 셀이 없어요. 해제할 셀을 먼저 클릭해서 선택해주세요.")
             else:
-                released = 0
+                changed = 0
                 for ni, di in positions:
-                    if (ni, di) in st.session_state.fixed_shift_requests:
-                        st.session_state.fixed_shift_requests.pop((ni, di), None)
-                        released += 1
-                refresh_combined_shift_requests()
-                st.session_state["shift_req_version"] = st.session_state.get("shift_req_version", 0) + 1
-                if released > 0:
-                    st.toast(f"🔓 {released}개 셀 고정 해제 완료! 원래 사용자 입력값으로 돌아갑니다.", icon="🔓")
+                    if (ni, di) in pending_locks:
+                        pending_locks.pop((ni, di), None)
+                        changed += 1
+                    elif (ni, di) in st.session_state.fixed_shift_requests:
+                        pending_releases.add((ni, di))
+                        changed += 1
+                st.session_state["pending_result_fixed_locks"] = pending_locks
+                st.session_state["pending_result_fixed_releases"] = pending_releases
+                if changed:
+                    st.toast(f"🔓 {changed}개 셀을 해제 예정으로 표시했습니다. 저장을 눌러 반영하세요.", icon="🔓")
                 else:
-                    st.toast("선택한 셀에는 결과표에서 추가한 fixed layer가 없어요. 원래 사용자 입력값은 근무 요청 탭에서 수정하세요.", icon="ℹ️")
+                    st.toast("선택한 셀에는 저장된 fixed layer가 없어요.", icon="ℹ️")
                 st.rerun()
 
-        lock_col3.caption(
-            "고정은 결과표 위에 fixed layer로 저장됩니다. 해제하면 기존 사용자 입력값(d/en/빈칸 등)이 다시 적용됩니다. "
-            "🔒가 붙은 request 칸은 근무 요청 탭에서도 잠겨 보입니다."
+        if lock_col3.button("저장", key="btn_result_fixed_save"):
+            new_fixed_req = dict(st.session_state.fixed_shift_requests)
+            for pos in pending_releases:
+                new_fixed_req.pop(pos, None)
+            for pos, val in pending_locks.items():
+                new_fixed_req[pos] = val
+            st.session_state.fixed_shift_requests = new_fixed_req
+            combined_req = refresh_combined_shift_requests()
+
+            # 모든 날이 hard-coded 된 의사는 shift_counts 자동 계산
+            new_shift_counts = dict(st.session_state.shift_counts)
+            for ni, row_label in editor_row_order:
+                total_fixed = sum(
+                    1 for di in range(num_days)
+                    if combined_req.get((ni, di), '') in ('D', 'E', 'N', 'x', 'a')
+                )
+                if total_fixed == num_days:
+                    d_cnt = sum(1 for di in range(num_days) if combined_req.get((ni, di), '') == 'D')
+                    e_cnt = sum(1 for di in range(num_days) if combined_req.get((ni, di), '') == 'E')
+                    n_cnt = sum(1 for di in range(num_days) if combined_req.get((ni, di), '') == 'N')
+                    new_shift_counts[ni] = {"D": d_cnt, "E": e_cnt, "N": n_cnt, "Total": d_cnt + e_cnt + n_cnt}
+            st.session_state.shift_counts = new_shift_counts
+            st.session_state["pending_result_fixed_locks"] = {}
+            st.session_state["pending_result_fixed_releases"] = set()
+            st.session_state["shift_req_version"] = st.session_state.get("shift_req_version", 0) + 1
+            st.toast("✅ 결과 고정 변경사항이 저장되었습니다.", icon="✅")
+            st.rerun()
+
+        lock_col4.caption(
+            "결과표 고정/해제는 먼저 예정으로 표시한 뒤 저장을 눌러야 fixed layer에 반영됩니다. "
+            "해제하면 기존 사용자 입력값(d/en/빈칸 등)이 다시 적용됩니다."
         )
 
         # ── 날짜별 duty 구성 요약 ─────────────────────────────────────────────
