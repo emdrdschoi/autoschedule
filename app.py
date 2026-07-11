@@ -319,6 +319,7 @@ def _init_state():
         "solve_failed": False,
         "solve_failure_message": "",
         "diagnostic_results": None,
+        "fixed_counts_editor_pending_df": None,  # 화면에만 반영된 자동계산 preview table
     }
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -582,22 +583,54 @@ def recommended_shift_adj_for_doc(fixed_total: int, annual_count: int, estimated
     return bounded_int(-int(annual_count or 0), 0, -60, 60)
 
 
-def apply_recommended_shift_adj_from_current_inputs() -> tuple[float, int]:
-    """Write recommended shift_adj values into session_state for all doctors."""
-    normalize_shift_counts()
-    annual_counts = get_annual_leave_counts_by_doc()
+def calculate_shift_adj_preview_df(current_df: pd.DataFrame | None) -> tuple[pd.DataFrame, float, int]:
+    """Return a table with recommended shift_adj filled into the visible column.
+
+    This does not save anything to st.session_state.shift_adj or shift_counts.
+    The returned table is a screen preview; users must press 저장 to commit it.
+    """
+    if current_df is None or getattr(current_df, "empty", True):
+        out_df = build_fixed_total_editor_df()
+    else:
+        out_df = current_df.copy()
+
     estimated_average = get_estimated_average_total()
     updated = 0
-    for ni in range(len(st.session_state.get("doctors", []))):
-        sc = st.session_state.shift_counts.get(ni, {})
-        fixed_total = parse_fixed_count_value(sc.get("Total", -1))
-        annual_count = int(annual_counts.get(ni, 0))
-        adj = recommended_shift_adj_for_doc(fixed_total, annual_count, estimated_average)
-        st.session_state.shift_adj[ni] = adj
-        if ni < len(st.session_state.get("doctors", [])):
-            st.session_state.doctors[ni]["shift_adj"] = adj
+    if "근무조정값" not in out_df.columns:
+        out_df["근무조정값"] = 0
+
+    for pos, idx in enumerate(out_df.index):
+        if pos >= len(st.session_state.get("doctors", [])):
+            continue
+        fixed_total = parse_fixed_count_value(out_df.at[idx, "fixed_Total"] if "fixed_Total" in out_df.columns else "")
+        annual_count = bounded_int(out_df.at[idx, "연차(a)"] if "연차(a)" in out_df.columns else 0, 0, 0, 60)
+        out_df.at[idx, "근무조정값"] = recommended_shift_adj_for_doc(fixed_total, annual_count, estimated_average)
         updated += 1
-    return estimated_average, updated
+    return out_df, estimated_average, updated
+
+
+def pending_fixed_total_editor_df_is_valid(pending_df: object, base_df: pd.DataFrame) -> bool:
+    """Check whether a screen-only preview table still matches the current doctor list."""
+    if not isinstance(pending_df, pd.DataFrame):
+        return False
+    if len(pending_df) != len(base_df):
+        return False
+    for col in ("No", "Name"):
+        if col not in pending_df.columns or col not in base_df.columns:
+            return False
+        if list(pending_df[col].astype(str)) != list(base_df[col].astype(str)):
+            return False
+    return True
+
+
+def get_fixed_total_editor_display_df() -> pd.DataFrame:
+    """Use pending auto-calculation preview table if available; otherwise use committed state."""
+    base_df = build_fixed_total_editor_df()
+    pending_df = st.session_state.get("fixed_counts_editor_pending_df")
+    if pending_fixed_total_editor_df_is_valid(pending_df, base_df):
+        return pending_df.copy()
+    st.session_state["fixed_counts_editor_pending_df"] = None
+    return base_df
 
 
 def build_fixed_total_editor_df() -> pd.DataFrame:
@@ -714,12 +747,15 @@ def render_fixed_total_editor_table():
     estimated_average = get_estimated_average_total()
     st.caption(
         "아래 표에서 연차(a) 개수, 근무 조정값과 fixed_D / fixed_E / fixed_N / fixed_Total을 함께 확인/수정합니다. "
-        "연차(a)는 현재 근무 요청의 a 개수입니다. 자동계산 버튼을 누르면 연차(a) 또는 fixed_Total 기준 권장값이 실제 근무조정값 칸에 입력됩니다. "
+        "연차(a)는 현재 근무 요청의 a 개수입니다. 자동계산 버튼을 누르면 연차(a) 또는 fixed_Total 기준 권장값이 화면의 근무조정값 칸에 계산됩니다. 저장을 눌러야 실제 반영됩니다. "
         "fixed count는 빈칸 = 자동 평준화, 0 = 해당 근무 없음, 1 이상 = 그 개수로 고정입니다. "
         f"현재 estimated average는 약 {estimated_average:.1f}개/명입니다."
     )
     key = get_fixed_total_editor_key()
-    df = build_fixed_total_editor_df()
+    df = get_fixed_total_editor_display_df()
+
+    if st.session_state.get("fixed_counts_editor_pending_df") is not None:
+        st.info("자동계산 결과가 화면 표에만 반영되어 있습니다. 실제 설정에 반영하려면 저장을 누르세요.")
 
     with st.form("fixed_counts_editor_form", clear_on_submit=False):
         edited_df = st.data_editor(
@@ -774,17 +810,22 @@ def render_fixed_total_editor_table():
         )
         btn_col1, btn_col2 = st.columns(2)
         with btn_col1:
-            submitted = st.form_submit_button("💾 근무 조정값 / fixed count 저장", use_container_width=True)
+            submitted = st.form_submit_button("저장", use_container_width=True)
         with btn_col2:
-            auto_submitted = st.form_submit_button("↔ 연차/fixed_Total 기준 shift_adj 자동계산 + 저장", use_container_width=True)
+            auto_submitted = st.form_submit_button("자동계산", use_container_width=True)
 
-    if submitted or auto_submitted:
+    if auto_submitted:
+        preview_df, avg, updated = calculate_shift_adj_preview_df(edited_df)
+        st.session_state["fixed_counts_editor_pending_df"] = preview_df
+        st.toast(f"✅ estimated average 약 {avg:.1f}개/명 기준으로 {updated}명의 근무조정값을 화면 표에 계산했습니다. 저장을 눌러야 실제 반영됩니다.", icon="✅")
+        # Recreate the editor using the preview table. Do not commit to solver inputs yet.
+        st.session_state["shift_count_version"] = st.session_state.get("shift_count_version", 0) + 1
+        st.rerun()
+
+    if submitted:
         apply_fixed_total_editor_df(edited_df)
-        if auto_submitted:
-            avg, updated = apply_recommended_shift_adj_from_current_inputs()
-            st.toast(f"✅ estimated average 약 {avg:.1f}개/명 기준으로 {updated}명의 shift_adj를 자동 계산했습니다.", icon="✅")
-        else:
-            st.toast("✅ 근무 조정값과 fixed count가 저장되었습니다.", icon="✅")
+        st.session_state["fixed_counts_editor_pending_df"] = None
+        st.toast("✅ 저장되었습니다.", icon="✅")
         # Recreate the editor from committed values and refresh the summary boxes above.
         st.session_state["shift_count_version"] = st.session_state.get("shift_count_version", 0) + 1
         st.rerun()
@@ -2744,19 +2785,30 @@ with tab4:
         annual_col = summary_display["Name"].map(name_to_annual).fillna(0).astype(int)
         if "연차" in summary_display.columns:
             summary_display = summary_display.drop(columns=["연차"])
+        if "Total+연차" in summary_display.columns:
+            summary_display = summary_display.drop(columns=["Total+연차"])
         insert_at = list(summary_display.columns).index("Total") + 1 if "Total" in summary_display.columns else min(6, len(summary_display.columns))
         summary_display.insert(insert_at, "연차", annual_col)
+        if "Total" in summary_display.columns:
+            total_numeric = pd.to_numeric(summary_display["Total"], errors="coerce").fillna(0).astype(int)
+            summary_display.insert(insert_at + 1, "Total+연차", total_numeric + annual_col)
 
         # Excel export는 화면 이동 때마다 만들지 않고, 아래의 "Excel 준비" 버튼을 눌렀을 때만 생성합니다.
 
         # Summary stats
         st.markdown('<div class="section-label">근무 통계</div>', unsafe_allow_html=True)
-        st.caption("No는 근무 요청/날짜 설정 탭 및 Excel 입력 순서 기준입니다. 연차는 현재 근무 요청의 a 개수 기준으로 표시됩니다.")
+        st.caption("No는 근무 요청/날짜 설정 탭 및 Excel 입력 순서 기준입니다. 연차와 Total+연차는 현재 근무 요청의 a 개수 기준입니다.")
         try:
+            gradient_subsets = [col for col in ['Total', 'Total+연차'] if col in summary_display.columns]
+            styled_summary = summary_display.style
+            if gradient_subsets:
+                styled_summary = styled_summary.background_gradient(subset=gradient_subsets, cmap='Blues')
+            if 'N' in summary_display.columns:
+                styled_summary = styled_summary.background_gradient(subset=['N'], cmap='Purples')
+            if 'Holiday' in summary_display.columns:
+                styled_summary = styled_summary.background_gradient(subset=['Holiday'], cmap='Oranges')
             st.dataframe(
-                summary_display.style.background_gradient(subset=['Total'], cmap='Blues')
-                             .background_gradient(subset=['N'], cmap='Purples')
-                             .background_gradient(subset=['Holiday'], cmap='Oranges'),
+                styled_summary,
                 use_container_width=True, hide_index=True
             )
         except ImportError:
