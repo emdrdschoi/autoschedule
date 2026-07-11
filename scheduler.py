@@ -554,10 +554,25 @@ def build_and_solve(params: dict[str, Any]):
                 model.Add(dev_dn <= k4 * r)
 
     # ── Soft balancing (deviation minimization) ───────────────────────────────
-    k  = model.NewIntVar(0, 6, 'k_DE')
-    k1 = model.NewIntVar(0, 6, 'k1_holiday')
-    k2 = model.NewIntVar(0, 6, 'k2_total')
-    k3 = model.NewIntVar(0, 6, 'k3_N')
+    # 각 balance 항목을 아래쪽/위쪽 편차로 분리한다.
+    # 예: 목표 19~20일 때 19~21은 상방 1, 18~20은 하방 1, 17~22는 하방 2+상방 2로 계산.
+    k_de_low  = model.NewIntVar(0, 6, 'k_DE_low')
+    k_de_high = model.NewIntVar(0, 6, 'k_DE_high')
+    k1_low    = model.NewIntVar(0, 6, 'k1_holiday_low')
+    k1_high   = model.NewIntVar(0, 6, 'k1_holiday_high')
+    k2_low    = model.NewIntVar(0, 6, 'k2_total_low')
+    k2_high   = model.NewIntVar(0, 6, 'k2_total_high')
+    k3_low    = model.NewIntVar(0, 6, 'k3_N_low')
+    k3_high   = model.NewIntVar(0, 6, 'k3_N_high')
+
+    k  = model.NewIntVar(0, 12, 'k_DE_sum')
+    k1 = model.NewIntVar(0, 12, 'k1_holiday_sum')
+    k2 = model.NewIntVar(0, 12, 'k2_total_sum')
+    k3 = model.NewIntVar(0, 12, 'k3_N_sum')
+    model.Add(k  == k_de_low + k_de_high)
+    model.Add(k1 == k1_low + k1_high)
+    model.Add(k2 == k2_low + k2_high)
+    model.Add(k3 == k3_low + k3_high)
 
     for n in all_doctors:
         adj     = balance_shift_adj.get(n, 0)
@@ -589,10 +604,16 @@ def build_and_solve(params: dict[str, Any]):
         sum_tot = model.NewIntVar(0, 12, f'stot_{n}')
         sum_N   = model.NewIntVar(0, 12, f'sN_{n}')
 
-        model.Add(sum_de  == dev_de[0]  + dev_de[1]);  model.Add(sum_de  <= k)
-        model.Add(sum_hol == dev_hol[0] + dev_hol[1]); model.Add(sum_hol <= k1)
-        model.Add(sum_tot == dev_tot[0] + dev_tot[1]); model.Add(sum_tot <= k2)
-        model.Add(sum_N   == dev_N[0]   + dev_N[1]);   model.Add(sum_N   <= k3)
+        model.Add(sum_de  == dev_de[0]  + dev_de[1])
+        model.Add(sum_hol == dev_hol[0] + dev_hol[1])
+        model.Add(sum_tot == dev_tot[0] + dev_tot[1])
+        model.Add(sum_N   == dev_N[0]   + dev_N[1])
+
+        # 하방/상방 편차를 따로 최적화한다. 같은 weight 하나를 (low+high)에 적용한다.
+        model.Add(dev_de[0]  <= k_de_low);   model.Add(dev_de[1]  <= k_de_high)
+        model.Add(dev_hol[0] <= k1_low);     model.Add(dev_hol[1] <= k1_high)
+        model.Add(dev_tot[0] <= k2_low);     model.Add(dev_tot[1] <= k2_high)
+        model.Add(dev_N[0]   <= k3_low);     model.Add(dev_N[1]   <= k3_high)
 
         if is_fully_fixed:
             # 전체 fix → deviation 전부 0, 평준화 제외 (holiday만 유지)
@@ -708,9 +729,17 @@ def build_and_solve(params: dict[str, Any]):
         return {
             "adv": value_fn(adv),
             "k": value_fn(k),
+            "k_low": value_fn(k_de_low),
+            "k_high": value_fn(k_de_high),
             "k1": value_fn(k1),
+            "k1_low": value_fn(k1_low),
+            "k1_high": value_fn(k1_high),
             "k2": value_fn(k2),
+            "k2_low": value_fn(k2_low),
+            "k2_high": value_fn(k2_high),
             "k3": value_fn(k3),
+            "k3_low": value_fn(k3_low),
+            "k3_high": value_fn(k3_high),
             "k4": value_fn(k4),
             "junior_excess": value_fn(junior_excess_total) if junior_excess_vars else 0,
             "junior_penalty": value_fn(junior_penalty) if junior_excess_vars else 0,

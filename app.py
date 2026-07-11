@@ -2817,16 +2817,25 @@ with tab4:
         # 편차 정보 (k (DE), k1 (holiday), k2 (N), k3 (total), k4 (grade))
         if metrics and sol_idx < len(metrics):
             m = metrics[sol_idx]
+            def _side_metric(label, total_key, low_key, high_key, weight_key, default_weight):
+                low = m.get(low_key)
+                high = m.get(high_key)
+                total = m.get(total_key)
+                weight = m.get(weight_key, gr.get(weight_key, default_weight))
+                if low is None or high is None:
+                    return f"| **{label}:** {total}×{weight} "
+                return f"| **{label}:** ↓{low}+↑{high}={total}×{weight} "
+
             st.markdown(
                 f"<div style='font-size:0.85rem; color:var(--text-dim);'>"
                 f"** 편차*가중치 합={m.get('adv')} "
                 f"| **최적 편차:** {m.get('best_adv', m.get('adv'))} "
                 f"| **허용 상한:** {m.get('allowed_adv', m.get('adv'))} "
                 f"| **balance penalty:** {m.get('balance_penalty', 'NA')} "
-                f"| **k D/E:** {m.get('k')}×{m.get('weight_de_dev', gr.get('weight_de_dev', 1))} "
-                f"| **k1 휴일:** {m.get('k1')}×{m.get('weight_holiday_dev', gr.get('weight_holiday_dev', 3))} "
-                f"| **k2 총근무:** {m.get('k2')}×{m.get('weight_total_dev', gr.get('weight_total_dev', 5))} "
-                f"| **k3 N:** {m.get('k3')}×{m.get('weight_n_dev', gr.get('weight_n_dev', 5))} "
+                f"{_side_metric('k D/E', 'k', 'k_low', 'k_high', 'weight_de_dev', 1)}"
+                f"{_side_metric('k1 휴일', 'k1', 'k1_low', 'k1_high', 'weight_holiday_dev', 3)}"
+                f"{_side_metric('k2 총근무', 'k2', 'k2_low', 'k2_high', 'weight_total_dev', 5)}"
+                f"{_side_metric('k3 N', 'k3', 'k3_low', 'k3_high', 'weight_n_dev', 5)}"
                 f"| **k4 Grade편차:** {m.get('k4', 0)} (실제±{round(m.get('k4',0)/10,1)})×{m.get('weight_grade_dev', gr.get('weight_grade_dev', 3))} "
                 f"| **저년차 초과:** {m.get('junior_excess', 0)}×{m.get('junior_penalty_weight', gr.get('junior_penalty_weight', 1))} "
                 f"= **{m.get('junior_penalty', 0)}** "
