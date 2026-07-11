@@ -5,6 +5,7 @@ from io import BytesIO
 from pathlib import Path
 import calendar
 import json
+import math
     
 st.set_page_config(
     page_title="스케줄 최적화",
@@ -392,6 +393,52 @@ def fixed_count_excel_value(value):
     val = parse_fixed_count_value(value)
     return "" if val < 0 else int(val)
 
+
+def round_shift_adj_difference(diff: float) -> int:
+    """Round a fixed_Total - estimated_average difference to an integer shift_adj.
+
+    Differences smaller than 1 duty are ignored.  Otherwise, use ordinary
+    half-away-from-zero rounding so 19 vs 20.7 becomes -2 and 19 vs 20.2
+    becomes -1.
+    """
+    try:
+        diff = float(diff)
+    except (TypeError, ValueError):
+        return 0
+    if abs(diff) < 1.0:
+        return 0
+    if diff >= 0:
+        return int(math.floor(diff + 0.5))
+    return int(math.ceil(diff - 0.5))
+
+
+def get_estimated_average_total() -> float:
+    """Return the simple overall average total duty count per doctor."""
+    doctor_count = len(st.session_state.get("doctors", []))
+    if doctor_count <= 0:
+        return 0.0
+    return get_total_duty_count() / doctor_count
+
+
+def apply_fixed_total_to_shift_adj() -> tuple[float, int]:
+    """Assign shift_adj from fixed_Total for doctors with fixed_Total.
+
+    fixed_Total is a hard total count.  This helper writes the implied difference
+    from the overall estimated average into the visible shift_adj field so the
+    existing balance penalty logic follows that fixed total scale.
+    """
+    normalize_shift_counts()
+    avg = get_estimated_average_total()
+    applied = 0
+    for ni in range(len(st.session_state.get("doctors", []))):
+        fixed_total = int(st.session_state.shift_counts.get(ni, {}).get("Total", -1))
+        if fixed_total >= 0:
+            adj = bounded_int(round_shift_adj_difference(fixed_total - avg), 0, -60, 60)
+            st.session_state.shift_adj[ni] = adj
+            st.session_state.doctors[ni]["shift_adj"] = adj
+            applied += 1
+    return avg, applied
+
 DEFAULT_GRADE_RULES = {
     "senior_min_grade": 2,       # grade >= this is treated as senior
     "senior_min_count": 1,       # hard: at least this many seniors per duty
@@ -564,6 +611,7 @@ def build_fixed_total_editor_df() -> pd.DataFrame:
             "Senior": "Y" if grade >= senior_min_grade else "",
             "Junior": "Y" if grade <= junior_max_grade else "",
             "초저년차": "Y" if grade <= ultra_max_grade else "",
+            "근무조정값": int(st.session_state.shift_adj.get(ni, doc.get("shift_adj", 0))),
             "fixed_D": fixed_count_display_value(sc.get("D", -1)),
             "fixed_E": fixed_count_display_value(sc.get("E", -1)),
             "fixed_N": fixed_count_display_value(sc.get("N", -1)),
@@ -598,6 +646,11 @@ def sync_fixed_total_editor_widget():
             if ni < 0 or ni >= len(st.session_state.get("doctors", [])):
                 continue
             if isinstance(changes, dict):
+                if "근무조정값" in changes:
+                    adj = bounded_int(changes.get("근무조정값"), 0, -60, 60)
+                    st.session_state.shift_adj[ni] = adj
+                    if ni < len(st.session_state.get("doctors", [])):
+                        st.session_state.doctors[ni]["shift_adj"] = adj
                 for col, shift_key in editable_cols:
                     if col in changes:
                         st.session_state.shift_counts[ni][shift_key] = parse_fixed_count_value(changes.get(col))
@@ -626,6 +679,10 @@ def apply_fixed_total_editor_df(edited_df: pd.DataFrame):
     for pos, (_, row) in enumerate(edited_df.iterrows()):
         if pos >= len(st.session_state.get("doctors", [])):
             break
+        if "근무조정값" in edited_df.columns:
+            adj = bounded_int(row.get("근무조정값", st.session_state.shift_adj.get(pos, 0)), 0, -60, 60)
+            st.session_state.shift_adj[pos] = adj
+            st.session_state.doctors[pos]["shift_adj"] = adj
         for col, shift_key in editable_cols:
             if col in edited_df.columns:
                 st.session_state.shift_counts[pos][shift_key] = parse_fixed_count_value(row.get(col, ""))
@@ -639,9 +696,10 @@ def render_fixed_total_editor_table():
     the values to session_state.shift_counts.
     """
     st.caption(
-        "아래 표에서 fixed_D / fixed_E / fixed_N / fixed_Total을 결과 통계 순서 그대로 수정합니다. "
-        "빈칸 = 자동 평준화, 0 = 해당 근무 없음, 1 이상 = 그 개수로 고정입니다. "
-        "여러 칸을 한 번에 수정한 뒤 아래 저장 버튼을 눌러 반영하세요."
+        "아래 표에서 근무 조정값과 fixed_D / fixed_E / fixed_N / fixed_Total을 함께 수정합니다. "
+        "fixed count는 빈칸 = 자동 평준화, 0 = 해당 근무 없음, 1 이상 = 그 개수로 고정입니다. "
+        "여러 칸을 한 번에 수정한 뒤 저장하세요. fixed_Total 기준 자동계산 버튼은 "
+        "fixed_Total이 있는 사람의 근무조정값을 fixed_Total - 전체 평균 근무수 기준으로 채웁니다."
     )
     key = get_fixed_total_editor_key()
     df = build_fixed_total_editor_df()
@@ -660,6 +718,15 @@ def render_fixed_total_editor_table():
                 "Senior": st.column_config.TextColumn("Senior", width="small", disabled=True),
                 "Junior": st.column_config.TextColumn("Junior", width="small", disabled=True),
                 "초저년차": st.column_config.TextColumn("초저년차", width="small", disabled=True),
+                "근무조정값": st.column_config.NumberColumn(
+                    "근무조정값",
+                    width="small",
+                    min_value=-60,
+                    max_value=60,
+                    step=1,
+                    format="%d",
+                    help="근무 평균 목표를 조정합니다. +1은 목표 근무를 1개 늘리고, -1은 1개 줄이는 효과입니다.",
+                ),
                 "fixed_D": st.column_config.TextColumn(
                     "fixed_D",
                     width="small",
@@ -682,13 +749,22 @@ def render_fixed_total_editor_table():
                 ),
             },
         )
-        submitted = st.form_submit_button("💾 fixed count 저장 / 요약에 반영", use_container_width=True)
+        save_col, auto_col = st.columns(2)
+        submitted = save_col.form_submit_button("💾 근무 조정값 / fixed count 저장", use_container_width=True)
+        auto_submitted = auto_col.form_submit_button("↔ fixed_Total 기준 shift_adj 자동계산 + 저장", use_container_width=True)
 
-    if submitted:
+    if submitted or auto_submitted:
         apply_fixed_total_editor_df(edited_df)
+        if auto_submitted:
+            avg, applied = apply_fixed_total_to_shift_adj()
+            st.toast(
+                f"✅ fixed_Total이 있는 {applied}명의 근무조정값을 평균 {avg:.1f} 기준으로 자동계산했습니다.",
+                icon="✅",
+            )
+        else:
+            st.toast("✅ 근무 조정값과 fixed count가 저장되었습니다.", icon="✅")
         # Recreate the editor from committed values and refresh the summary boxes above.
         st.session_state["shift_count_version"] = st.session_state.get("shift_count_version", 0) + 1
-        st.toast("✅ fixed count가 저장되었습니다.", icon="✅")
         st.rerun()
 
 
@@ -726,16 +802,29 @@ def render_fixed_total_duty_summary(num_days: int):
     n_total = sum(st.session_state.duty_requests.get(di, [0, 0, 0])[2] for di in range(num_days))
     remaining = fixed_total_info["remaining"]
     diff_text = f"{remaining:+d}"
+    free_count = int(fixed_total_info.get("free_count", 0))
+    remaining_per_free_text = ""
+    if free_count > 0 and remaining >= 0:
+        remaining_per_free = remaining / free_count
+        remaining_per_free_text = f"약 {remaining_per_free:.1f}개/명"
 
     if fixed_total_info["fixed_count"] == 0:
-        comment = "fixed_total이 지정된 사람이 없습니다. 총근무 수는 자동 평준화됩니다."
+        if free_count > 0:
+            total_per_free = fixed_total_info["total_duty"] / free_count
+            comment = (
+                f"fixed_total이 지정된 사람이 없습니다. 총근무 수는 전체 {free_count}명에게 자동 평준화됩니다 "
+                f"(약 {total_per_free:.1f}개/명)."
+            )
+        else:
+            comment = "fixed_total이 지정된 사람이 없습니다. 총근무 수는 자동 평준화됩니다."
     elif remaining == 0:
         comment = "차이 0: Duty 총합과 fixed_total 합이 정확히 맞습니다."
     elif remaining > 0:
-        if fixed_total_info["free_count"] > 0:
+        if free_count > 0:
             comment = (
                 f"차이 {diff_text}: Duty 총합이 fixed_total 합보다 {remaining}개 많습니다. "
-                f"현재는 fixed_total 미지정 인원 {fixed_total_info['free_count']}명에게 {remaining}개가 자동 배분됩니다. "
+                f"현재는 fixed_total 미지정 인원 {free_count}명에게 {remaining}개가 자동 배분됩니다 "
+                f"({remaining_per_free_text}). "
                 f"모든 인원의 Total을 고정하려면 Duty를 {remaining}개 줄이거나 fixed_total을 {remaining}개 늘리세요."
             )
         else:
@@ -774,7 +863,8 @@ def render_fixed_total_duty_summary(num_days: int):
         elif fixed_total_info["free_count"] == 0 and remaining > 0:
             st.error(f"모든 의사의 fixed_total이 지정되어 있는데 Duty 총합이 fixed_total 합보다 {remaining}개 많습니다. Duty를 {remaining}개 줄이거나 fixed_total을 {remaining}개 늘려야 합니다.")
         elif fixed_total_info["free_count"] > 0 and remaining >= 0:
-            st.info(f"fixed_total이 없는 {fixed_total_info['free_count']}명에게 남은 근무수 {remaining}개가 자동 배분됩니다.")
+            avg_msg = f" (약 {remaining / fixed_total_info['free_count']:.1f}개/명)" if fixed_total_info['free_count'] else ""
+            st.info(f"fixed_total이 없는 {fixed_total_info['free_count']}명에게 남은 근무수 {remaining}개가 자동 배분됩니다{avg_msg}.")
 
 def grade_rules_to_df(grade_rules: dict) -> pd.DataFrame:
     return pd.DataFrame([
@@ -2382,14 +2472,14 @@ with tab3:
     )
 
     st.divider()
-    st.markdown('<div class="section-label">fixed D/E/N/Total / Duty 총합 확인</div>', unsafe_allow_html=True)
-    st.caption("fixed_D/E/N/Total 또는 Duty 필요 인원을 바꾸면 아래 요약이 바로 갱신됩니다.")
+    st.markdown('<div class="section-label">근무 조정값 & fixed D/E/N/Total / Duty 총합 확인</div>', unsafe_allow_html=True)
+    st.caption("근무 조정값과 fixed_D/E/N/Total은 아래 표에서 한 번에 수정한 뒤 저장합니다. Duty 필요 인원과 fixed_Total 요약도 여기서 확인합니다.")
     render_fixed_total_duty_summary(num_days)
     render_fixed_total_editor_table()
 
     st.divider()
     st.markdown('<div class="section-label">개인별 Grade & 근무 규칙 설정</div>', unsafe_allow_html=True)
-    st.caption("7명씩 나눠서 표시됩니다. Grade와 규칙명 옆으로 의사별 설정을 입력하세요.")
+    st.caption("7명씩 나눠서 표시됩니다. Grade와 개인 rule을 입력하세요. 근무 조정값과 fixed count는 위 표에서 수정합니다.")
 
     doc_names = [d["name"] for d in doctors]
     DOC_CHUNK = 7
@@ -2436,19 +2526,7 @@ with tab3:
             )
             doctors[ni]["grade"] = int(new_grade)
 
-        # shift_adj
-        adj_cols = st.columns([2] + [1] * chunk_size)
-        adj_cols[0].markdown("<span style='font-size:0.75rem'>근무 조정값</span>", unsafe_allow_html=True)
-        for ci, ni in enumerate(range(chunk_start, chunk_end)):
-            cur = int(st.session_state.shift_adj.get(ni, doctors[ni].get("shift_adj", 0)))
-            new_val = adj_cols[ci+1].number_input(
-                f"adj_{ni}", min_value=-10, max_value=10,
-                value=cur, label_visibility="collapsed", key=f"shift_adj_{ni}"
-            )
-            st.session_state.shift_adj[ni] = int(new_val)
-            doctors[ni]["shift_adj"] = int(new_val)
-
-        # fixed Total/D/E/N counts are edited in the table above.
+        # 근무 조정값과 fixed Total/D/E/N counts are edited in the table above.
 
         # 규칙 rows
         for key, label, rtype, opt1, opt2 in RULE_DEFS:

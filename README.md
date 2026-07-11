@@ -181,14 +181,15 @@ fixed_total 합
 fixed_total 미지정 인원
 차이
 남은 근무수
+미지정 인원 1명당 자동 배분 예상 개수
 ```
 
-`남은 근무수 = Duty 총합 - fixed_total 합`입니다.
+`남은 근무수 = Duty 총합 - fixed_total 합`입니다. fixed_Total 미지정 인원이 있으면 `남은 근무수 ÷ 미지정 인원 수`를 계산해서 `(약 19.4개/명)`처럼 함께 보여줍니다. 이 값은 fixed_Total을 대략 몇 개로 넣으면 좋을지 판단하는 참고용입니다.
 
 | 상황 | 의미 | 해야 할 일 |
 |---|---|---|
 | 차이 `0` | Duty 총합과 fixed_total 합이 정확히 맞음 | 그대로 진행 가능 |
-| 차이 `+2` | Duty 총합이 fixed_total 합보다 2개 많음 | fixed_Total 없는 인원이 있으면 자동 배분. 모든 인원이 fixed_Total이면 Duty를 2개 줄이거나 fixed_Total을 2개 늘려야 함 |
+| 차이 `+2` | Duty 총합이 fixed_total 합보다 2개 많음 | fixed_Total 없는 인원이 있으면 자동 배분되며, 1명당 예상 개수가 함께 표시됨. 모든 인원이 fixed_Total이면 Duty를 2개 줄이거나 fixed_Total을 2개 늘려야 함 |
 | 차이 `-2` | fixed_total 합이 Duty 총합보다 2개 많음 | Duty를 2개 늘리거나 fixed_Total을 2개 줄여야 함 |
 
 이 요약은 solver를 돌리기 전에 먼저 확인하는 것이 좋습니다. Duty 필요 인원이나 fixed_Total 입력값을 바꾸면 최신 number_input 값을 먼저 동기화한 뒤 계산하므로, 한 박자 늦은 숫자가 보이지 않도록 처리되어 있습니다.
@@ -205,18 +206,20 @@ fixed_total 미지정 인원
 
 ```text
 Duty 총합: 651 (D 217 / E 248 / N 186)
-fixed_total 합: 644
-fixed_total 미지정 인원: 0
-차이: +7
-남은 근무수: 7
+fixed_total 합: 117
+fixed_total 미지정 인원: 29
+차이: +534
+남은 근무수: 534
+💬 현재는 fixed_total 미지정 인원 29명에게 534개가 자동 배분됩니다 (약 18.4개/명).
 ```
 
 해석은 다음과 같습니다.
 
 ```text
-차이 +7
-→ Duty 총합이 fixed_total 합보다 7개 많음
-→ Duty를 7개 줄이거나 fixed_Total을 7개 늘려야 함
+차이 +534
+→ Duty 총합이 fixed_total 합보다 534개 많음
+→ fixed_Total 미지정 인원 29명에게 약 18.4개/명으로 자동 배분됨
+→ 모든 인원의 Total을 고정하려면 Duty를 534개 줄이거나 fixed_Total을 534개 늘려야 함
 
 차이 -7
 → fixed_total 합이 Duty 총합보다 7개 많음
@@ -225,10 +228,10 @@ fixed_total 미지정 인원: 0
 
 이 박스는 저장된 fixed count와 현재 Duty 필요 인원을 기준으로 계산됩니다. fixed count 표를 여러 칸 수정한 뒤에는 아래의 `fixed count 저장 / 요약에 반영` 버튼을 눌러야 요약, solve, 진단 입력값에 반영됩니다.
 
-요약 박스 바로 아래에는 `fixed_D / fixed_E / fixed_N / fixed_Total` 편집 표가 표시됩니다. 결과 탭의 근무 통계처럼 입력 순서 기준 `No / Name / Grade / Senior / Junior / 초저년차`를 함께 보여주고, 고정값 네 칸을 직접 수정할 수 있습니다.
+요약 박스 바로 아래에는 근무 조정값과 `fixed_D / fixed_E / fixed_N / fixed_Total` 편집 표가 표시됩니다. 결과 탭의 근무 통계처럼 입력 순서 기준 `No / Name / Grade / Senior / Junior / 초저년차`를 함께 보여주고, `근무조정값`과 고정값 네 칸을 직접 수정할 수 있습니다.
 
 ```text
-No | Name | Grade | Senior | Junior | 초저년차 | fixed_D | fixed_E | fixed_N | fixed_Total
+No | Name | Grade | Senior | Junior | 초저년차 | 근무조정값 | fixed_D | fixed_E | fixed_N | fixed_Total
 ```
 
 `fixed_D / fixed_E / fixed_N / fixed_Total` 값의 의미는 다음과 같습니다.
@@ -241,7 +244,7 @@ No | Name | Grade | Senior | Junior | 초저년차 | fixed_D | fixed_E | fixed_N
 
 이전 버전과의 호환을 위해 Excel에 `-1`이 들어 있어도 자동 평준화로 읽지만, 앱 화면과 새로 저장되는 Excel에서는 자동값을 빈칸으로 표시합니다.
 
-이 표는 form 안에 있으므로 칸을 하나하나 바꿀 때마다 즉시 반영/갱신되지 않습니다. 여러 칸을 수정하거나 Excel에서 복사해 붙여넣은 뒤 `💾 fixed count 저장 / 요약에 반영` 버튼을 누르면 그때 한 번에 저장되고, 위의 `Duty 총합 / fixed_total 합 / 차이 / 남은 근무수` 요약과 solve/진단 입력값에 반영됩니다. 기존처럼 아래 개인별 규칙 영역에 D/E/N 고정 줄을 따로 두지 않고, 이 표에서 한 번에 관리합니다.
+이 표는 form 안에 있으므로 칸을 하나하나 바꿀 때마다 즉시 반영/갱신되지 않습니다. 여러 칸을 수정하거나 Excel에서 복사해 붙여넣은 뒤 `💾 근무 조정값 / fixed count 저장` 버튼을 누르면 그때 한 번에 저장되고, 위의 `Duty 총합 / fixed_total 합 / 차이 / 남은 근무수` 요약과 solve/진단 입력값에 반영됩니다. 기존처럼 아래 개인별 규칙 영역에 근무 조정값이나 D/E/N 고정 줄을 따로 두지 않고, 이 표에서 한 번에 관리합니다.
 
 ### 6.2 Grade 정책 설정
 
@@ -849,7 +852,7 @@ Lee      fixed_N       7        5               2
 
 ## 최근 수정: fixed count 편집표 즉시 반영
 
-개인 규칙 / Grade 탭의 fixed count 편집표에서 `fixed_D`, `fixed_E`, `fixed_N`, `fixed_Total`을 수정한 뒤 바로 스케줄 생성 또는 진단모드를 실행해도, 최신 값이 계산에 반영되도록 보강했습니다.
+개인 규칙 / Grade 탭의 fixed count 편집표에서 `근무조정값`, `fixed_D`, `fixed_E`, `fixed_N`, `fixed_Total`을 수정한 뒤 저장하면, 최신 값이 스케줄 생성과 진단모드 계산에 반영되도록 보강했습니다.
 
 수정 내용:
 
@@ -859,3 +862,64 @@ Lee      fixed_N       7        5               2
 - Streamlit `data_editor`의 edit-delta 형식과 DataFrame 형식을 모두 안전하게 처리합니다.
 
 이제 fixed count 표에서 값을 바꾼 뒤 바로 `스케줄 생성`을 눌러도 이전 값으로 계산되는 문제가 줄어듭니다.
+
+
+### 최신 변경: 미지정 인원 1명당 자동 배분 예상치 표시
+
+Duty 총합과 fixed_total 합의 차이가 양수이고 fixed_Total 미지정 인원이 있으면, 요약 문구에 `(약 N.N개/명)`을 함께 표시합니다. 예를 들어 `534개 / 29명 = 약 18.4개/명`처럼 보여주므로, 미지정 인원에게 fixed_Total을 대략 몇 개로 넣으면 좋을지 판단하기 쉽습니다.
+
+
+## 최근 수정: 근무 조정값을 fixed count 편집표에 통합
+
+개인 규칙 / Grade 탭의 `fixed D/E/N/Total / Duty 총합 확인` 영역에서, `초저년차` 컬럼과 `fixed_D` 컬럼 사이에 `근무조정값` 컬럼을 추가했습니다.
+
+```text
+No | Name | Grade | Senior | Junior | 초저년차 | 근무조정값 | fixed_D | fixed_E | fixed_N | fixed_Total
+```
+
+이제 근무 조정값과 fixed count를 한 표에서 같이 수정한 뒤 `💾 근무 조정값 / fixed count 저장` 버튼으로 한 번에 반영합니다. 아래 개인별 rule 표에서는 중복을 피하기 위해 근무 조정값 입력줄을 제거했습니다.
+
+## 최신 변경: fixed_Total 기준 근무조정값 자동계산
+
+`fixed_Total`을 입력한 사람은 필요할 때 실제 `근무조정값` 칸에 자동 보정값을 채울 수 있습니다.
+
+개인 규칙 / Grade 탭의 fixed count 편집표 아래에 버튼이 추가되었습니다.
+
+```text
+↔ fixed_Total 기준 shift_adj 자동계산 + 저장
+```
+
+이 버튼을 누르면 먼저 표의 `fixed_D / fixed_E / fixed_N / fixed_Total` 값을 저장한 뒤, `fixed_Total`이 있는 사람만 대상으로 다음 값을 계산해 실제 `근무조정값`에 입력합니다.
+
+```text
+estimated average = Duty 총합 ÷ 전체 의사 수
+근무조정값 = fixed_Total - estimated average
+```
+
+차이가 1개 미만이면 0으로 처리하고, 1개 이상 차이가 날 때는 가장 가까운 정수로 반영합니다.
+
+예:
+
+```text
+Duty 총합 = 651
+의사 수 = 31
+estimated average ≈ 21.0
+
+fixed_Total = 19
+→ 근무조정값 = -2
+
+fixed_Total = 5
+→ 근무조정값 = -16
+```
+
+의미:
+
+```text
+평균보다 적게 fixed_Total을 넣은 사람
+→ 근무조정값이 음수로 들어가 holiday / D / E / N balance target도 자연스럽게 낮아짐
+
+평균보다 많이 fixed_Total을 넣은 사람
+→ 근무조정값이 양수로 들어가 balance target이 높아짐
+```
+
+이 기능은 자동 버튼을 눌렀을 때만 실행됩니다. 기존 근무조정값을 직접 유지하고 싶으면 일반 `💾 근무 조정값 / fixed count 저장` 버튼만 누르면 됩니다.
