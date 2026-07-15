@@ -2260,8 +2260,6 @@ with st.sidebar:
         st.session_state["trigger_solve"] = True
         st.rerun()
 
-    i
-
     st.caption("by DS Choi 2026.03.19")
 
 
