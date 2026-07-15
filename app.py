@@ -2257,19 +2257,10 @@ with st.sidebar:
     # Schedule generation button: two-step confirmation so users save forms first.
     st.caption("스케줄 생성은 각 탭에서 저장된 설정만 사용합니다.")
     if st.button("🚀 스케줄 생성", use_container_width=True, key="btn_solve"):
-        st.session_state["solve_confirm_pending"] = True
+        st.session_state["trigger_solve"] = True
         st.rerun()
 
-    if st.session_state.get("solve_confirm_pending"):
-        st.warning("변경한 탭을 저장했나요? 저장된 설정으로 스케줄을 생성합니다.")
-        solve_c1, solve_c2 = st.columns(2)
-        if solve_c1.button("생성", use_container_width=True, key="btn_solve_confirm"):
-            st.session_state["solve_confirm_pending"] = False
-            st.session_state["trigger_solve"] = True
-            st.rerun()
-        if solve_c2.button("취소", use_container_width=True, key="btn_solve_cancel"):
-            st.session_state["solve_confirm_pending"] = False
-            st.rerun()
+    i
 
     st.caption("by DS Choi 2026.03.19")
 
