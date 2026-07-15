@@ -2876,6 +2876,52 @@ with tab4:
 
         st.divider()
 
+        # Navigator (schedule grid 아래)
+        nav_col1, nav_col2, nav_col3, nav_col4, nav_col5 = st.columns([1,1,2,2,1])
+        if nav_col1.button("◀ 이전", key="nav_prev") and sol_idx > 0:
+            st.session_state.sol_idx -= 1
+            st.rerun()
+        if nav_col2.button("다음 ▶", key="nav_next") and sol_idx < total - 1:
+            st.session_state.sol_idx += 1
+            st.rerun()
+        nav_col3.markdown(f"<div style='font-family:var(--mono);font-size:0.85rem;padding-top:0.4rem'>솔루션 <strong style='color:var(--accent)'>{sol_idx+1}</strong> / {total}</div>", unsafe_allow_html=True)
+        jump = nav_col4.number_input("이동", min_value=1, max_value=total, value=sol_idx+1, key="nav_jump", label_visibility="collapsed")
+        if int(jump) - 1 != sol_idx:
+            st.session_state.sol_idx = int(jump) - 1
+            st.rerun()
+
+        prepared = st.session_state.get("prepared_excel_export")
+        prepared_matches_current = prepared and prepared.get("sol_idx") == sol_idx
+
+        if nav_col5.button("Excel 준비", use_container_width=True, key=f"prepare_excel_{sol_idx}"):
+            excel_bytes = build_schedule_excel_bytes(
+                doctors=doctors,
+                num_days=num_days,
+                start_date=start_date,
+                sol=sol,
+                summary_display=summary_display,
+                metrics=metrics,
+                sol_idx=sol_idx,
+                display_order=display_order,
+            )
+            st.session_state.prepared_excel_export = {
+                "sol_idx": sol_idx,
+                "filename": f"schedule_{sol_idx+1}.xlsx",
+                "bytes": excel_bytes,
+            }
+            prepared = st.session_state.prepared_excel_export
+            prepared_matches_current = True
+
+        if prepared_matches_current:
+            nav_col5.download_button(
+                "다운로드",
+                data=prepared["bytes"],
+                file_name=prepared["filename"],
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                use_container_width=True,
+                key=f"download_excel_{sol_idx}",
+            )
+
         # ── 통합 근무표: 표시 + 셀 선택/고정 ────────────────────────────────
         st.markdown('<div class="section-label">근무 일정표 / 셀 선택 & 고정</div>', unsafe_allow_html=True)
         st.caption(
@@ -3128,51 +3174,7 @@ with tab4:
         else:
             st.dataframe(duty_summary_df, use_container_width=True, hide_index=True)
 
-        # Navigator (schedule grid 아래)
-        nav_col1, nav_col2, nav_col3, nav_col4, nav_col5 = st.columns([1,1,2,2,1])
-        if nav_col1.button("◀ 이전", key="nav_prev") and sol_idx > 0:
-            st.session_state.sol_idx -= 1
-            st.rerun()
-        if nav_col2.button("다음 ▶", key="nav_next") and sol_idx < total - 1:
-            st.session_state.sol_idx += 1
-            st.rerun()
-        nav_col3.markdown(f"<div style='font-family:var(--mono);font-size:0.85rem;padding-top:0.4rem'>솔루션 <strong style='color:var(--accent)'>{sol_idx+1}</strong> / {total}</div>", unsafe_allow_html=True)
-        jump = nav_col4.number_input("이동", min_value=1, max_value=total, value=sol_idx+1, key="nav_jump", label_visibility="collapsed")
-        if int(jump) - 1 != sol_idx:
-            st.session_state.sol_idx = int(jump) - 1
-            st.rerun()
 
-        prepared = st.session_state.get("prepared_excel_export")
-        prepared_matches_current = prepared and prepared.get("sol_idx") == sol_idx
-
-        if nav_col5.button("Excel 준비", use_container_width=True, key=f"prepare_excel_{sol_idx}"):
-            excel_bytes = build_schedule_excel_bytes(
-                doctors=doctors,
-                num_days=num_days,
-                start_date=start_date,
-                sol=sol,
-                summary_display=summary_display,
-                metrics=metrics,
-                sol_idx=sol_idx,
-                display_order=display_order,
-            )
-            st.session_state.prepared_excel_export = {
-                "sol_idx": sol_idx,
-                "filename": f"schedule_{sol_idx+1}.xlsx",
-                "bytes": excel_bytes,
-            }
-            prepared = st.session_state.prepared_excel_export
-            prepared_matches_current = True
-
-        if prepared_matches_current:
-            nav_col5.download_button(
-                "다운로드",
-                data=prepared["bytes"],
-                file_name=prepared["filename"],
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-                use_container_width=True,
-                key=f"download_excel_{sol_idx}",
-            )
 
         st.divider()
         st.markdown('<div class="section-label">범례</div>', unsafe_allow_html=True)
