@@ -49,6 +49,14 @@ def _parse_shift_wish(cell: str):
     return ('D' in cell, 'E' in cell, 'N' in cell)
 
 
+def _parse_actual_shift(cell: str):
+    """Return worked D/E/N flags from an already-completed schedule cell."""
+    c = str(cell or '').strip().upper().replace(' ', '')
+    if c in {'', 'A', 'O', 'OFF', 'X', '-', 'NONE', 'NAN'}:
+        return (False, False, False)
+    return ('D' in c, 'E' in c, 'N' in c)
+
+
 def build_and_solve(params: dict[str, Any]):
     """
     Main entry-point called from app.py.
@@ -60,6 +68,8 @@ def build_and_solve(params: dict[str, Any]):
         day_types     : dict {str(day_idx) -> '평일'|'토'|'일'|'공'}
         duty_requests : dict {str(day_idx) -> [D, E, N]}
         shift_requests: dict {"n,d" -> cell_str}
+        previous_schedule: dict {"n,h" -> actual shift}, h=0 oldest of preceding days
+        previous_schedule_days: int (default 5)
         rules         : dict {str(n) -> {rule_key: value}}
         shift_adj     : dict {str(n) -> int}
         grades        : dict {str(n) -> int}
@@ -83,6 +93,8 @@ def build_and_solve(params: dict[str, Any]):
     day_types    = {int(k): v for k, v in params["day_types"].items()}
     duty_req_raw = {int(k): list(v) for k, v in params["duty_requests"].items()}
     sr_raw       = params["shift_requests"]   # {"n,d": cell_str}
+    previous_schedule_days = max(0, int(params.get("previous_schedule_days", 5)))
+    previous_schedule_raw = params.get("previous_schedule", {}) or {}
     rules_raw    = {int(k): v for k, v in params["rules"].items()}
     shift_adj    = {int(k): int(v) for k, v in params["shift_adj"].items()}
     # shift_counts: {n: {"D": -1|int, "E": -1|int, "N": -1|int}}, -1 = auto balance
@@ -129,6 +141,21 @@ def build_and_solve(params: dict[str, Any]):
     all_doctors = range(num_doctors)
     all_days    = range(num_days)
     all_shifts  = range(num_shifts)
+
+    # Previous schedule is fixed historical context only. It does not contribute
+    # to current-month duty counts or balancing, but sequence rules can span the boundary.
+    previous_schedule = [[[0] * num_shifts for _ in range(previous_schedule_days)] for _ in all_doctors]
+    for key, cell in previous_schedule_raw.items():
+        try:
+            n_str, h_str = str(key).split(",", 1)
+            n, h = int(n_str), int(h_str)
+        except (TypeError, ValueError):
+            continue
+        if not (0 <= n < num_doctors and 0 <= h < previous_schedule_days):
+            continue
+        flags = _parse_actual_shift(cell)
+        for s in all_shifts:
+            previous_schedule[n][h][s] = int(flags[s])
 
     # Existing/old configs may not have grade values. Default grade 2 keeps legacy schedules feasible.
     for n in all_doctors:
@@ -315,6 +342,38 @@ def build_and_solve(params: dict[str, Any]):
             for s in all_shifts:
                 shifts[(n, d, s)] = model.NewBoolVar(f"s_{n}_{d}_{s}")
 
+    # Fixed BoolVars for the already-completed preceding days let the same CP-SAT
+    # sequence expressions span the month boundary without counting history as demand.
+    history_shifts = {}
+    for n in all_doctors:
+        for h in range(previous_schedule_days):
+            for s in all_shifts:
+                var = model.NewBoolVar(f"hist_{n}_{h}_{s}")
+                model.Add(var == previous_schedule[n][h][s])
+                history_shifts[(n, h, s)] = var
+
+    timeline_len = previous_schedule_days + num_days
+    current_offset = previous_schedule_days
+
+    def timeline_shift(n: int, t: int, s: int):
+        if t < current_offset:
+            return history_shifts[(n, t, s)]
+        return shifts[(n, t - current_offset, s)]
+
+    def sequence_window_starts(window_len: int):
+        """Starts of windows that contain at least one current-month day."""
+        if window_len <= 0 or timeline_len < window_len:
+            return range(0)
+        first = max(0, current_offset - window_len + 1)
+        return range(first, timeline_len - window_len + 1)
+
+    timeline_worked = {}
+    for n in all_doctors:
+        for t in range(timeline_len):
+            worked = model.NewBoolVar(f"worked_timeline_{n}_{t}")
+            model.AddMaxEquality(worked, [timeline_shift(n, t, s) for s in all_shifts])
+            timeline_worked[(n, t)] = worked
+
     # ── Hard constraints ──────────────────────────────────────────────────────
 
     # Per-doctor rules
@@ -327,10 +386,10 @@ def build_and_solve(params: dict[str, Any]):
         r6        = get_rule(n, "rule_max_shifts_per_week", 0)
         r7        = get_rule(n, "rule_no_3day_consec", 1)
         n_max     = get_rule(n, "rule_n_block_max", 1)   # Max N block length (1/2/3)
-        n_rest    = get_rule(n, "rule_n_rest", 1)         # Mandatory rest days after N-block
-        n_gap     = get_rule(n, "rule_n_gap", 0)          # Min gap before next N after N-block
+        n_rest    = get_rule(n, "rule_n_rest", 1)        # Mandatory rest days after N-block
+        n_gap     = get_rule(n, "rule_n_gap", 0)         # Min gap before next N after N-block
 
-        # rule0: max shifts per day
+        # rule0: max shifts per day (current month); the 2-day cap spans history.
         if r0 == 1:
             for d in all_days:
                 model.AddAtMostOne(shifts[(n,d,s)] for s in all_shifts)
@@ -341,105 +400,105 @@ def build_and_solve(params: dict[str, Any]):
             if r0 == 4:
                 for d in [x for x in all_days if x not in holiday]:
                     model.AddAtMostOne(shifts[(n,d,s)] for s in all_shifts)
-            for d in range(num_days - 1):
-                model.Add(sum(shifts[(n,d+p,s)] for p in range(2) for s in all_shifts) < 4)
+            for t in sequence_window_starts(2):
+                model.Add(sum(timeline_shift(n, t+p, s) for p in range(2) for s in all_shifts) < 4)
         elif r0 in (3, 5):
             for d in all_days:
                 model.AddBoolOr([shifts[(n,d,0)].Not(), shifts[(n,d,1)], shifts[(n,d,2)].Not()])
             if r0 == 5:
                 for d in [x for x in all_days if x not in holiday]:
                     model.AddAtMostOne(shifts[(n,d,s)] for s in all_shifts)
-            for d in range(num_days - 1):
-                model.Add(sum(shifts[(n,d+p,s)] for p in range(2) for s in all_shifts) < 4)
+            for t in sequence_window_starts(2):
+                model.Add(sum(timeline_shift(n, t+p, s) for p in range(2) for s in all_shifts) < 4)
 
         # ── N-block constraints ───────────────────────────────────────────────
-        # n_max  : N 연속 최대 허용 길이 (1=NN불가, 2=NNN불가, 3=NNNN불가)
-        # n_rest : N뭉치 끝난 후 완전 Off 의무일 수
-        # n_gap  : N뭉치 끝난 날로부터 총 며칠 후 N이 가능한지 (n_gap >= n_rest)
-        #
-        # 예) n_max=2, n_rest=2, n_gap=3
-        #   N N | O O | D/E가능 | N가능  (3일째부터 N)
-
-        # 1) Max N block length: (n_max+1)개 연속 N 금지
+        # All windows containing a current day include the fixed previous schedule.
         block_len = n_max + 1
-        if block_len <= num_days:
-            for d in range(num_days - block_len + 1):
-                model.Add(
-                    sum(shifts[(n, d+i, 2)] for i in range(block_len)) < block_len
-                )
+        for t in sequence_window_starts(block_len):
+            model.Add(sum(timeline_shift(n, t+i, 2) for i in range(block_len)) < block_len)
 
-        # 2) 뭉치 끝 지점(e) 감지: N[e]=True AND (e==마지막날 OR N[e+1]=False)
-        #    → end+1..end+n_rest: 완전 Off
-        #    → end+n_rest+1..end+n_gap: N만 금지
-        #
-        #    "N[e]=T and N[e+1]=F → 제약" 을
-        #    CP-SAT 로: AddBoolOr([N[e].Not, N[e+1], shifts[dd,s].Not])
-        #    마지막 날(e=num_days-1): AddBoolOr([N[e].Not, shifts[dd,s].Not])
-
-        for e in range(num_days):  # e = 뭉치 마지막 날 후보
-            # 완전 휴무
+        # Detect an N-block end anywhere in the available history/current timeline.
+        # Only consequences landing in the current month are added.
+        for e in range(timeline_len):
             for r in range(1, n_rest + 1):
                 dd = e + r
-                if dd >= num_days:
+                if dd >= timeline_len:
                     break
+                if dd < current_offset:
+                    continue
                 for s in all_shifts:
-                    if e + 1 < num_days:
-                        # N[e]=T and N[e+1]=F → shifts[dd,s]=F
-                        model.AddBoolOr([shifts[(n,e,2)].Not(), shifts[(n,e+1,2)], shifts[(n,dd,s)].Not()])
+                    if e + 1 < timeline_len:
+                        model.AddBoolOr([
+                            timeline_shift(n,e,2).Not(),
+                            timeline_shift(n,e+1,2),
+                            timeline_shift(n,dd,s).Not(),
+                        ])
                     else:
-                        # 마지막날 N이면 무조건
-                        model.AddBoolOr([shifts[(n,e,2)].Not(), shifts[(n,dd,s)].Not()])
+                        model.AddBoolOr([timeline_shift(n,e,2).Not(), timeline_shift(n,dd,s).Not()])
 
-            # N만 금지
             for g in range(n_rest + 1, n_gap + 1):
                 dd = e + g
-                if dd >= num_days:
+                if dd >= timeline_len:
                     break
-                if e + 1 < num_days:
-                    model.AddBoolOr([shifts[(n,e,2)].Not(), shifts[(n,e+1,2)], shifts[(n,dd,2)].Not()])
+                if dd < current_offset:
+                    continue
+                if e + 1 < timeline_len:
+                    model.AddBoolOr([
+                        timeline_shift(n,e,2).Not(),
+                        timeline_shift(n,e+1,2),
+                        timeline_shift(n,dd,2).Not(),
+                    ])
                 else:
-                    model.AddBoolOr([shifts[(n,e,2)].Not(), shifts[(n,dd,2)].Not()])
+                    model.AddBoolOr([timeline_shift(n,e,2).Not(), timeline_shift(n,dd,2).Not()])
 
-        # rule2: no D after E
+        # rule2: no D after E, including previous-month final day -> current day 1.
         if r2:
-            for d in range(num_days - 1):
-                model.Add(shifts[(n,d+1,0)] == 0).OnlyEnforceIf(shifts[(n,d,1)])
+            for t in sequence_window_starts(2):
+                model.Add(timeline_shift(n,t+1,0) == 0).OnlyEnforceIf(timeline_shift(n,t,1))
 
-        # rule3: no EEE
+        # rule3: no EEE across the boundary.
         if r3:
-            for d in range(num_days - 2):
-                model.AddBoolOr([shifts[(n,d,1)].Not(), shifts[(n,d+1,1)].Not(), shifts[(n,d+2,1)].Not()])
+            for t in sequence_window_starts(3):
+                model.AddBoolOr([
+                    timeline_shift(n,t,1).Not(),
+                    timeline_shift(n,t+1,1).Not(),
+                    timeline_shift(n,t+2,1).Not(),
+                ])
 
-        # rule4: no 3 evenings in 4 days
+        # rule4: preserve the original two forbidden 3-in-4 E patterns, now cross-boundary.
         if r4:
-            for d in range(num_days - 3):
-                model.AddBoolOr([shifts[(n,d,1)].Not(), shifts[(n,d+1,1)].Not(), shifts[(n,d+2,1)], shifts[(n,d+3,1)].Not()])
-                model.AddBoolOr([shifts[(n,d,1)].Not(), shifts[(n,d+1,1)], shifts[(n,d+2,1)].Not(), shifts[(n,d+3,1)].Not()])
+            for t in sequence_window_starts(4):
+                model.AddBoolOr([
+                    timeline_shift(n,t,1).Not(),
+                    timeline_shift(n,t+1,1).Not(),
+                    timeline_shift(n,t+2,1),
+                    timeline_shift(n,t+3,1).Not(),
+                ])
+                model.AddBoolOr([
+                    timeline_shift(n,t,1).Not(),
+                    timeline_shift(n,t+1,1),
+                    timeline_shift(n,t+2,1).Not(),
+                    timeline_shift(n,t+3,1).Not(),
+                ])
 
-        # rule5: max consecutive working days
-        # r5 means "up to r5 consecutive working days are allowed".
-        # Therefore we forbid any (r5 + 1)-day window in which all days are worked.
-        # Example: r5=6 allows 6 consecutive working days, but not 7.
-        if r5 in (3,4,5,6,7) and num_days >= r5 + 1:
-            for d in range(num_days - r5):
-                worked_days = []
-                for p in range(r5 + 1):
-                    worked = model.NewBoolVar(f"worked_{n}_{d}_{p}")
-                    model.AddMaxEquality(worked, [shifts[(n, d+p, s)] for s in all_shifts])
-                    worked_days.append(worked)
-                model.Add(sum(worked_days) <= r5)
+        # rule5: max consecutive working days across the month boundary.
+        if r5 in (3,4,5,6,7):
+            for t in sequence_window_starts(r5 + 1):
+                model.Add(sum(timeline_worked[(n, t+p)] for p in range(r5 + 1)) <= r5)
 
-        # rule6: max shifts in any 7-day window
-        # r6 means "up to r6 shifts are allowed in a 7-day window".
-        # Example: r6=6 allows 6 shifts, but not 7.
-        if r6 > 0 and num_days >= 7:
-            for d in range(num_days - 6):
-                model.Add(sum(shifts[(n,d+p,s)] for p in range(7) for s in all_shifts) <= r6)
+        # rule6: max shifts in any available 7-day window across the boundary.
+        if r6 > 0:
+            for t in sequence_window_starts(7):
+                model.Add(sum(timeline_shift(n,t+p,s) for p in range(7) for s in all_shifts) <= r6)
 
-        # rule7: no DDD
+        # rule7: no DDD across the boundary.
         if r7:
-            for d in range(num_days - 2):
-                model.AddBoolOr([shifts[(n,d,0)].Not(), shifts[(n,d+1,0)].Not(), shifts[(n,d+2,0)].Not()])
+            for t in sequence_window_starts(3):
+                model.AddBoolOr([
+                    timeline_shift(n,t,0).Not(),
+                    timeline_shift(n,t+1,0).Not(),
+                    timeline_shift(n,t+2,0).Not(),
+                ])
 
     # Duty demand constraints
     for d in all_days:

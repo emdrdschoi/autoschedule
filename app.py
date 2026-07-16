@@ -274,10 +274,15 @@ section[data-testid="stSidebar"] .stButton > button {
 
 # ── Session state init ───────────────────────────────────────────────────────
 def _init_state():
-    # Calculate default start date and number of days for current month
+    # The scheduler normally prepares the following month, so initialize the
+    # calendar from the first day of next month through that month's last day.
     today = date.today()
-    start_of_month = today.replace(day=1)
-    _, last_day = calendar.monthrange(today.year, today.month)
+    if today.month == 12:
+        next_year, next_month = today.year + 1, 1
+    else:
+        next_year, next_month = today.year, today.month + 1
+    start_of_month = date(next_year, next_month, 1)
+    _, last_day = calendar.monthrange(next_year, next_month)
     num_days_in_month = last_day
 
     defaults = {
@@ -289,6 +294,8 @@ def _init_state():
         "shift_requests": {},     # combined view: base_shift_requests + fixed_shift_requests
         "base_shift_requests": {}, # user-entered wanted/cannot schedule
         "fixed_shift_requests": {},# result-cell locks overlaid on top of base requests
+        "previous_schedule": {},  # {(doctor_idx, history_idx 0..4): D/E/N/...}; oldest -> newest
+        "previous_schedule_version": 0,
         "shift_requests1": {},    # legacy key; wishes are parsed from shift_requests
         "rules": {},              # {n: {rule_key: value}}
         "shift_adj": {},          # {n: int}
@@ -1049,6 +1056,88 @@ def parse_start_date_from_duty_index(df_duty: pd.DataFrame, fallback: date) -> d
     except Exception:
         pass
     return fallback
+
+
+PREVIOUS_SCHEDULE_DAYS = 5
+PREVIOUS_SHIFT_OPTIONS = ["", "D", "E", "N", "DE", "DN", "EN", "DEN", "A", "OFF"]
+
+
+def get_previous_schedule_dates(start: date, days: int = PREVIOUS_SCHEDULE_DAYS) -> list[date]:
+    """Return the immediately preceding dates, ordered oldest to newest."""
+    return [start - timedelta(days=days - idx) for idx in range(days)]
+
+
+def normalize_previous_shift_value(value) -> str:
+    """Normalize an already-worked shift value used for cross-month rules."""
+    text = _clean_shift_request_value(value).upper().replace(" ", "")
+    if text in {"", "A", "O", "OFF", "X", "-", "NONE", "NAN"}:
+        return "" if text == "" else ("A" if text == "A" else "OFF")
+    letters = "".join(letter for letter in "DEN" if letter in text)
+    return letters
+
+
+def normalize_previous_schedule():
+    """Keep only valid doctor/history cells and normalized shift values."""
+    raw = st.session_state.get("previous_schedule", {})
+    if not isinstance(raw, dict):
+        raw = {}
+    cleaned = {}
+    doctor_count = len(st.session_state.get("doctors", []))
+    for key, value in raw.items():
+        try:
+            ni, hi = int(key[0]), int(key[1])
+        except (TypeError, ValueError, IndexError):
+            continue
+        if not (0 <= ni < doctor_count and 0 <= hi < PREVIOUS_SCHEDULE_DAYS):
+            continue
+        val = normalize_previous_shift_value(value)
+        if val:
+            cleaned[(ni, hi)] = val
+    st.session_state.previous_schedule = cleaned
+
+
+def build_previous_schedule_df() -> pd.DataFrame:
+    """Build the editable previous-five-day schedule table."""
+    normalize_previous_schedule()
+    dates = get_previous_schedule_dates(st.session_state.start_date)
+    columns = [f"{d.strftime('%Y-%m-%d')} ({get_day_label(d, 0)})" for d in dates]
+    rows = []
+    for ni, doc in enumerate(st.session_state.get("doctors", [])):
+        row = {"No": ni + 1, "Name": doc.get("name", "")}
+        for hi, col in enumerate(columns):
+            row[col] = st.session_state.previous_schedule.get((ni, hi), "")
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def apply_previous_schedule_df(df: pd.DataFrame):
+    """Commit the previous-five-day editor table to session state."""
+    if df is None or df.empty:
+        st.session_state.previous_schedule = {}
+        return
+    date_columns = [c for c in df.columns if c not in {"No", "Name"}]
+    out = {}
+    for pos, (_, row) in enumerate(df.iterrows()):
+        if pos >= len(st.session_state.get("doctors", [])):
+            break
+        for hi, col in enumerate(date_columns[:PREVIOUS_SCHEDULE_DAYS]):
+            val = normalize_previous_shift_value(row.get(col, ""))
+            if val:
+                out[(pos, hi)] = val
+    st.session_state.previous_schedule = out
+
+
+def previous_schedule_to_excel_df() -> pd.DataFrame:
+    """Return the PreviousSchedule sheet with actual date columns."""
+    normalize_previous_schedule()
+    doctor_names = [d.get("name", "") for d in st.session_state.get("doctors", [])]
+    date_columns = [d.strftime('%Y-%m-%d') for d in get_previous_schedule_dates(st.session_state.start_date)]
+    grid = pd.DataFrame("", index=doctor_names, columns=date_columns)
+    grid.index.name = "Name"
+    for (ni, hi), value in st.session_state.previous_schedule.items():
+        if 0 <= ni < len(doctor_names) and 0 <= hi < len(date_columns):
+            grid.iloc[ni, hi] = value
+    return grid
 
 
 HARD_SHIFT_VALUES = {"D", "E", "N", "x", "a"}
@@ -1956,6 +2045,9 @@ with st.sidebar:
     start_d = st.date_input("시작 날짜", value=prev_start, key="sb_start")
     if start_d != prev_start:
         st.session_state.start_date = start_d
+        # A different target month needs a different preceding-five-day history.
+        st.session_state.previous_schedule = {}
+        st.session_state["previous_schedule_version"] = st.session_state.get("previous_schedule_version", 0) + 1
         # start_date가 바뀌면 요일 계산도 다시 (토/일 자동 설정)
         st.session_state.day_types = auto_day_types(start_d, st.session_state.num_days)
 
@@ -2073,12 +2165,14 @@ with st.sidebar:
                 fixed_grid.iloc[doc_idx, day_idx] = val
 
         df_grade_rules = grade_rules_to_df(st.session_state.grade_rules)
+        previous_grid = previous_schedule_to_excel_df()
 
         towrite = BytesIO()
         with pd.ExcelWriter(towrite, engine='openpyxl') as writer:
             pd.DataFrame(st.session_state.doctors).to_excel(writer, sheet_name='Doctors', index=False)
             df_rules.to_excel(writer, sheet_name='Rules')
             df_grade_rules.to_excel(writer, sheet_name='GradeRules', index=False)
+            previous_grid.to_excel(writer, sheet_name='PreviousSchedule')
             df_duty.to_excel(writer, sheet_name='DutyRequests')
             shift_grid.to_excel(writer, sheet_name='ShiftRequests')
             fixed_grid.to_excel(writer, sheet_name='FixedShiftRequests')
@@ -2105,6 +2199,7 @@ with st.sidebar:
                 df_duty = read_config_sheet(xls, 'DutyRequests', index_col=0)
                 df_shift = read_config_sheet(xls, 'ShiftRequests', index_col=0)
                 df_fixed_shift = read_config_sheet(xls, 'FixedShiftRequests', index_col=0)
+                df_previous = read_config_sheet(xls, 'PreviousSchedule', index_col=0)
                 df_grade_rules = read_config_sheet(xls, 'GradeRules')
 
                 # 1) 의사 정보: Doctors 시트가 없거나 grade/shift_adj 컬럼이 없어도 기본값으로 복원
@@ -2122,7 +2217,7 @@ with st.sidebar:
                         adj = safe_int(row_get_any(row, ['shift_adj', 'Shift_adj', '근무 조정값', 'adjustment'], 0), 0, -60, 60)
                         new_doctors.append({"name": name, "shift_adj": adj, "grade": grade})
                 else:
-                    fallback_names = derive_doctor_names_from_old_config(df_rules, df_shift, df_fixed_shift)
+                    fallback_names = derive_doctor_names_from_old_config(df_rules, df_shift, df_fixed_shift, df_previous)
                     new_doctors = [
                         {"name": name, "shift_adj": 0, "grade": DEFAULT_DOCTOR_GRADE}
                         for name in fallback_names
@@ -2212,7 +2307,40 @@ with st.sidebar:
                 st.session_state.day_types = auto_day_types(st.session_state.start_date, st.session_state.num_days)
                 st.session_state["duty_req_version"] = st.session_state.get("duty_req_version", 0) + 1
 
-                # 4) ShiftRequests: 없으면 빈 요청으로 시작. FixedShiftRequests도 optional.
+                # 4) PreviousSchedule: target start date immediately preceding 5 days.
+                # Date-like columns are aligned by date; legacy/non-date columns use the last 5 columns.
+                previous_out = {}
+                if df_previous is not None and not df_previous.empty:
+                    parsed_columns = []
+                    for col_pos, col in enumerate(df_previous.columns):
+                        parsed = pd.to_datetime(col, errors="coerce")
+                        parsed_columns.append((col_pos, parsed.date() if pd.notna(parsed) else None))
+                    wanted_dates = get_previous_schedule_dates(st.session_state.start_date)
+                    date_to_col = {parsed_date: col_pos for col_pos, parsed_date in parsed_columns if parsed_date is not None}
+                    selected_cols = [date_to_col.get(d) for d in wanted_dates]
+                    if not any(col is not None for col in selected_cols):
+                        fallback_cols = list(range(max(0, len(df_previous.columns) - PREVIOUS_SCHEDULE_DAYS), len(df_previous.columns)))
+                        selected_cols = [None] * (PREVIOUS_SCHEDULE_DAYS - len(fallback_cols)) + fallback_cols
+
+                    name_to_doc_idx_prev = {doc['name']: i for i, doc in enumerate(st.session_state.doctors)}
+                    for row_pos, (row_name, row) in enumerate(df_previous.iterrows()):
+                        doc_name = str(row_name).strip()
+                        if doc_name in name_to_doc_idx_prev:
+                            doc_idx = name_to_doc_idx_prev[doc_name]
+                        elif 0 <= row_pos < len(st.session_state.doctors):
+                            doc_idx = row_pos
+                        else:
+                            continue
+                        for hi, col_pos in enumerate(selected_cols):
+                            if col_pos is None or col_pos >= len(row):
+                                continue
+                            val = normalize_previous_shift_value(row.iloc[col_pos])
+                            if val:
+                                previous_out[(doc_idx, hi)] = val
+                st.session_state.previous_schedule = previous_out
+                st.session_state["previous_schedule_version"] = st.session_state.get("previous_schedule_version", 0) + 1
+
+                # 5) ShiftRequests: 없으면 빈 요청으로 시작. FixedShiftRequests도 optional.
                 name_to_doc_idx = {doc['name']: i for i, doc in enumerate(st.session_state.doctors)}
 
                 def _grid_to_shift_dict(df_grid, hard_only=False):
@@ -2269,6 +2397,7 @@ st.markdown('<div class="main-header"><h1>🏥 SHIFT SCHEDULER</h1><p>의료진 
 normalize_doctors()
 normalize_grade_rules()
 normalize_shift_request_layers()
+normalize_previous_schedule()
 
 doctors = st.session_state.doctors
 num_days = st.session_state.num_days
@@ -2288,7 +2417,7 @@ if not st.session_state.duty_requests or len(st.session_state.duty_requests) != 
     st.session_state.duty_requests = {i: [1, 1, 1] for i in range(st.session_state.num_days)}
 
 st.info("각 탭의 변경사항은 저장 버튼을 눌러야 반영됩니다. 스케줄 생성 전에는 관련 탭을 저장했는지 확인하세요.")
-tab1, tab2, tab3, tab4 = st.tabs(["📅 근무 요청 / 날짜 설정", "📋 Duty 설정", "⚙ 개인 규칙 / Grade", "📊 결과"])
+tab1, tab2, tab3, tab4, tab5 = st.tabs(["📅 근무 요청 / 날짜 설정", "📋 Duty 설정", "⚙ 개인 규칙 / Grade", "⏮ 직전 5일 스케줄", "📊 결과"])
 
 # ─────────────────────────────────────────────────────────────────────────────
 # TAB 1: Shift requests + Day types
@@ -2463,6 +2592,12 @@ for ni in range(len(doctors)):
         st.session_state.shift_adj[ni] = 0
 
 with tab3:
+    st.markdown('<div class="section-label">근무 조정값 & fixed D/E/N/Total / Duty 총합 확인</div>', unsafe_allow_html=True)
+    st.caption("fixed schedule 관련 표를 rule 화면의 가장 위에 배치했습니다. 근무 조정값과 fixed_D/E/N/Total을 한 번에 수정할 수 있습니다.")
+    render_fixed_total_duty_summary(num_days)
+    render_fixed_total_editor_table()
+    st.divider()
+
     with st.form("grade_rule_settings_form", clear_on_submit=False):
         save_grade_rule_settings = st.form_submit_button("저장", use_container_width=True)
         st.caption("Grade 정책, 가중치, 개인별 Grade/규칙은 여러 항목을 수정한 뒤 저장을 눌러야 실제 설정에 반영됩니다.")
@@ -2648,11 +2783,46 @@ with tab3:
         st.toast("✅ 개인 규칙 / Grade 설정이 저장되었습니다.", icon="✅")
         st.rerun()
 
-    st.divider()
-    st.markdown('<div class="section-label">근무 조정값 & fixed D/E/N/Total / Duty 총합 확인</div>', unsafe_allow_html=True)
-    st.caption("근무 조정값과 fixed_D/E/N/Total은 아래 표에서 한 번에 수정한 뒤 저장합니다. Duty 필요 인원과 fixed_Total 요약도 여기서 확인합니다.")
-    render_fixed_total_duty_summary(num_days)
-    render_fixed_total_editor_table()
+# ─────────────────────────────────────────────────────────────────────────────
+# TAB 4: Previous five days for cross-month rule continuity
+# ─────────────────────────────────────────────────────────────────────────────
+with tab4:
+    st.markdown('<div class="section-label">직전 5일 실제 스케줄</div>', unsafe_allow_html=True)
+    previous_dates = get_previous_schedule_dates(start_date)
+    st.caption(
+        f"{previous_dates[0].strftime('%Y-%m-%d')}부터 {previous_dates[-1].strftime('%Y-%m-%d')}까지의 실제 근무를 입력하세요. "
+        "이 값은 이번 달 근무수에는 포함되지 않고, 월 경계를 넘는 연속근무/E→D/N-rest/7일 구간 rule에만 사용됩니다. "
+        "빈칸·A·OFF는 근무 없음으로 처리됩니다."
+    )
+    with st.form("previous_schedule_form", clear_on_submit=False):
+        save_previous_schedule = st.form_submit_button("저장", use_container_width=True)
+        previous_df = st.data_editor(
+            build_previous_schedule_df(),
+            hide_index=True,
+            use_container_width=True,
+            key=f"previous_schedule_editor_v{st.session_state.get('previous_schedule_version', 0)}",
+            disabled=["No", "Name"],
+            column_config={
+                "No": st.column_config.NumberColumn("No", width="small", disabled=True),
+                "Name": st.column_config.TextColumn("Name", width="medium", disabled=True),
+                **{
+                    col: st.column_config.SelectboxColumn(
+                        col,
+                        options=PREVIOUS_SHIFT_OPTIONS,
+                        required=False,
+                        width="small",
+                        help="실제 근무: D/E/N/DE/DN/EN/DEN. A/OFF/빈칸은 근무 없음",
+                    )
+                    for col in build_previous_schedule_df().columns
+                    if col not in {"No", "Name"}
+                },
+            },
+        )
+    if save_previous_schedule:
+        apply_previous_schedule_df(previous_df)
+        st.session_state["previous_schedule_version"] = st.session_state.get("previous_schedule_version", 0) + 1
+        st.toast("✅ 직전 5일 스케줄이 저장되었습니다.", icon="✅")
+        st.rerun()
 
 # ─────────────────────────────────────────────────────────────────────────────
 # SOLVER (triggered from sidebar button)
@@ -2698,7 +2868,19 @@ if st.session_state.get("trigger_solve"):
         else:
             with st.spinner("최적 스케줄을 계산 중입니다..."):
                 try:
-                    from scheduler import build_and_solve
+                    try:
+                        from scheduler import build_and_solve
+                    except ModuleNotFoundError:
+                        # Robust fallback for test/deployment runners that do not add
+                        # the app.py directory to sys.path automatically.
+                        import importlib.util
+                        scheduler_path = Path(__file__).with_name("scheduler.py")
+                        spec = importlib.util.spec_from_file_location("scheduler", scheduler_path)
+                        if spec is None or spec.loader is None:
+                            raise ImportError(f"scheduler.py를 불러올 수 없습니다: {scheduler_path}")
+                        scheduler_module = importlib.util.module_from_spec(spec)
+                        spec.loader.exec_module(scheduler_module)
+                        build_and_solve = scheduler_module.build_and_solve
 
                     params = {
                         "doctors": [d["name"] for d in doctors],
@@ -2707,6 +2889,8 @@ if st.session_state.get("trigger_solve"):
                         "day_types": st.session_state.day_types,
                         "duty_requests": st.session_state.duty_requests,
                         "shift_requests": {f"{k[0]},{k[1]}": v for k, v in refresh_combined_shift_requests().items()},
+                        "previous_schedule": {f"{k[0]},{k[1]}": v for k, v in st.session_state.previous_schedule.items()},
+                        "previous_schedule_days": PREVIOUS_SCHEDULE_DAYS,
                         "rules": {str(k): v for k, v in st.session_state.rules.items()},
                         "shift_adj": {str(k): v for k, v in st.session_state.shift_adj.items()},
                         "shift_counts": {str(k): v for k, v in st.session_state.shift_counts.items()},
@@ -2752,9 +2936,9 @@ if st.session_state.get("trigger_solve"):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# TAB 4: Results
+# TAB 5: Results
 # ─────────────────────────────────────────────────────────────────────────────
-with tab4:
+with tab5:
     if not st.session_state.solved or not st.session_state.solutions:
         if st.session_state.get("solve_failed"):
             st.error("조건을 만족하는 스케줄을 찾지 못했습니다.")
