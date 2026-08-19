@@ -9,6 +9,8 @@ from typing import Any
 import pandas as pd
 from datetime import date, timedelta
 
+SCHEDULER_API_VERSION = '2026-08-19-v7-exact-fixed-total-diagnostics'
+
 try:
     from ortools.sat.python import cp_model
     ORTOOLS_AVAILABLE = True
@@ -57,6 +59,956 @@ def _parse_actual_shift(cell: str):
     return ('D' in c, 'E' in c, 'N' in c)
 
 
+def _build_personal_hard_model(params: dict[str, Any], n: int, *, total_target: int | None = None,
+                               objective: str | None = None):
+    """Build a one-person CP-SAT model that mirrors the scheduler's personal hard rules.
+
+    This is used only by diagnostic mode.  It deliberately excludes group-level staffing/
+    grade constraints and soft balancing, but includes every hard condition that can limit
+    one person's monthly total:
+      - PreviousSchedule boundary context
+      - D/E/N/x/a requests
+      - closed duties (DutyRequests == 0)
+      - all personal sequence rules
+      - fixed_D/E/N and maximum_total
+
+    fixed_Total itself is *not* added unless ``total_target`` is supplied.  This lets the
+    diagnostic solver ask both "is this exact fixed_Total feasible?" and "what is the true
+    personal maximum/minimum under the other hard rules?".
+    """
+    if not ORTOOLS_AVAILABLE:
+        return None, None, None, "ORTOOLS_UNAVAILABLE"
+
+    names = list(params.get("doctors", []))
+    if not (0 <= n < len(names)):
+        return None, None, None, "INVALID_DOCTOR"
+
+    num_days = max(0, int(params.get("num_days", 0)))
+    previous_days = max(0, int(params.get("previous_schedule_days", 5)))
+    day_types = {int(k): v for k, v in (params.get("day_types", {}) or {}).items()}
+    duty_raw = {int(k): list(v) for k, v in (params.get("duty_requests", {}) or {}).items()}
+    sr_raw = params.get("shift_requests", {}) or {}
+    previous_raw = params.get("previous_schedule", {}) or {}
+    rules_raw = {int(k): (v or {}) for k, v in (params.get("rules", {}) or {}).items()}
+    shift_counts_raw = params.get("shift_counts", {}) or {}
+    shift_counts = {int(k): (v or {}) for k, v in shift_counts_raw.items()}
+    maximum_total = {int(k): int(v) for k, v in (params.get("maximum_total", {}) or {}).items()}
+
+    def get_rule(key: str, default: int) -> int:
+        try:
+            return int(rules_raw.get(n, {}).get(key, default))
+        except (TypeError, ValueError):
+            return int(default)
+
+    model = cp_model.CpModel()
+    all_days = range(num_days)
+    all_shifts = range(3)
+    shifts = {(d, s): model.NewBoolVar(f"diag_s_{n}_{d}_{s}") for d in all_days for s in all_shifts}
+
+    # Fixed previous-schedule context.
+    history = [[0, 0, 0] for _ in range(previous_days)]
+    for key, cell in previous_raw.items():
+        try:
+            n_str, h_str = str(key).split(",", 1)
+            nn, h = int(n_str), int(h_str)
+        except (TypeError, ValueError):
+            continue
+        if nn == n and 0 <= h < previous_days:
+            history[h] = [int(x) for x in _parse_actual_shift(cell)]
+
+    history_vars = {}
+    for h in range(previous_days):
+        for s in all_shifts:
+            v = model.NewBoolVar(f"diag_hist_{n}_{h}_{s}")
+            model.Add(v == int(history[h][s]))
+            history_vars[(h, s)] = v
+
+    timeline_len = previous_days + num_days
+    current_offset = previous_days
+
+    def timeline_shift(t: int, s: int):
+        if t < current_offset:
+            return history_vars[(t, s)]
+        return shifts[(t - current_offset, s)]
+
+    def sequence_window_starts(window_len: int):
+        if window_len <= 0 or timeline_len < window_len:
+            return range(0)
+        first = max(0, current_offset - window_len + 1)
+        return range(first, timeline_len - window_len + 1)
+
+    timeline_worked = {}
+    for t in range(timeline_len):
+        worked = model.NewBoolVar(f"diag_worked_{n}_{t}")
+        model.AddMaxEquality(worked, [timeline_shift(t, s) for s in all_shifts])
+        timeline_worked[t] = worked
+
+    # Personal rules -- intentionally kept in lockstep with build_and_solve().
+    r0 = get_rule("rule_max_shifts_per_day", 1)
+    r2 = get_rule("rule_no_day_after_eve", 1)
+    r3 = get_rule("rule_no_3eve_consec", 1)
+    r4 = get_rule("rule_no_3eve_in_4days", 1)
+    r5 = get_rule("rule_max_consec_days", 5)
+    r6 = get_rule("rule_max_shifts_per_week", 0)
+    r7 = get_rule("rule_no_3day_consec", 1)
+    n_max = get_rule("rule_n_block_max", 1)
+    n_rest = get_rule("rule_n_rest", 1)
+    n_gap = get_rule("rule_n_gap", 0)
+
+    holiday = [d for d, t in day_types.items() if t in ("토", "일", "공")]
+
+    if r0 == 1:
+        for d in all_days:
+            model.AddAtMostOne(shifts[(d, s)] for s in all_shifts)
+    elif r0 in (2, 4):
+        for d in all_days:
+            model.AddBoolOr([shifts[(d,0)].Not(), shifts[(d,1)], shifts[(d,2)].Not()])
+            model.AddBoolOr([shifts[(d,0)].Not(), shifts[(d,1)].Not(), shifts[(d,2)].Not()])
+        if r0 == 4:
+            for d in [x for x in all_days if x not in holiday]:
+                model.AddAtMostOne(shifts[(d, s)] for s in all_shifts)
+        for t in sequence_window_starts(2):
+            model.Add(sum(timeline_shift(t+p, s) for p in range(2) for s in all_shifts) < 4)
+    elif r0 in (3, 5):
+        for d in all_days:
+            model.AddBoolOr([shifts[(d,0)].Not(), shifts[(d,1)], shifts[(d,2)].Not()])
+        if r0 == 5:
+            for d in [x for x in all_days if x not in holiday]:
+                model.AddAtMostOne(shifts[(d, s)] for s in all_shifts)
+        for t in sequence_window_starts(2):
+            model.Add(sum(timeline_shift(t+p, s) for p in range(2) for s in all_shifts) < 4)
+
+    block_len = n_max + 1
+    for t in sequence_window_starts(block_len):
+        model.Add(sum(timeline_shift(t+i, 2) for i in range(block_len)) < block_len)
+
+    for e in range(timeline_len):
+        for r in range(1, n_rest + 1):
+            dd = e + r
+            if dd >= timeline_len:
+                break
+            if dd < current_offset:
+                continue
+            for s in all_shifts:
+                if e + 1 < timeline_len:
+                    model.AddBoolOr([
+                        timeline_shift(e,2).Not(), timeline_shift(e+1,2), timeline_shift(dd,s).Not()
+                    ])
+                else:
+                    model.AddBoolOr([timeline_shift(e,2).Not(), timeline_shift(dd,s).Not()])
+        for g in range(n_rest + 1, n_gap + 1):
+            dd = e + g
+            if dd >= timeline_len:
+                break
+            if dd < current_offset:
+                continue
+            if e + 1 < timeline_len:
+                model.AddBoolOr([
+                    timeline_shift(e,2).Not(), timeline_shift(e+1,2), timeline_shift(dd,2).Not()
+                ])
+            else:
+                model.AddBoolOr([timeline_shift(e,2).Not(), timeline_shift(dd,2).Not()])
+
+    if r2:
+        for t in sequence_window_starts(2):
+            model.Add(timeline_shift(t+1,0) == 0).OnlyEnforceIf(timeline_shift(t,1))
+    if r3:
+        for t in sequence_window_starts(3):
+            model.AddBoolOr([timeline_shift(t,1).Not(), timeline_shift(t+1,1).Not(), timeline_shift(t+2,1).Not()])
+    if r4:
+        for t in sequence_window_starts(4):
+            model.AddBoolOr([
+                timeline_shift(t,1).Not(), timeline_shift(t+1,1).Not(), timeline_shift(t+2,1), timeline_shift(t+3,1).Not()
+            ])
+            model.AddBoolOr([
+                timeline_shift(t,1).Not(), timeline_shift(t+1,1), timeline_shift(t+2,1).Not(), timeline_shift(t+3,1).Not()
+            ])
+    if r5 in (3, 4, 5, 6, 7):
+        for t in sequence_window_starts(r5 + 1):
+            model.Add(sum(timeline_worked[t+p] for p in range(r5 + 1)) <= r5)
+    if r6 > 0:
+        for t in sequence_window_starts(7):
+            model.Add(sum(timeline_shift(t+p, s) for p in range(7) for s in all_shifts) <= r6)
+    if r7:
+        for t in sequence_window_starts(3):
+            model.AddBoolOr([timeline_shift(t,0).Not(), timeline_shift(t+1,0).Not(), timeline_shift(t+2,0).Not()])
+
+    # Current-month request / closed-duty hard constraints.
+    for d in all_days:
+        cell = str(sr_raw.get(f"{n},{d}", "") or "").strip()
+        cannot = _parse_shift_request(cell)
+        must = _parse_shift_wish(cell)
+        needs = list(duty_raw.get(d, [0, 0, 0]))
+        if len(needs) < 3:
+            needs = (needs + [0, 0, 0])[:3]
+        for s in all_shifts:
+            if int(needs[s]) <= 0:
+                model.Add(shifts[(d, s)] == 0)
+            if cannot[s]:
+                model.Add(shifts[(d, s)] == 0)
+            if must[s]:
+                model.Add(shifts[(d, s)] == 1)
+
+    sc = shift_counts.get(n, {}) if isinstance(shift_counts.get(n, {}), dict) else {}
+    num_s = []
+    for s, sk in enumerate(("D", "E", "N")):
+        count_var = model.NewIntVar(0, num_days, f"diag_count_{n}_{sk}")
+        model.Add(count_var == sum(shifts[(d, s)] for d in all_days))
+        num_s.append(count_var)
+        try:
+            fixed_val = int(sc.get(sk, -1))
+        except (TypeError, ValueError):
+            fixed_val = -1
+        if fixed_val >= 0:
+            model.Add(count_var == fixed_val)
+
+    num_total = model.NewIntVar(0, num_days * 3, f"diag_total_{n}")
+    model.Add(num_total == sum(num_s))
+
+    max_total = int(maximum_total.get(n, -1))
+    if max_total >= 0:
+        model.Add(num_total <= max_total)
+    if total_target is not None:
+        model.Add(num_total == int(total_target))
+
+    if objective == "max":
+        model.Maximize(num_total)
+    elif objective == "min":
+        model.Minimize(num_total)
+
+    return model, num_total, (r0, r2, r3, r4, r5, r6, r7, n_max, n_rest, n_gap), "OK"
+
+
+def _solve_personal_total_model(params: dict[str, Any], n: int, *, total_target: int | None = None,
+                                objective: str | None = None) -> dict[str, Any]:
+    """Solve the exact one-person diagnostic model."""
+    model, num_total, rule_tuple, build_status = _build_personal_hard_model(
+        params, n, total_target=total_target, objective=objective
+    )
+    if build_status != "OK":
+        return {"status": build_status, "value": None, "optimal": False, "rules": rule_tuple}
+
+    solver = cp_model.CpSolver()
+    # One-person models are tiny.  A short but generous limit avoids diagnostic mode
+    # becoming slow even with many nurses while still giving an exact optimum in practice.
+    solver.parameters.max_time_in_seconds = 3.0
+    solver.parameters.num_search_workers = 8
+    status = solver.Solve(model)
+    status_name = solver.StatusName(status)
+    feasible = status in (cp_model.OPTIMAL, cp_model.FEASIBLE)
+    value = int(solver.Value(num_total)) if feasible else None
+    return {
+        "status": status_name,
+        "value": value,
+        "optimal": status == cp_model.OPTIMAL,
+        "feasible": feasible,
+        "rules": rule_tuple,
+    }
+
+
+def _personal_diagnostic_limit_summary(params: dict[str, Any], n: int) -> str:
+    """Compact human-readable summary of the major personal hard limits."""
+    start_date = date.fromisoformat(str(params.get("start_date")))
+    num_days = max(0, int(params.get("num_days", 0)))
+    sr_raw = params.get("shift_requests", {}) or {}
+    rules_raw = {int(k): (v or {}) for k, v in (params.get("rules", {}) or {}).items()}
+    previous_days = max(0, int(params.get("previous_schedule_days", 5)))
+    previous_raw = params.get("previous_schedule", {}) or {}
+
+    def get_rule(key: str, default: int) -> int:
+        try:
+            return int(rules_raw.get(n, {}).get(key, default))
+        except (TypeError, ValueError):
+            return int(default)
+
+    full_off_dates = []
+    for d in range(num_days):
+        cell = str(sr_raw.get(f"{n},{d}", "") or "").strip()
+        if all(_parse_shift_request(cell)):
+            full_off_dates.append((start_date + timedelta(days=d)).strftime("%m/%d"))
+
+    history_txt = []
+    for h in range(previous_days):
+        cell = previous_raw.get(f"{n},{h}", "")
+        flags = _parse_actual_shift(cell)
+        label = "".join(sk for sk, v in zip(("D","E","N"), flags) if v) or "OFF"
+        hist_date = start_date - timedelta(days=previous_days - h)
+        history_txt.append(f"{hist_date.strftime('%m/%d')} {label}")
+
+    r5 = get_rule("rule_max_consec_days", 5)
+    r6 = get_rule("rule_max_shifts_per_week", 0)
+    n_max = get_rule("rule_n_block_max", 1)
+    n_rest = get_rule("rule_n_rest", 1)
+    n_gap = get_rule("rule_n_gap", 0)
+
+    bits = []
+    if full_off_dates:
+        shown = ", ".join(full_off_dates[:8])
+        if len(full_off_dates) > 8:
+            shown += f" 외 {len(full_off_dates)-8}일"
+        bits.append(f"완전휴무 요청 {len(full_off_dates)}일({shown})")
+    if r6 > 0:
+        bits.append(f"7일 최대 {r6}근무")
+    if r5 > 0:
+        bits.append(f"연속근무 최대 {r5}일")
+    bits.append(f"N block≤{n_max}, N-rest={n_rest}, N-gap={n_gap}")
+    if history_txt:
+        bits.append("직전=" + " / ".join(history_txt))
+    return "; ".join(bits)
+
+
+
+def diagnose_hard_conflicts(params: dict[str, Any]) -> pd.DataFrame:
+    """Detect definite contradictions among hard-coded inputs before solving.
+
+    This intentionally reports only *provable* conflicts from fixed/known facts:
+    - completed previous schedule,
+    - uppercase D/E/N must-work requests,
+    - x/a/lowercase cannot-work requests,
+    - zero duty demand,
+    - fixed D/E/N/Total and maximum_total,
+    - personal sequence hard rules that are already forced by those facts.
+
+    It does not claim that an otherwise empty/optional day will be worked, so the
+    table is conservative: rows shown here are genuine contradictions, while an
+    empty table does not guarantee the full model is feasible.
+    """
+    names = list(params.get("doctors", []))
+    num_doctors = len(names)
+    num_days = max(0, int(params.get("num_days", 0)))
+    start_date = date.fromisoformat(str(params.get("start_date")))
+    previous_days = max(0, int(params.get("previous_schedule_days", 5)))
+    previous_raw = params.get("previous_schedule", {}) or {}
+    sr_raw = params.get("shift_requests", {}) or {}
+    rules_raw = {int(k): (v or {}) for k, v in (params.get("rules", {}) or {}).items()}
+    day_types = {int(k): v for k, v in (params.get("day_types", {}) or {}).items()}
+    duty_raw = {int(k): list(v) for k, v in (params.get("duty_requests", {}) or {}).items()}
+    shift_counts_raw = params.get("shift_counts", {}) or {}
+    shift_counts = {int(k): (v or {}) for k, v in shift_counts_raw.items()}
+    maximum_total = {int(k): int(v) for k, v in (params.get("maximum_total", {}) or {}).items()}
+
+    shift_keys = ["D", "E", "N"]
+    rows: list[dict[str, Any]] = []
+    seen: set[tuple] = set()
+
+    def get_rule(n: int, key: str, default: int) -> int:
+        try:
+            return int(rules_raw.get(n, {}).get(key, default))
+        except (TypeError, ValueError):
+            return int(default)
+
+    def date_for_t(t: int) -> date:
+        return start_date + timedelta(days=t - previous_days)
+
+    def dlabel(t: int) -> str:
+        d = date_for_t(t)
+        return f"{d.strftime('%m/%d')}({_get_day_label(d, 0)})"
+
+    def shift_text(flags) -> str:
+        txt = "".join(k for k, v in zip(shift_keys, flags) if v)
+        return txt or "OFF"
+
+    def add_conflict(n: int, *, day_t: int | None, rule: str, explanation: str,
+                     related: str = "", suggestion: str = ""):
+        key = (n, day_t, rule, explanation, related)
+        if key in seen:
+            return
+        seen.add(key)
+        rows.append({
+            "상태": "확정 충돌",
+            "이름": names[n] if 0 <= n < len(names) else f"doctor_{n}",
+            "날짜": dlabel(day_t) if day_t is not None else "월 전체",
+            "충돌 규칙": rule,
+            "설명": explanation,
+            "관련 일정": related,
+            "수정 제안": suggestion,
+        })
+
+    # Exact completed history.
+    history = [[[0, 0, 0] for _ in range(previous_days)] for _ in range(num_doctors)]
+    for key, cell in previous_raw.items():
+        try:
+            n_str, h_str = str(key).split(",")
+            n, h = int(n_str), int(h_str)
+        except (ValueError, TypeError):
+            continue
+        if 0 <= n < num_doctors and 0 <= h < previous_days:
+            history[n][h] = [int(x) for x in _parse_actual_shift(cell)]
+
+    timeline_len = previous_days + num_days
+    current_offset = previous_days
+
+    def sequence_window_starts(window_len: int):
+        if window_len <= 0 or timeline_len < window_len:
+            return range(0)
+        first = max(0, current_offset - window_len + 1)
+        return range(first, timeline_len - window_len + 1)
+
+    for n in range(num_doctors):
+        r0 = get_rule(n, "rule_max_shifts_per_day", 1)
+        r2 = get_rule(n, "rule_no_day_after_eve", 1)
+        r3 = get_rule(n, "rule_no_3eve_consec", 1)
+        r4 = get_rule(n, "rule_no_3eve_in_4days", 1)
+        r5 = get_rule(n, "rule_max_consec_days", 5)
+        r6 = get_rule(n, "rule_max_shifts_per_week", 0)
+        r7 = get_rule(n, "rule_no_3day_consec", 1)
+        n_max = get_rule(n, "rule_n_block_max", 1)
+        n_rest = get_rule(n, "rule_n_rest", 1)
+        n_gap = get_rule(n, "rule_n_gap", 0)
+
+        sc = shift_counts.get(n, {}) if isinstance(shift_counts.get(n, {}), dict) else {}
+        fixed_shift = {}
+        for sk in shift_keys:
+            try:
+                fixed_shift[sk] = int(sc.get(sk, -1))
+            except (TypeError, ValueError):
+                fixed_shift[sk] = -1
+        try:
+            fixed_total = int(sc.get("Total", -1))
+        except (TypeError, ValueError):
+            fixed_total = -1
+        max_total = int(maximum_total.get(n, -1))
+
+        # minimum forced/current facts and definitely-impossible shifts.
+        on = [[0, 0, 0] for _ in range(timeline_len)]
+        off = [[False, False, False] for _ in range(timeline_len)]
+        for h in range(previous_days):
+            for s_idx in range(3):
+                on[h][s_idx] = int(history[n][h][s_idx])
+                off[h][s_idx] = not bool(history[n][h][s_idx])
+
+        current_forced_counts = [0, 0, 0]
+        current_forced_total = 0
+
+        for d in range(num_days):
+            t = current_offset + d
+            cell = str(sr_raw.get(f"{n},{d}", "") or "").strip()
+            forced = [int(x) for x in _parse_shift_wish(cell)]
+            cannot = [bool(x) for x in _parse_shift_request(cell)]
+            needs = list(duty_raw.get(d, [0, 0, 0]))
+            if len(needs) < 3:
+                needs = (needs + [0, 0, 0])[:3]
+
+            for s_idx in range(3):
+                on[t][s_idx] = forced[s_idx]
+                off[t][s_idx] = cannot[s_idx] or int(needs[s_idx]) <= 0
+                if fixed_shift[shift_keys[s_idx]] == 0:
+                    off[t][s_idx] = True
+                if fixed_total == 0 or max_total == 0:
+                    off[t][s_idx] = True
+
+                if forced[s_idx]:
+                    current_forced_counts[s_idx] += 1
+                    current_forced_total += 1
+                    if cannot[s_idx]:
+                        add_conflict(
+                            n, day_t=t, rule="근무 요청 자체 충돌",
+                            explanation=f"{shift_keys[s_idx]}가 대문자로 hard-fixed되어 있지만 같은 셀에서 근무불가(a/x/소문자 불가)도 적용됩니다.",
+                            related=f"{dlabel(t)} 요청='{cell}'",
+                            suggestion="대문자 고정근무와 불가표시 중 하나를 제거하세요.",
+                        )
+                    if int(needs[s_idx]) <= 0:
+                        add_conflict(
+                            n, day_t=t, rule="Duty 필요인원=0 vs hard-fixed",
+                            explanation=f"{shift_keys[s_idx]} 필요인원이 0명인데 {shift_keys[s_idx]}가 hard-fixed되어 있습니다.",
+                            related=f"{dlabel(t)} {shift_keys[s_idx]} 필요={int(needs[s_idx])}, 요청='{cell}'",
+                            suggestion="해당 hard-fixed를 제거하거나 Duty 필요인원을 1명 이상으로 변경하세요.",
+                        )
+
+            # rule_max_shifts_per_day may make non-forced shifts definitely OFF.
+            forced_count = sum(forced)
+            dtype = day_types.get(d, "평일")
+            is_holiday = dtype in ("토", "일", "공")
+            same_day_bad = False
+            why = ""
+            if r0 == 1 and forced_count > 1:
+                same_day_bad, why = True, "하루 최대 1근무인데 여러 근무가 동시에 hard-fixed되었습니다."
+            elif r0 in (2, 4):
+                if forced_count == 3:
+                    same_day_bad, why = True, "D/E/N 3개 동시근무는 허용되지 않습니다."
+                elif forced[0] and forced[2] and not forced[1]:
+                    same_day_bad, why = True, "D+N 조합은 E 없이 허용되지 않습니다."
+                elif r0 == 4 and not is_holiday and forced_count > 1:
+                    same_day_bad, why = True, "평일에는 하루 1근무만 허용됩니다."
+            elif r0 in (3, 5):
+                if forced[0] and forced[2] and not forced[1]:
+                    same_day_bad, why = True, "D+N 조합은 E 없이 허용되지 않습니다."
+                elif r0 == 5 and not is_holiday and forced_count > 1:
+                    same_day_bad, why = True, "평일에는 하루 1근무만 허용됩니다."
+            if same_day_bad:
+                add_conflict(
+                    n, day_t=t, rule="하루 근무 횟수 rule",
+                    explanation=why,
+                    related=f"{dlabel(t)} hard-fixed={shift_text(forced)}, rule_max_shifts_per_day={r0}",
+                    suggestion="해당 날짜의 대문자 D/E/N 고정 중 일부를 해제하세요.",
+                )
+
+            if r0 == 1 and forced_count >= 1:
+                for s_idx in range(3):
+                    if not forced[s_idx]:
+                        off[t][s_idx] = True
+            elif r0 in (4, 5) and not is_holiday and forced_count >= 1:
+                for s_idx in range(3):
+                    if not forced[s_idx]:
+                        off[t][s_idx] = True
+
+        # Count-level contradictions among forced assignments and exact/maximum counts.
+        for s_idx, sk in enumerate(shift_keys):
+            fv = fixed_shift[sk]
+            if fv >= 0 and current_forced_counts[s_idx] > fv:
+                add_conflict(
+                    n, day_t=None, rule=f"fixed_{sk} vs hard-fixed {sk}",
+                    explanation=f"대문자 {sk} hard-fixed가 {current_forced_counts[s_idx]}개인데 fixed_{sk}={fv}입니다.",
+                    related=f"hard-fixed {sk}={current_forced_counts[s_idx]}, fixed_{sk}={fv}",
+                    suggestion=f"대문자 {sk} 일부를 해제하거나 fixed_{sk}를 늘리세요.",
+                )
+        if fixed_total >= 0 and current_forced_total > fixed_total:
+            add_conflict(
+                n, day_t=None, rule="fixed_Total vs hard-fixed 근무",
+                explanation=f"대문자 hard-fixed 근무가 {current_forced_total}개인데 fixed_Total={fixed_total}입니다.",
+                related=f"hard-fixed total={current_forced_total}, fixed_Total={fixed_total}",
+                suggestion="대문자 고정근무 일부를 해제하거나 fixed_Total을 늘리세요.",
+            )
+        if max_total >= 0 and current_forced_total > max_total:
+            add_conflict(
+                n, day_t=None, rule="maximum_total vs hard-fixed 근무",
+                explanation=f"대문자 hard-fixed 근무가 {current_forced_total}개인데 maximum_total={max_total}입니다.",
+                related=f"hard-fixed total={current_forced_total}, maximum_total={max_total}",
+                suggestion="대문자 고정근무 일부를 해제하거나 maximum_total을 늘리세요.",
+            )
+        fixed_positive_sum = sum(v for v in fixed_shift.values() if v >= 0)
+        if fixed_total >= 0 and fixed_positive_sum > fixed_total:
+            add_conflict(
+                n, day_t=None, rule="fixed_D/E/N 합 vs fixed_Total",
+                explanation=f"fixed_D/E/N 지정 합이 {fixed_positive_sum}인데 fixed_Total={fixed_total}입니다.",
+                related=f"fixed D/E/N 합={fixed_positive_sum}, fixed_Total={fixed_total}",
+                suggestion="fixed_D/E/N 또는 fixed_Total 값을 조정하세요.",
+            )
+        if max_total >= 0 and fixed_positive_sum > max_total:
+            add_conflict(
+                n, day_t=None, rule="fixed_D/E/N 합 vs maximum_total",
+                explanation=f"fixed_D/E/N 지정 합이 {fixed_positive_sum}인데 maximum_total={max_total}입니다.",
+                related=f"fixed D/E/N 합={fixed_positive_sum}, maximum_total={max_total}",
+                suggestion="fixed_D/E/N을 줄이거나 maximum_total을 늘리세요.",
+            )
+        if fixed_total >= 0 and max_total >= 0 and fixed_total > max_total:
+            add_conflict(
+                n, day_t=None, rule="fixed_Total vs maximum_total",
+                explanation=f"fixed_Total={fixed_total}은 정확한 근무수인데 maximum_total={max_total}보다 큽니다.",
+                related=f"fixed_Total={fixed_total}, maximum_total={max_total}",
+                suggestion="fixed_Total을 줄이거나 maximum_total을 늘리세요.",
+            )
+
+        # If a shift is known ON/OFF, these helpers make rule checks easy to read.
+        def is_on(t: int, s_idx: int) -> bool:
+            return 0 <= t < timeline_len and bool(on[t][s_idx])
+
+        def is_off(t: int, s_idx: int) -> bool:
+            return 0 <= t < timeline_len and bool(off[t][s_idx])
+
+        def is_forced_work(t: int) -> bool:
+            return 0 <= t < timeline_len and any(on[t])
+
+        def related_window(ts) -> str:
+            return " → ".join(f"{dlabel(t)} {shift_text(on[t])}" for t in ts)
+
+        # Two-day total cap used by r0 2/3/4/5.
+        if r0 in (2, 3, 4, 5):
+            for t in sequence_window_starts(2):
+                minimum_shifts = sum(sum(on[t+p]) for p in range(2))
+                if minimum_shifts >= 4:
+                    add_conflict(
+                        n, day_t=max(current_offset, t), rule="2일간 근무수 상한",
+                        explanation=f"연속 2일의 확정 근무가 이미 {minimum_shifts}개로, solver의 '< 4' hard rule을 위반합니다.",
+                        related=related_window([t, t+1]),
+                        suggestion="두 날짜의 hard-fixed 근무 중 일부를 해제하세요.",
+                    )
+
+        # N block maximum.
+        block_len = n_max + 1
+        if block_len > 0:
+            for t in sequence_window_starts(block_len):
+                if all(is_on(t+i, 2) for i in range(block_len)):
+                    add_conflict(
+                        n, day_t=max(current_offset, t), rule="N block 최대 길이",
+                        explanation=f"N이 {block_len}일 연속으로 확정되어 있으나 N block 최대는 {n_max}일입니다.",
+                        related=related_window(range(t, t+block_len)),
+                        suggestion="대문자 N 중 하나를 해제하거나 N block 최대 길이를 조정하세요.",
+                    )
+
+        # N-block end consequences. An end is definite only when the following day's N is known OFF.
+        for e in range(timeline_len):
+            if not is_on(e, 2):
+                continue
+            if e + 1 >= timeline_len or not is_off(e + 1, 2):
+                continue
+            end_date = dlabel(e)
+            for r in range(1, n_rest + 1):
+                dd = e + r
+                if dd >= timeline_len:
+                    break
+                if dd < current_offset:
+                    continue
+                if is_forced_work(dd):
+                    forced_txt = shift_text(on[dd])
+                    add_conflict(
+                        n, day_t=dd, rule="N block 후 mandatory OFF",
+                        explanation=(f"{end_date}에 N block이 확정 종료되어 이후 {n_rest}일은 완전 OFF여야 하지만 "
+                                     f"{dlabel(dd)}에 {forced_txt}가 hard-fixed되어 있습니다."),
+                        related=f"N block 종료={end_date}; mandatory OFF day {r}/{n_rest}={dlabel(dd)}; hard-fixed={forced_txt}",
+                        suggestion=f"{dlabel(dd)}의 대문자 {forced_txt}를 빈칸/x로 바꾸거나 직전 스케줄/N-rest 설정을 확인하세요.",
+                    )
+            for g in range(n_rest + 1, n_gap + 1):
+                dd = e + g
+                if dd >= timeline_len:
+                    break
+                if dd < current_offset:
+                    continue
+                if is_on(dd, 2):
+                    add_conflict(
+                        n, day_t=dd, rule="N block 후 다음 N 간격",
+                        explanation=(f"{end_date}에 N block이 확정 종료되어 다음 N은 gap 규칙상 아직 불가능하지만 "
+                                     f"{dlabel(dd)} N이 hard-fixed되어 있습니다."),
+                        related=f"N block 종료={end_date}; n_rest={n_rest}, n_gap={n_gap}; hard-fixed N={dlabel(dd)}",
+                        suggestion=f"{dlabel(dd)}의 대문자 N을 해제하거나 n_gap 설정을 확인하세요.",
+                    )
+
+        if r2:
+            for t in sequence_window_starts(2):
+                if is_on(t, 1) and is_on(t+1, 0):
+                    add_conflict(
+                        n, day_t=t+1, rule="Evening 후 Day 금지",
+                        explanation=f"{dlabel(t)} E 다음 날인 {dlabel(t+1)}에 D가 hard-fixed되어 있습니다.",
+                        related=related_window([t, t+1]),
+                        suggestion=f"{dlabel(t+1)} D 고정을 해제하거나 개인 E→D rule을 확인하세요.",
+                    )
+
+        if r3:
+            for t in sequence_window_starts(3):
+                if all(is_on(t+i, 1) for i in range(3)):
+                    add_conflict(
+                        n, day_t=max(current_offset, t), rule="Evening 3연속 금지",
+                        explanation="E가 3일 연속으로 확정되어 있습니다.",
+                        related=related_window([t, t+1, t+2]),
+                        suggestion="대문자 E 중 하나를 해제하거나 해당 rule을 확인하세요.",
+                    )
+
+        if r4:
+            for t in sequence_window_starts(4):
+                if is_on(t,1) and is_on(t+1,1) and is_off(t+2,1) and is_on(t+3,1):
+                    add_conflict(
+                        n, day_t=max(current_offset, t), rule="4일 내 Evening 3회 금지",
+                        explanation="E-E-(E불가)-E 패턴이 hard input으로 확정되어 있습니다.",
+                        related=related_window([t, t+1, t+2, t+3]),
+                        suggestion="대문자 E/불가표시 중 하나를 조정하세요.",
+                    )
+                if is_on(t,1) and is_off(t+1,1) and is_on(t+2,1) and is_on(t+3,1):
+                    add_conflict(
+                        n, day_t=max(current_offset, t), rule="4일 내 Evening 3회 금지",
+                        explanation="E-(E불가)-E-E 패턴이 hard input으로 확정되어 있습니다.",
+                        related=related_window([t, t+1, t+2, t+3]),
+                        suggestion="대문자 E/불가표시 중 하나를 조정하세요.",
+                    )
+
+        if r5 in (3, 4, 5, 6, 7):
+            for t in sequence_window_starts(r5 + 1):
+                if all(is_forced_work(t+p) for p in range(r5 + 1)):
+                    add_conflict(
+                        n, day_t=max(current_offset, t), rule="최대 연속 근무일수",
+                        explanation=f"{r5 + 1}일 연속 근무가 hard input으로 확정되어 있으나 최대 허용은 {r5}일입니다.",
+                        related=related_window(range(t, t+r5+1)),
+                        suggestion="해당 구간의 대문자 고정근무 중 하나를 해제하세요.",
+                    )
+
+        if r6 > 0:
+            for t in sequence_window_starts(7):
+                forced_count = sum(sum(on[t+p]) for p in range(7))
+                if forced_count > r6:
+                    add_conflict(
+                        n, day_t=max(current_offset, t), rule="7일 구간 최대 근무수",
+                        explanation=f"7일 구간의 확정 근무가 {forced_count}개로 최대 {r6}개를 초과합니다.",
+                        related=related_window(range(t, t+7)),
+                        suggestion="해당 7일 구간의 hard-fixed 근무를 줄이거나 주간 상한을 조정하세요.",
+                    )
+
+        if r7:
+            for t in sequence_window_starts(3):
+                if all(is_on(t+i, 0) for i in range(3)):
+                    add_conflict(
+                        n, day_t=max(current_offset, t), rule="Day 3연속 금지",
+                        explanation="D가 3일 연속으로 hard input으로 확정되어 있습니다.",
+                        related=related_window([t, t+1, t+2]),
+                        suggestion="대문자 D 중 하나를 해제하거나 해당 rule을 확인하세요.",
+                    )
+
+    # Exact per-person fixed_Total feasibility.
+    # The lightweight app-side estimate used to miss sliding 7-day limits and
+    # PreviousSchedule/N-rest interactions.  Here we ask CP-SAT directly using
+    # the same personal hard constraints as the real scheduler.
+    if ORTOOLS_AVAILABLE:
+        for n in range(num_doctors):
+            sc = shift_counts.get(n, {}) if isinstance(shift_counts.get(n, {}), dict) else {}
+            try:
+                fixed_total = int(sc.get("Total", -1))
+            except (TypeError, ValueError):
+                fixed_total = -1
+            if fixed_total < 0:
+                continue
+
+            exact = _solve_personal_total_model(params, n, total_target=fixed_total)
+            if exact.get("feasible"):
+                continue
+            # UNKNOWN is not a proof of infeasibility, so do not report it as a conflict.
+            if str(exact.get("status", "")).upper() == "UNKNOWN":
+                continue
+
+            max_res = _solve_personal_total_model(params, n, objective="max")
+            min_res = _solve_personal_total_model(params, n, objective="min")
+            max_val = max_res.get("value") if max_res.get("optimal") else None
+            min_val = min_res.get("value") if min_res.get("optimal") else None
+            limits = _personal_diagnostic_limit_summary(params, n)
+
+            if max_val is not None and fixed_total > max_val:
+                add_conflict(
+                    n,
+                    day_t=None,
+                    rule="fixed_Total 달성 불가 · 정확 개인별 최대",
+                    explanation=(
+                        f"fixed_Total={fixed_total}은 정확히 채워야 하지만, 현재 개인 hard rule을 모두 적용하면 "
+                        f"이 사람의 월 최대 가능 근무수는 {max_val}개입니다. 따라서 최소 {fixed_total - max_val}개가 부족합니다."
+                    ),
+                    related=f"fixed_Total={fixed_total}; 정확 최대={max_val}; {limits}",
+                    suggestion=(
+                        "fixed_Total을 줄이는 것이 아니라, fixed_Total을 유지해야 한다면 x/a/불가요청 또는 "
+                        "7일 최대근무·연속근무·N-rest/N-gap 등 개인 hard rule 중 실제 조정 가능한 조건을 확인하세요."
+                    ),
+                )
+            elif min_val is not None and fixed_total < min_val:
+                add_conflict(
+                    n,
+                    day_t=None,
+                    rule="fixed_Total 달성 불가 · 정확 개인별 최소",
+                    explanation=(
+                        f"fixed_Total={fixed_total}은 정확값이지만, 현재 hard-fixed D/E/N 및 fixed_D/E/N 등을 적용하면 "
+                        f"최소 {min_val}개는 근무해야 합니다."
+                    ),
+                    related=f"fixed_Total={fixed_total}; 정확 최소={min_val}; {limits}",
+                    suggestion="대문자 D/E/N 또는 fixed_D/E/N을 확인하세요.",
+                )
+            elif max_val is not None and min_val is not None:
+                # Rare discrete-pattern case: target lies inside [min,max] but is still not attainable.
+                add_conflict(
+                    n,
+                    day_t=None,
+                    rule="fixed_Total 정확값 달성 불가",
+                    explanation=(
+                        f"개인 hard rule상 가능한 총근무 범위는 {min_val}~{max_val}이지만 fixed_Total={fixed_total} "
+                        "정확값을 만드는 조합은 존재하지 않습니다."
+                    ),
+                    related=f"fixed_Total={fixed_total}; 개인 가능 범위={min_val}~{max_val}; {limits}",
+                    suggestion="fixed_D/E/N, 대문자 고정근무 및 sequence rule 조합을 확인하세요.",
+                )
+            elif str(max_res.get("status", "")).upper() == "INFEASIBLE":
+                add_conflict(
+                    n,
+                    day_t=None,
+                    rule="개인 hard rule 조합 자체 불가능",
+                    explanation=(
+                        "fixed_Total을 잠시 제외해도 이 사람의 fixed_D/E/N·근무요청·직전 스케줄·sequence rule을 "
+                        "동시에 만족하는 개인 스케줄이 없습니다."
+                    ),
+                    related=limits,
+                    suggestion="fixed_D/E/N, 대문자 D/E/N, x/a 및 직전 5일과 sequence rule을 함께 확인하세요.",
+                )
+
+    columns = ["상태", "이름", "날짜", "충돌 규칙", "설명", "관련 일정", "수정 제안"]
+    if not rows:
+        return pd.DataFrame(columns=columns)
+    out = pd.DataFrame(rows, columns=columns)
+    return out.sort_values(["이름", "날짜", "충돌 규칙"], kind="stable").reset_index(drop=True)
+
+
+def evaluate_additional_availability(params: dict[str, Any], sol: dict[tuple[int, int], str]):
+    """Return extra D/E/N shifts that can be added without violating personal hard rules.
+
+    This intentionally ignores duty headcount and group-level grade composition, because
+    it is meant as a backup/extra-work availability view after a complete schedule exists.
+    It *does* enforce the doctor's requests, previous-five-day sequence context, all
+    per-doctor sequence rules, fixed D/E/N/Total counts, and maximum_total.
+
+    Returns a dict {(doctor_idx, day_idx): ["D", "E", "N", ...]} for candidates.
+    """
+    names = list(params.get("doctors", []))
+    num_doctors = len(names)
+    num_days = int(params.get("num_days", 0))
+    previous_days = max(0, int(params.get("previous_schedule_days", 5)))
+    previous_raw = params.get("previous_schedule", {}) or {}
+    sr_raw = params.get("shift_requests", {}) or {}
+    rules_raw = {int(k): v for k, v in (params.get("rules", {}) or {}).items()}
+    day_types = {int(k): v for k, v in (params.get("day_types", {}) or {}).items()}
+    shift_counts_raw = params.get("shift_counts", {}) or {}
+    shift_counts = {int(k): {sk: int(sv) for sk, sv in v.items()} for k, v in shift_counts_raw.items()}
+    maximum_total = {int(k): int(v) for k, v in (params.get("maximum_total", {}) or {}).items()}
+
+    history = [[[0, 0, 0] for _ in range(previous_days)] for _ in range(num_doctors)]
+    for key, cell in previous_raw.items():
+        try:
+            n_str, h_str = str(key).split(",")
+            n, h = int(n_str), int(h_str)
+        except (ValueError, TypeError):
+            continue
+        if 0 <= n < num_doctors and 0 <= h < previous_days:
+            history[n][h] = [int(x) for x in _parse_actual_shift(cell)]
+
+    def get_rule(n: int, key: str, default: int) -> int:
+        return int(rules_raw.get(n, {}).get(key, default))
+
+    def sequence_window_starts(timeline_len: int, window_len: int):
+        if window_len <= 0 or timeline_len < window_len:
+            return range(0)
+        first = max(0, previous_days - window_len + 1)
+        return range(first, timeline_len - window_len + 1)
+
+    def personal_rules_ok(n: int, current_flags: list[list[int]]) -> bool:
+        timeline = [list(x) for x in history[n]] + [list(x) for x in current_flags]
+        timeline_len = len(timeline)
+        r0 = get_rule(n, "rule_max_shifts_per_day", 1)
+        r2 = get_rule(n, "rule_no_day_after_eve", 1)
+        r3 = get_rule(n, "rule_no_3eve_consec", 1)
+        r4 = get_rule(n, "rule_no_3eve_in_4days", 1)
+        r5 = get_rule(n, "rule_max_consec_days", 5)
+        r6 = get_rule(n, "rule_max_shifts_per_week", 0)
+        r7 = get_rule(n, "rule_no_3day_consec", 1)
+        n_max = get_rule(n, "rule_n_block_max", 1)
+        n_rest = get_rule(n, "rule_n_rest", 1)
+        n_gap = get_rule(n, "rule_n_gap", 0)
+
+        # Same-day / two-day multiplicity rules.
+        for d, flags in enumerate(current_flags):
+            cnt = sum(flags)
+            if r0 == 1 and cnt > 1:
+                return False
+            if r0 in (2, 4):
+                if flags[0] and flags[2] and not flags[1]:  # DN without E
+                    return False
+                if all(flags):
+                    return False
+                if r0 == 4 and day_types.get(d, "평일") not in ("토", "일", "공") and cnt > 1:
+                    return False
+            if r0 in (3, 5):
+                if flags[0] and flags[2] and not flags[1]:  # DN requires E too
+                    return False
+                if r0 == 5 and day_types.get(d, "평일") not in ("토", "일", "공") and cnt > 1:
+                    return False
+        if r0 in (2, 3, 4, 5):
+            for t in sequence_window_starts(timeline_len, 2):
+                if sum(sum(timeline[t+p]) for p in range(2)) >= 4:
+                    return False
+
+        # N block maximum.
+        block_len = n_max + 1
+        for t in sequence_window_starts(timeline_len, block_len):
+            if sum(timeline[t+i][2] for i in range(block_len)) >= block_len:
+                return False
+
+        # N-block end consequences, matching the solver's current-month enforcement.
+        for e in range(timeline_len):
+            if not timeline[e][2]:
+                continue
+            next_is_n = (e + 1 < timeline_len and timeline[e+1][2])
+            if next_is_n:
+                continue
+            for r in range(1, n_rest + 1):
+                dd = e + r
+                if dd >= timeline_len:
+                    break
+                if dd < previous_days:
+                    continue
+                if any(timeline[dd]):
+                    return False
+            for g in range(n_rest + 1, n_gap + 1):
+                dd = e + g
+                if dd >= timeline_len:
+                    break
+                if dd < previous_days:
+                    continue
+                if timeline[dd][2]:
+                    return False
+
+        if r2:
+            for t in sequence_window_starts(timeline_len, 2):
+                if timeline[t][1] and timeline[t+1][0]:
+                    return False
+        if r3:
+            for t in sequence_window_starts(timeline_len, 3):
+                if timeline[t][1] and timeline[t+1][1] and timeline[t+2][1]:
+                    return False
+        if r4:
+            for t in sequence_window_starts(timeline_len, 4):
+                es = [timeline[t+i][1] for i in range(4)]
+                if es[0] and es[1] and (not es[2]) and es[3]:
+                    return False
+                if es[0] and (not es[1]) and es[2] and es[3]:
+                    return False
+        if r5 in (3, 4, 5, 6, 7):
+            for t in sequence_window_starts(timeline_len, r5 + 1):
+                if sum(1 if any(timeline[t+p]) else 0 for p in range(r5 + 1)) > r5:
+                    return False
+        if r6 > 0:
+            for t in sequence_window_starts(timeline_len, 7):
+                if sum(sum(timeline[t+p]) for p in range(7)) > r6:
+                    return False
+        if r7:
+            for t in sequence_window_starts(timeline_len, 3):
+                if timeline[t][0] and timeline[t+1][0] and timeline[t+2][0]:
+                    return False
+        return True
+
+    result: dict[tuple[int, int], list[str]] = {}
+    shift_keys = ["D", "E", "N"]
+    for n in range(num_doctors):
+        current_flags = []
+        for d in range(num_days):
+            current_flags.append([int(x) for x in _parse_actual_shift(sol.get((n, d), ""))])
+        current_counts = [sum(current_flags[d][s] for d in range(num_days)) for s in range(3)]
+        current_total = sum(current_counts)
+        sc = shift_counts.get(n, {})
+        fixed_total = int(sc.get("Total", -1))
+        max_total = int(maximum_total.get(n, -1))
+
+        # Exact fixed total means no extra assignment can be added without breaking it.
+        if fixed_total >= 0 and current_total >= fixed_total:
+            continue
+        if max_total >= 0 and current_total >= max_total:
+            continue
+
+        for d in range(num_days):
+            req_cell = str(sr_raw.get(f"{n},{d}", "") or "")
+            cannot = _parse_shift_request(req_cell)
+            candidates = []
+            for s, shift_key in enumerate(shift_keys):
+                if current_flags[d][s]:
+                    continue
+                if cannot[s]:
+                    continue
+
+                # Exact per-shift and total counts remain hard constraints.
+                fixed_shift = int(sc.get(shift_key, -1))
+                if fixed_shift >= 0 and current_counts[s] + 1 > fixed_shift:
+                    continue
+                if fixed_total >= 0 and current_total + 1 > fixed_total:
+                    continue
+                if max_total >= 0 and current_total + 1 > max_total:
+                    continue
+
+                trial = [list(x) for x in current_flags]
+                trial[d][s] = 1
+                if personal_rules_ok(n, trial):
+                    candidates.append(shift_key)
+            if candidates:
+                result[(n, d)] = candidates
+    return result
+
 def build_and_solve(params: dict[str, Any]):
     """
     Main entry-point called from app.py.
@@ -66,12 +1018,13 @@ def build_and_solve(params: dict[str, Any]):
         num_days      : int
         start_date    : str  (YYYY-MM-DD)
         day_types     : dict {str(day_idx) -> '평일'|'토'|'일'|'공'}
-        duty_requests : dict {str(day_idx) -> [D, E, N]}
+        duty_requests : dict {str(day_idx) -> [D, E, N]}  # minimum staffing per duty
         shift_requests: dict {"n,d" -> cell_str}
         previous_schedule: dict {"n,h" -> actual shift}, h=0 oldest of preceding days
         previous_schedule_days: int (default 5)
         rules         : dict {str(n) -> {rule_key: value}}
         shift_adj     : dict {str(n) -> int}
+        maximum_total : dict {str(n) -> -1|int}; -1 = no maximum
         grades        : dict {str(n) -> int}
         grade_rules   : dict with senior/junior policy
         solver_mode   : str
@@ -97,6 +1050,8 @@ def build_and_solve(params: dict[str, Any]):
     previous_schedule_raw = params.get("previous_schedule", {}) or {}
     rules_raw    = {int(k): v for k, v in params["rules"].items()}
     shift_adj    = {int(k): int(v) for k, v in params["shift_adj"].items()}
+    maximum_total_raw = params.get("maximum_total", {}) or {}
+    maximum_total = {int(k): int(v) for k, v in maximum_total_raw.items()}
     # shift_counts: {n: {"D": -1|int, "E": -1|int, "N": -1|int}}, -1 = auto balance
     shift_counts_raw = params.get("shift_counts", {})
     shift_counts = {}
@@ -191,13 +1146,9 @@ def build_and_solve(params: dict[str, Any]):
                 f"고년차 hard rule 불가능: grade >= {senior_min_grade} 인원이 {len(senior_doctors)}명인데, "
                 f"각 duty마다 최소 {senior_min_count}명이 필요합니다."
             )
-        for d in all_days:
-            for s in all_shifts:
-                if duty_requests[d][s] > 0 and senior_min_count > duty_requests[d][s]:
-                    raise RuntimeError(
-                        f"고년차 hard rule 불가능: day {d+1}, shift {['D','E','N'][s]} 필요 인원은 "
-                        f"{duty_requests[d][s]}명인데 고년차 최소 {senior_min_count}명으로 설정되어 있습니다."
-                    )
+        # DutyRequests are minimum staffing values.  If the minimum headcount is
+        # smaller than senior_min_count, the solver may simply add staff to that duty.
+        # Therefore only the size of the senior pool is a global impossibility here.
 
     # Validate ultra-junior hard rule before building the full model.
     # ultra_junior_max_count = maximum ultra-juniors allowed in one active D/E/N duty.
@@ -263,16 +1214,56 @@ def build_and_solve(params: dict[str, Any]):
     fixed_total_sum = sum(fixed_total_by_doc.values())
     free_total_doctors = [n for n in all_doctors if n not in fixed_total_by_doc]
 
-    if fixed_total_sum > total_duty:
+    # maximum_total is a separate hard upper bound. -1/absent means unlimited.
+    max_total_by_doc = {
+        n: int(maximum_total.get(n, -1))
+        for n in all_doctors
+        if int(maximum_total.get(n, -1)) >= 0
+    }
+    for n, fixed_total in fixed_total_by_doc.items():
+        max_total = max_total_by_doc.get(n, -1)
+        if max_total >= 0 and fixed_total > max_total:
+            raise RuntimeError(
+                f"{names[n]}의 fixed_total({fixed_total})이 maximum_total({max_total})보다 큽니다."
+            )
+
+    # If every doctor has a finite total upper bound (fixed_total itself is also an
+    # exact upper bound), the sum of those bounds must cover all required duties.
+    finite_upper_bounds = []
+    all_have_upper_bound = True
+    for n in all_doctors:
+        if n in fixed_total_by_doc:
+            finite_upper_bounds.append(fixed_total_by_doc[n])
+        elif n in max_total_by_doc:
+            finite_upper_bounds.append(max_total_by_doc[n])
+        else:
+            all_have_upper_bound = False
+            break
+    if all_have_upper_bound and sum(finite_upper_bounds) < total_duty:
         raise RuntimeError(
-            f"fixed_total 합({fixed_total_sum})이 Duty 총합({total_duty})보다 {fixed_total_sum - total_duty}개 많습니다. "
-            f"Duty 설정에서 총 근무를 추가하거나 fixed_total을 줄여주세요."
+            f"모든 의사의 total 상한 합({sum(finite_upper_bounds)})이 Duty 총합({total_duty})보다 작아 "
+            f"{total_duty - sum(finite_upper_bounds)}개 근무를 배정할 수 없습니다."
         )
-    if not free_total_doctors and fixed_total_sum != total_duty:
+
+    # DutyRequests are MINIMUM staffing, while fixed_total is an EXACT monthly count.
+    # Therefore fixed_total_sum > minimum Duty total is allowed: the solver must
+    # overstaff some active D/E/N duties enough to honor those exact totals.
+    # The impossible all-fixed case is the opposite direction: exact totals are
+    # collectively smaller than the minimum staffing demand.
+    if not free_total_doctors and fixed_total_sum < total_duty:
         raise RuntimeError(
-            f"모든 의사의 fixed_total이 지정되어 있지만 합({fixed_total_sum})이 Duty 총합({total_duty})과 다릅니다. "
-            f"차이={total_duty - fixed_total_sum}개입니다."
+            f"모든 의사의 fixed_total 합({fixed_total_sum})이 Duty 최소합({total_duty})보다 "
+            f"{total_duty - fixed_total_sum}개 작아 최소 필요 인원을 채울 수 없습니다."
         )
+
+    for n in all_doctors:
+        sc = shift_counts.get(n, {})
+        fixed_shift_sum = sum(int(sc.get(sk, -1)) for sk in ("D", "E", "N") if int(sc.get(sk, -1)) >= 0)
+        max_total = max_total_by_doc.get(n, -1)
+        if max_total >= 0 and fixed_shift_sum > max_total:
+            raise RuntimeError(
+                f"{names[n]}의 fixed_D/E/N 지정 합({fixed_shift_sum})이 maximum_total({max_total})보다 큽니다."
+            )
 
     for n, fixed_total in fixed_total_by_doc.items():
         sc = shift_counts.get(n, {})
@@ -297,8 +1288,12 @@ def build_and_solve(params: dict[str, Any]):
     }
 
     free_total_adj = sum(balance_shift_adj.get(n, 0) for n in free_total_doctors)
+    # Use the smallest plausible total assignment count as the balancing target.
+    # If exact fixed totals already exceed the Duty minimum, they alone determine
+    # that target and unfixed staff are not pushed toward a negative average.
+    target_total_duty = max(total_duty, fixed_total_sum)
     avr_total_free = (
-        (total_duty - fixed_total_sum - free_total_adj) / len(free_total_doctors)
+        (target_total_duty - fixed_total_sum - free_total_adj) / len(free_total_doctors)
         if free_total_doctors else 0.0
     )
 
@@ -500,10 +1495,27 @@ def build_and_solve(params: dict[str, Any]):
                     timeline_shift(n,t+2,0).Not(),
                 ])
 
-    # Duty demand constraints
+    # Duty staffing constraints.
+    # DutyRequests now mean MINIMUM required headcount, not an exact count.
+    # A request of 0 keeps that shift closed; a positive request may be exceeded
+    # when exact fixed_total/fixed_D/E/N values require additional assignments.
+    duty_extra_vars = []
+    duty_count_vars = {}
     for d in all_days:
         for s in all_shifts:
-            model.Add(sum(shifts[(n,d,s)] for n in all_doctors) == duty_requests[d][s])
+            requested_min = int(duty_requests[d][s])
+            count_var = model.NewIntVar(0, num_doctors, f"duty_count_{d}_{s}")
+            model.Add(count_var == sum(shifts[(n,d,s)] for n in all_doctors))
+            duty_count_vars[(d, s)] = count_var
+            if requested_min <= 0:
+                model.Add(count_var == 0)
+            else:
+                model.Add(count_var >= requested_min)
+                extra = model.NewIntVar(0, max(0, num_doctors - requested_min), f"duty_extra_{d}_{s}")
+                model.Add(extra == count_var - requested_min)
+                duty_extra_vars.append(extra)
+
+    duty_extra_total = sum(duty_extra_vars) if duty_extra_vars else 0
 
     # Grade hard rule: each active duty must include enough senior doctors.
     if senior_min_count > 0:
@@ -541,7 +1553,7 @@ def build_and_solve(params: dict[str, Any]):
             for s in all_shifts:
                 if duty_requests[d][s] <= 0:
                     continue
-                max_excess = max(0, duty_requests[d][s] - junior_soft_max_count)
+                max_excess = max(0, len(junior_doctors) - junior_soft_max_count)
                 if max_excess <= 0:
                     continue
                 junior_count = sum(shifts[(n,d,s)] for n in junior_doctors)
@@ -549,85 +1561,49 @@ def build_and_solve(params: dict[str, Any]):
                 model.Add(excess >= junior_count - junior_soft_max_count)
                 junior_excess_vars.append(excess)
 
-    # ── Grade 평균 편차 (duty별) ─────────────────────────────────────────────
-    # 기존 D/E/N 편차와 동일한 방식:
-    # "각 duty의 grade 평균이 전체 평균에서 최대 k4만큼 벗어날 수 있다"
-    #
-    # 10배 스케일로 정수화 (k4=5 → 실제 편차 0.5)
-    # grade_avg(d,s) × 10 = grade_sum(d,s) × 10 / r
-    # 전체 평균 × 10 = total_grade × 10 / num_doctors (정수 근사)
-    # CP-SAT: 양변에 r × num_doctors 곱해서 정수 비교
-    # grade_sum × num_doctors × 10  vs  total_grade × r × 10
-    # → grade_sum × num_doctors  vs  total_grade × r  (10 약분)
-    # 편차 upper bound: grade_sum × num_doctors ≤ total_grade × r + k4 × r
-    # 편차 lower bound: grade_sum × num_doctors ≥ total_grade × r - k4 × r
-    # 즉 k4 단위 = num_doctors × 1/10 grade (10배 스케일)
-
-    # 더 직관적으로: 양변을 num_doctors로 나누면
-    # grade_sum / r ≤ total_grade/num_doctors + k4/10
-    # k4=5 이면 평균 grade에서 ±0.5 허용
-
+    # ── Grade 구성 편차 (duty별) ─────────────────────────────────────────────
+    # Duty headcount is now variable because DutyRequests are minimums.  The old
+    # formula divided by the fixed requested headcount, so it would be incorrect
+    # after overstaffing.  Instead compare the actual grade sum with
+    # (overall average grade × actual assigned headcount), which stays linear.
     max_grade   = max(grades.get(n, 2) for n in all_doctors) if num_doctors > 0 else 3
     total_grade = sum(grades.get(n, 2) for n in all_doctors)
-    # 10배 스케일 전체 평균 (정수 근사)
     avr_grade_10 = (total_grade * 10) // num_doctors if num_doctors > 0 else 20
-
-    # k4 범위: 최대 ±max_grade (10배 스케일이므로 ×10)
-    k4 = model.NewIntVar(0, max_grade * 10, 'k4_grade_dev')
+    grade_dev_bound = max(1, num_doctors * max(10, max_grade * 10, avr_grade_10))
+    k4 = model.NewIntVar(0, grade_dev_bound, 'k4_grade_dev')
 
     if weight_grade_dev > 0 and num_doctors > 0:
         for d in all_days:
             for s in all_shifts:
-                r = duty_requests[d][s]
-                if r <= 0:
+                if duty_requests[d][s] <= 0:
                     continue
-
-                # grade_sum × 10 / r 가 avr_grade_10 ± k4 이내
-                # CP-SAT: 양변 × r → grade_sum × 10 이 avr_grade_10×r ± k4×r 이내
+                actual_count = duty_count_vars[(d, s)]
                 grade_sum_10 = sum(shifts[(n,d,s)] * grades.get(n, 2) * 10 for n in all_doctors)
-
-                # avr_grade_10 × r - k4 × r ≤ grade_sum_10 ≤ avr_grade_10 × r + k4 × r
-                # → grade_sum_10 ≤ (avr_grade_10 + k4) × r
-                # → grade_sum_10 ≥ (avr_grade_10 - k4) × r
-                #
-                # CP-SAT AddBoolOr 방식 대신 직접 부등식:
-                # 단, k4가 변수이므로 선형 표현 필요
-                # grade_sum_10 - avr_grade_10 * r ≤ k4 * r
-                # avr_grade_10 * r - grade_sum_10 ≤ k4 * r
-
-                max_gs10 = max_grade * 10 * r
-                gs10_var = model.NewIntVar(0, max_gs10, f"gs10_{d}_{s}")
-                model.Add(gs10_var == grade_sum_10)
-
-                dev_up = model.NewIntVar(0, max_gs10, f"gup_{d}_{s}")
-                dev_dn = model.NewIntVar(0, max_gs10, f"gdn_{d}_{s}")
-                model.Add(dev_up - dev_dn == gs10_var - avr_grade_10 * r)
-
-                # k4 × r ≥ dev_up  and  k4 × r ≥ dev_dn
-                # → k4 이 "grade 평균 편차의 최대값 (×10 스케일)"
-                # r로 나눠야 하지만 CP-SAT 정수 → r 곱한 채로 k4에 반영
-                # 대신 k4를 r배 스케일로 정의하지 않고,
-                # 편차를 r로 나눈 값이 k4 이하가 되도록:
-                # dev_up ≤ k4 × r  (즉 dev_up/r ≤ k4)
-                model.Add(dev_up <= k4 * r)
-                model.Add(dev_dn <= k4 * r)
+                dev = model.NewIntVar(0, grade_dev_bound, f"grade_dev_{d}_{s}")
+                model.Add(dev >= grade_sum_10 - avr_grade_10 * actual_count)
+                model.Add(dev >= avr_grade_10 * actual_count - grade_sum_10)
+                model.Add(k4 >= dev)
 
     # ── Soft balancing (deviation minimization) ───────────────────────────────
     # 각 balance 항목을 아래쪽/위쪽 편차로 분리한다.
     # 예: 목표 19~20일 때 19~21은 상방 1, 18~20은 하방 1, 17~22는 하방 2+상방 2로 계산.
-    k_de_low  = model.NewIntVar(0, 6, 'k_DE_low')
-    k_de_high = model.NewIntVar(0, 6, 'k_DE_high')
-    k1_low    = model.NewIntVar(0, 6, 'k1_holiday_low')
-    k1_high   = model.NewIntVar(0, 6, 'k1_holiday_high')
-    k2_low    = model.NewIntVar(0, 6, 'k2_total_low')
-    k2_high   = model.NewIntVar(0, 6, 'k2_total_high')
-    k3_low    = model.NewIntVar(0, 6, 'k3_N_low')
-    k3_high   = model.NewIntVar(0, 6, 'k3_N_high')
+    # A low maximum_total can legitimately put a doctor far below the uncapped
+    # average. Keep deviation variables wide enough so that the balancing soft
+    # objective never turns a valid maximum_total cap into an accidental hard failure.
+    max_balance_dev = max(6, total_duty, num_days * num_shifts)
+    k_de_low  = model.NewIntVar(0, max_balance_dev, 'k_DE_low')
+    k_de_high = model.NewIntVar(0, max_balance_dev, 'k_DE_high')
+    k1_low    = model.NewIntVar(0, max_balance_dev, 'k1_holiday_low')
+    k1_high   = model.NewIntVar(0, max_balance_dev, 'k1_holiday_high')
+    k2_low    = model.NewIntVar(0, max_balance_dev, 'k2_total_low')
+    k2_high   = model.NewIntVar(0, max_balance_dev, 'k2_total_high')
+    k3_low    = model.NewIntVar(0, max_balance_dev, 'k3_N_low')
+    k3_high   = model.NewIntVar(0, max_balance_dev, 'k3_N_high')
 
-    k  = model.NewIntVar(0, 12, 'k_DE_sum')
-    k1 = model.NewIntVar(0, 12, 'k1_holiday_sum')
-    k2 = model.NewIntVar(0, 12, 'k2_total_sum')
-    k3 = model.NewIntVar(0, 12, 'k3_N_sum')
+    k  = model.NewIntVar(0, max_balance_dev * 2, 'k_DE_sum')
+    k1 = model.NewIntVar(0, max_balance_dev * 2, 'k1_holiday_sum')
+    k2 = model.NewIntVar(0, max_balance_dev * 2, 'k2_total_sum')
+    k3 = model.NewIntVar(0, max_balance_dev * 2, 'k3_N_sum')
     model.Add(k  == k_de_low + k_de_high)
     model.Add(k1 == k1_low + k1_high)
     model.Add(k2 == k2_low + k2_high)
@@ -652,16 +1628,19 @@ def build_and_solve(params: dict[str, Any]):
         if fixed_e >= 0: model.Add(num_s[1] == fixed_e)
         if fixed_n >= 0: model.Add(num_s[2] == fixed_n)
         if fixed_total >= 0: model.Add(num_total == fixed_total)
+        max_total = int(maximum_total.get(n, -1))
+        if max_total >= 0:
+            model.Add(num_total <= max_total)
 
-        dev_de  = [model.NewIntVar(0, 6, f'dde_{n}_{x}') for x in range(2)]
-        dev_hol = [model.NewIntVar(0, 6, f'dhol_{n}_{x}') for x in range(2)]
-        dev_tot = [model.NewIntVar(0, 6, f'dtot_{n}_{x}') for x in range(2)]
-        dev_N   = [model.NewIntVar(0, 6, f'dN_{n}_{x}') for x in range(2)]
+        dev_de  = [model.NewIntVar(0, max_balance_dev, f'dde_{n}_{x}') for x in range(2)]
+        dev_hol = [model.NewIntVar(0, max_balance_dev, f'dhol_{n}_{x}') for x in range(2)]
+        dev_tot = [model.NewIntVar(0, max_balance_dev, f'dtot_{n}_{x}') for x in range(2)]
+        dev_N   = [model.NewIntVar(0, max_balance_dev, f'dN_{n}_{x}') for x in range(2)]
 
-        sum_de  = model.NewIntVar(0, 12, f'sde_{n}')
-        sum_hol = model.NewIntVar(0, 12, f'shol_{n}')
-        sum_tot = model.NewIntVar(0, 12, f'stot_{n}')
-        sum_N   = model.NewIntVar(0, 12, f'sN_{n}')
+        sum_de  = model.NewIntVar(0, max_balance_dev * 2, f'sde_{n}')
+        sum_hol = model.NewIntVar(0, max_balance_dev * 2, f'shol_{n}')
+        sum_tot = model.NewIntVar(0, max_balance_dev * 2, f'stot_{n}')
+        sum_N   = model.NewIntVar(0, max_balance_dev * 2, f'sN_{n}')
 
         model.Add(sum_de  == dev_de[0]  + dev_de[1])
         model.Add(sum_hol == dev_hol[0] + dev_hol[1])
@@ -724,13 +1703,23 @@ def build_and_solve(params: dict[str, Any]):
         + k3 * weight_n_dev
         + k4 * weight_grade_dev
     )
+    # `adv` remains the schedule-quality penalty shown to the user.  Extra staffing
+    # is optimized lexicographically ahead of it: one fewer extra assignment must
+    # always beat any possible improvement in balancing/grade/junior penalties.
     adv = balance_penalty + junior_penalty
     is_multi = "다중" in solver_mode
 
-    # Always solve once with objective minimization first.
-    # In multi mode, this first pass finds the best objective value, then we enumerate
-    # solutions with adv <= best_adv + adv_limit.
-    model.Minimize(adv)
+    balance_upper = (
+        2 * max_balance_dev * (weight_de_dev + weight_holiday_dev + weight_total_dev + weight_n_dev)
+        + grade_dev_bound * weight_grade_dev
+    )
+    junior_upper = num_days * num_shifts * max(0, len(junior_doctors) - junior_soft_max_count) * junior_penalty_weight
+    extra_duty_weight = int(balance_upper + junior_upper + 1)
+    objective_expr = duty_extra_total * extra_duty_weight + adv
+
+    # First minimize extra staffing, then quality within that minimum through the
+    # dominating coefficient above.
+    model.Minimize(objective_expr)
 
     # ── Solve ─────────────────────────────────────────────────────────────────
     solver = cp_model.CpSolver()
@@ -769,7 +1758,7 @@ def build_and_solve(params: dict[str, Any]):
                 'Junior': 'Y' if grades.get(n, 2) <= junior_max_grade else '',
                 '초저년차': 'Y' if grades.get(n, 2) <= ultra_junior_max_grade else '',
                 'D': d_cnt, 'E': e_cnt, 'N': n_cnt,
-                'Total': tot, '연차': annual_cnt, 'Holiday': hol,
+                'Total': tot, 'maximum_total': int(maximum_total.get(n, -1)), '연차': annual_cnt, 'Holiday': hol,
                 'Fri_N': fri_n,
                 '주간평균hr': round((d_cnt*8 + e_cnt*9 + n_cnt*8) / num_days * 7, 2),
             })
@@ -781,12 +1770,17 @@ def build_and_solve(params: dict[str, Any]):
     if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
         raise RuntimeError("최적해가 없습니다.")
 
+    best_extra_duty = solver.Value(duty_extra_total) if duty_extra_vars else 0
     best_adv = solver.Value(adv)
     allowed_adv = best_adv + adv_limit if is_multi else best_adv
 
     def _metric_dict(value_fn):
         return {
             "adv": value_fn(adv),
+            "duty_extra": value_fn(duty_extra_total) if duty_extra_vars else 0,
+            "duty_minimum_total": total_duty,
+            "actual_duty_total": total_duty + (value_fn(duty_extra_total) if duty_extra_vars else 0),
+            "extra_duty_weight": extra_duty_weight,
             "k": value_fn(k),
             "k_low": value_fn(k_de_low),
             "k_high": value_fn(k_de_high),
@@ -828,8 +1822,10 @@ def build_and_solve(params: dict[str, Any]):
         metrics.append(_metric_dict(solver.Value))
     else:
         # 2-stage multi-solution search:
-        #   step 1: minimize adv and record best_adv
-        #   step 2: enumerate schedules with adv <= best_adv + adv_limit
+        #   step 1: minimize extra staffing first, then schedule-quality penalty
+        #   step 2: keep the minimum extra staffing count fixed and enumerate
+        #           schedules with adv <= best_adv + adv_limit
+        model.Add(duty_extra_total == best_extra_duty)
         model.Add(adv <= allowed_adv)
         try:
             model.ClearObjective()

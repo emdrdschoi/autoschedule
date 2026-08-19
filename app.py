@@ -300,6 +300,7 @@ def _init_state():
         "rules": {},              # {n: {rule_key: value}}
         "shift_adj": {},          # {n: int}
         "shift_counts": {},       # {n: {"D": -1|int, "E": -1|int, "N": -1|int, "Total": -1|int}}
+        "maximum_total": {},       # {n: -1|int}; -1 = no maximum, 0+ = hard upper bound
         "grade_rules": {          # Global grade/balancing policy; not per-doctor
             "senior_min_grade": 2,
             "senior_min_count": 1,
@@ -316,6 +317,8 @@ def _init_state():
         },
         "solutions": [],
         "summaries": [],
+        "additional_availability": [],
+        "last_solve_params": None,
         "sol_idx": 0,
         "solved": False,
         "shift_req_version": 0,  # key versioning for shift_request widgets
@@ -485,6 +488,16 @@ def normalize_shift_counts():
                 sc[key] = -1
         st.session_state.shift_counts[ni] = sc
 
+def normalize_maximum_total():
+    """Ensure per-doctor maximum_total values exist. -1 means no upper bound."""
+    if "maximum_total" not in st.session_state or not isinstance(st.session_state.maximum_total, dict):
+        st.session_state.maximum_total = {}
+    for ni in range(len(st.session_state.get("doctors", []))):
+        st.session_state.maximum_total[ni] = parse_fixed_count_value(
+            st.session_state.maximum_total.get(ni, -1)
+        )
+
+
 def sync_live_total_summary_inputs(num_days: int | None = None):
     """Synchronize live number_input widget values before rendering fixed_total summary.
 
@@ -546,9 +559,18 @@ def sync_shift_count_widget(ni: int, shift_key: str, widget_key: str):
     st.session_state.shift_counts[ni][shift_key] = bounded_int(st.session_state.get(widget_key), -1, -1, 60)
 
 
+FIXED_TOTAL_EDITOR_SCHEMA_VERSION = 3  # v3 puts maximum_total visibly next to Name
+
 def get_fixed_total_editor_key() -> str:
-    """Versioned key for the fixed count table editor."""
-    return f"fixed_counts_editor_v{st.session_state.get('shift_count_version', 0)}"
+    """Versioned key for the fixed/max count table editor.
+
+    Include a schema version so Streamlit cannot reuse stale data_editor state
+    created before columns (such as maximum_total) were added.
+    """
+    return (
+        f"fixed_counts_editor_schema{FIXED_TOTAL_EDITOR_SCHEMA_VERSION}"
+        f"_v{st.session_state.get('shift_count_version', 0)}"
+    )
 
 
 def get_estimated_average_total() -> float:
@@ -617,14 +639,32 @@ def calculate_shift_adj_preview_df(current_df: pd.DataFrame | None) -> tuple[pd.
 
 
 def pending_fixed_total_editor_df_is_valid(pending_df: object, base_df: pd.DataFrame) -> bool:
-    """Check whether a screen-only preview table still matches the current doctor list."""
+    """Check whether a screen-only preview table matches the current table schema.
+
+    Older preview DataFrames did not contain maximum_total.  Checking only No/Name
+    allowed that stale preview to replace the new table indefinitely, which made the
+    new maximum_total column disappear from the UI.
+    """
     if not isinstance(pending_df, pd.DataFrame):
         return False
     if len(pending_df) != len(base_df):
         return False
+
+    required_cols = (
+        "No", "Name", "maximum_total", "fixed_Total", "Grade", "Senior", "Junior", "초저년차", "연차(a)",
+        "근무조정값", "fixed_D", "fixed_E", "fixed_N",
+    )
+    if any(col not in pending_df.columns for col in required_cols):
+        return False
+    if any(col not in base_df.columns for col in required_cols):
+        return False
+
+    # Keep column order/schema synchronized too, so newly inserted columns appear
+    # exactly where intended rather than being hidden by an old widget state.
+    if list(pending_df.columns) != list(base_df.columns):
+        return False
+
     for col in ("No", "Name"):
-        if col not in pending_df.columns or col not in base_df.columns:
-            return False
         if list(pending_df[col].astype(str)) != list(base_df[col].astype(str)):
             return False
     return True
@@ -645,6 +685,7 @@ def build_fixed_total_editor_df() -> pd.DataFrame:
     normalize_doctors()
     normalize_grade_rules()
     normalize_shift_counts()
+    normalize_maximum_total()
     gr = st.session_state.grade_rules
     senior_min_grade = int(gr.get("senior_min_grade", DEFAULT_GRADE_RULES["senior_min_grade"]))
     junior_max_grade = int(gr.get("junior_max_grade", DEFAULT_GRADE_RULES["junior_max_grade"]))
@@ -662,6 +703,9 @@ def build_fixed_total_editor_df() -> pd.DataFrame:
         rows.append({
             "No": ni + 1,
             "Name": doc.get("name", ""),
+            # Put maximum_total immediately after Name so it is always visible.
+            "maximum_total": fixed_count_display_value(st.session_state.maximum_total.get(ni, -1)),
+            "fixed_Total": fixed_count_display_value(sc.get("Total", -1)),
             "Grade": grade,
             "Senior": "Y" if grade >= senior_min_grade else "",
             "Junior": "Y" if grade <= junior_max_grade else "",
@@ -671,7 +715,6 @@ def build_fixed_total_editor_df() -> pd.DataFrame:
             "fixed_D": fixed_count_display_value(sc.get("D", -1)),
             "fixed_E": fixed_count_display_value(sc.get("E", -1)),
             "fixed_N": fixed_count_display_value(sc.get("N", -1)),
-            "fixed_Total": fixed_count_display_value(sc.get("Total", -1)),
         })
     return pd.DataFrame(rows)
 
@@ -688,6 +731,7 @@ def sync_fixed_total_editor_widget():
     key = get_fixed_total_editor_key()
     editor_state = st.session_state.get(key)
     normalize_shift_counts()
+    normalize_maximum_total()
 
     editable_cols = (("fixed_D", "D"), ("fixed_E", "E"), ("fixed_N", "N"), ("fixed_Total", "Total"))
 
@@ -710,6 +754,8 @@ def sync_fixed_total_editor_widget():
                 for col, shift_key in editable_cols:
                     if col in changes:
                         st.session_state.shift_counts[ni][shift_key] = parse_fixed_count_value(changes.get(col))
+                if "maximum_total" in changes:
+                    st.session_state.maximum_total[ni] = parse_fixed_count_value(changes.get("maximum_total"))
         return
 
     # Defensive compatibility for Streamlit versions or testing paths where the
@@ -732,6 +778,7 @@ def apply_fixed_total_editor_df(edited_df: pd.DataFrame):
     if not any(col in edited_df.columns for col, _ in editable_cols):
         return
     normalize_shift_counts()
+    normalize_maximum_total()
     for pos, (_, row) in enumerate(edited_df.iterrows()):
         if pos >= len(st.session_state.get("doctors", [])):
             break
@@ -742,29 +789,40 @@ def apply_fixed_total_editor_df(edited_df: pd.DataFrame):
         for col, shift_key in editable_cols:
             if col in edited_df.columns:
                 st.session_state.shift_counts[pos][shift_key] = parse_fixed_count_value(row.get(col, ""))
+        if "maximum_total" in edited_df.columns:
+            st.session_state.maximum_total[pos] = parse_fixed_count_value(row.get("maximum_total", ""))
 
 
 def render_fixed_total_editor_table():
     """Render a batched fixed Total/D/E/N editor below the Duty/fixed_total summary.
 
     The editor is inside a form so Streamlit does not apply every single cell edit
-    immediately.  Users can paste/edit many cells, then press one button to commit
+    immediately. Users can paste/edit many cells, then press one button to commit
     the values to session_state.shift_counts.
     """
     estimated_average = get_estimated_average_total()
     st.caption(
-        "아래 표에서 연차(a) 개수, 근무 조정값과 fixed_D / fixed_E / fixed_N / fixed_Total을 함께 확인/수정합니다. "
-        "연차(a)는 현재 근무 요청의 a 개수입니다. 자동계산 버튼을 누르면 연차(a) 또는 fixed_Total 기준 권장값이 화면의 근무조정값 칸에 계산됩니다. 저장을 눌러야 실제 반영됩니다. "
-        "fixed count는 빈칸 = 자동 평준화, 0 = 해당 근무 없음, 1 이상 = 그 개수로 고정입니다. "
-        f"현재 estimated average는 약 {estimated_average:.1f}개/명입니다."
+        "빈칸은 자동 배정입니다. fixed_D/E/N/Total은 정확한 개수, maximum_total은 총근무 상한, "
+        "근무조정값은 자동 평준화 목표를 ±조정합니다. 저장을 눌러야 실제 반영됩니다."
     )
+    with st.expander("입력값 설명", expanded=False):
+        st.markdown(
+            f"""
+- **근무조정값**: fixed_Total이 없는 사람의 자동 평준화 목표를 조정합니다. `+1`은 약 1근무 증가, `-1`은 약 1근무 감소 방향입니다.
+- **fixed_D / fixed_E / fixed_N**: 해당 shift를 정확히 그 개수로 고정합니다. `0`도 정확한 0개라는 뜻입니다.
+- **fixed_Total**: 월 총근무수를 정확히 고정합니다. 더 많거나 적게 배정할 수 없습니다.
+- **maximum_total**: 월 총근무 상한입니다. 그보다 적게 근무하는 것은 허용됩니다.
+- **연차(a)**: 근무 요청에서 입력한 `a` 개수입니다. 자동계산 시 fixed_Total이 없는 사람의 권장 근무조정값에 반영됩니다.
+- **Duty 기준 평균**: 현재 Duty 최소합 ÷ 전체 인원 = 약 **{estimated_average:.1f}개/명**입니다. 실제 자동 목표는 fixed_Total, 근무조정값 및 개인 rule에 따라 달라질 수 있습니다.
+            """
+        )
     key = get_fixed_total_editor_key()
     df = get_fixed_total_editor_display_df()
 
     if st.session_state.get("fixed_counts_editor_pending_df") is not None:
         st.info("자동계산 결과가 화면 표에만 반영되어 있습니다. 실제 설정에 반영하려면 저장을 누르세요.")
 
-    with st.form("fixed_counts_editor_form", clear_on_submit=False):
+    with st.form(f"fixed_counts_editor_form_schema{FIXED_TOTAL_EDITOR_SCHEMA_VERSION}", clear_on_submit=False):
         btn_col1, btn_col2 = st.columns(2)
         with btn_col1:
             submitted = st.form_submit_button("저장", use_container_width=True)
@@ -819,6 +877,11 @@ def render_fixed_total_editor_table():
                     width="small",
                     help="빈칸 = 자동 평준화, 0 = 총근무 없음, 1 이상 = 총 D/E/N 근무 수 고정",
                 ),
+                "maximum_total": st.column_config.TextColumn(
+                    "maximum_total",
+                    width="small",
+                    help="빈칸 = 제한 없음, 0 이상 = 총 D/E/N 근무 수의 최대 허용값. fixed_Total과 달리 더 적게 근무하는 것은 허용",
+                ),
             },
         )
     if auto_submitted:
@@ -864,51 +927,46 @@ def get_fixed_total_summary():
     }
 
 def render_fixed_total_duty_summary(num_days: int):
-    """Render a compact mismatch/remaining summary for DutyRequests vs fixed_total."""
+    """Render Duty MINIMUM vs exact fixed_total summary."""
     sync_live_total_summary_inputs(num_days)
     fixed_total_info = get_fixed_total_summary()
     d_total = sum(st.session_state.duty_requests.get(di, [0, 0, 0])[0] for di in range(num_days))
     e_total = sum(st.session_state.duty_requests.get(di, [0, 0, 0])[1] for di in range(num_days))
     n_total = sum(st.session_state.duty_requests.get(di, [0, 0, 0])[2] for di in range(num_days))
     annual_total = int(sum(get_annual_leave_counts_by_doc().values()))
-    remaining = fixed_total_info["remaining"]
-    diff_text = f"{remaining:+d}"
+    minimum_total = fixed_total_info["total_duty"]
+    fixed_sum = fixed_total_info["fixed_sum"]
     free_count = int(fixed_total_info.get("free_count", 0))
-    remaining_per_free_text = ""
-    if free_count > 0 and remaining >= 0:
-        remaining_per_free = remaining / free_count
-        remaining_per_free_text = f"약 {remaining_per_free:.1f}개/명"
+    difference = fixed_sum - minimum_total
 
     if fixed_total_info["fixed_count"] == 0:
-        if free_count > 0:
-            total_per_free = fixed_total_info["total_duty"] / free_count
-            comment = (
-                f"fixed_total이 지정된 사람이 없습니다. 총근무 수는 전체 {free_count}명에게 자동 평준화됩니다 "
-                f"(약 {total_per_free:.1f}개/명)."
-            )
-        else:
-            comment = "fixed_total이 지정된 사람이 없습니다. 총근무 수는 자동 평준화됩니다."
-    elif remaining == 0:
-        comment = "차이 0: Duty 총합과 fixed_total 합이 정확히 맞습니다."
-    elif remaining > 0:
-        if free_count > 0:
-            comment = (
-                f"차이 {diff_text}: Duty 총합이 fixed_total 합보다 {remaining}개 많습니다. "
-                f"현재는 fixed_total 미지정 인원 {free_count}명에게 {remaining}개가 자동 배분됩니다 "
-                f"({remaining_per_free_text}). "
-                f"모든 인원의 Total을 고정하려면 Duty를 {remaining}개 줄이거나 fixed_total을 {remaining}개 늘리세요."
-            )
-        else:
-            comment = (
-                f"차이 {diff_text}: Duty 총합이 fixed_total 합보다 {remaining}개 많습니다. "
-                f"Duty를 {remaining}개 줄이거나 fixed_total을 {remaining}개 늘려야 합니다."
-            )
-    else:
-        over = -remaining
         comment = (
-            f"차이 {diff_text}: fixed_total 합이 Duty 총합보다 {over}개 많습니다. "
-            f"Duty를 {over}개 늘리거나 fixed_total을 {over}개 줄여야 합니다."
+            f"fixed_Total 지정자가 없습니다. Duty 최소인원을 우선 충족하고, "
+            f"미지정 {free_count}명은 개인 rule과 근무조정값을 반영해 평준화합니다."
         )
+    elif difference > 0:
+        comment = (
+            f"fixed_Total을 맞추려면 Duty 최소합보다 최소 {difference}근무가 더 필요합니다. "
+            "solver가 개인 rule을 만족하는 활성 duty에 자동으로 추가 배정합니다."
+        )
+    elif difference == 0:
+        comment = "fixed_Total 합과 Duty 최소합이 같습니다. 개인 rule을 만족하는 범위에서 최소 인원을 기준으로 배정합니다."
+    else:
+        shortage = -difference
+        if free_count > 0:
+            comment = (
+                f"fixed_Total 지정자 배정 후 최소 {shortage}근무가 남습니다. "
+                f"미지정 {free_count}명이 개인 rule과 근무조정값을 반영해 나누어 채웁니다."
+            )
+        else:
+            comment = (
+                f"모든 인원의 fixed_Total 합이 Duty 최소합보다 {shortage}근무 부족합니다. "
+                "현재 값으로는 최소 필요 인원을 채울 수 없습니다."
+            )
+
+    doctor_count = len(st.session_state.get("doctors", []))
+    duty_average = (minimum_total / doctor_count) if doctor_count > 0 else 0.0
+    fixed_count = int(fixed_total_info.get("fixed_count", 0))
 
     st.markdown(
         f"""
@@ -916,27 +974,30 @@ def render_fixed_total_duty_summary(num_days: int):
                     padding:0.65rem 0.8rem;border:1px solid #4b5563;border-radius:5px;
                     background:#1f2937;color:#ffffff;margin:0.7rem 0;'>
             <div>
-                <span style='color:#ffffff;'>Duty 총합:</span> <b style='color:#ffffff;'>{fixed_total_info['total_duty']}</b>
+                <span style='color:#ffffff;'>Duty 최소합</span> <b>{minimum_total}</b>
                 <span style='color:#e5e7eb;'>(D {d_total} / E {e_total} / N {n_total})</span>
-                &nbsp;|&nbsp; <span style='color:#ffffff;'>연차(a) 총합:</span> <b style='color:#ffffff;'>{annual_total}</b>
-                &nbsp;|&nbsp; <span style='color:#ffffff;'>fixed_total 합:</span> <b style='color:#ffffff;'>{fixed_total_info['fixed_sum']}</b>
-                &nbsp;|&nbsp; <span style='color:#ffffff;'>fixed_total 미지정 인원:</span> <b style='color:#ffffff;'>{fixed_total_info['free_count']}</b>
-                &nbsp;|&nbsp; <span style='color:#ffffff;'>차이:</span> <b style='color:#ffffff;'>{diff_text}</b>
-                &nbsp;|&nbsp; <span style='color:#ffffff;'>남은 근무수:</span> <b style='color:#ffffff;'>{remaining}</b>
+                &nbsp;|&nbsp; <span style='color:#ffffff;'>Duty 기준 평균</span> <b>{duty_average:.1f}/명</b>
+                &nbsp;|&nbsp; <span style='color:#ffffff;'>fixed_Total</span> <b>{fixed_count}명 · 합 {fixed_sum}</b>
+                &nbsp;|&nbsp; <span style='color:#ffffff;'>미지정</span> <b>{free_count}명</b>
+                &nbsp;|&nbsp; <span style='color:#ffffff;'>연차(a)</span> <b>{annual_total}</b>
             </div>
             <div style='margin-top:0.35rem;color:#ffffff;font-weight:600;'>💬 {comment}</div>
         </div>
         """,
         unsafe_allow_html=True
     )
-    if fixed_total_info["fixed_count"] > 0:
-        if remaining < 0:
-            st.error(f"fixed_total 합이 Duty 총합보다 {-remaining}개 많습니다. Duty를 {-remaining}개 늘리거나 fixed_total을 {-remaining}개 줄여야 합니다.")
-        elif fixed_total_info["free_count"] == 0 and remaining > 0:
-            st.error(f"모든 의사의 fixed_total이 지정되어 있는데 Duty 총합이 fixed_total 합보다 {remaining}개 많습니다. Duty를 {remaining}개 줄이거나 fixed_total을 {remaining}개 늘려야 합니다.")
-        elif fixed_total_info["free_count"] > 0 and remaining >= 0:
-            avg_msg = f" (약 {remaining / fixed_total_info['free_count']:.1f}개/명)" if fixed_total_info['free_count'] else ""
-            st.info(f"fixed_total이 없는 {fixed_total_info['free_count']}명에게 남은 근무수 {remaining}개가 자동 배분됩니다{avg_msg}.")
+
+    if fixed_total_info["fixed_count"] > 0 and free_count == 0 and fixed_sum < minimum_total:
+        st.error(
+            f"모든 인원의 fixed_total 합({fixed_sum})이 Duty 최소합({minimum_total})보다 "
+            f"{minimum_total - fixed_sum}개 작습니다. fixed_total 합을 늘리거나 Duty 최소 인원을 줄여야 합니다."
+        )
+    elif fixed_sum > minimum_total:
+        st.info(
+            f"fixed_total 때문에 최소 {fixed_sum - minimum_total}개의 추가 배정이 필요합니다. "
+            "solver가 가능한 duty에 자동으로 분산하며, 불필요한 추가 배정은 최소화합니다."
+        )
+
 
 def grade_rules_to_df(grade_rules: dict) -> pd.DataFrame:
     return pd.DataFrame([
@@ -1276,6 +1337,48 @@ def _diagnostic_max_shift_count_without_long_blocks(window_len: int, max_block: 
     return window_len - (window_len // (max_block + 1))
 
 
+
+def _run_exact_hard_conflict_diagnostics(combined_req: dict) -> tuple[pd.DataFrame, str]:
+    """Call scheduler.py's conservative exact hard-input conflict checker."""
+    try:
+        import importlib.util
+        scheduler_path = Path(__file__).resolve().with_name("scheduler.py")
+        if not scheduler_path.exists():
+            return pd.DataFrame(), f"scheduler.py를 찾을 수 없습니다: {scheduler_path}"
+        spec = importlib.util.spec_from_file_location("autoscheduler_diag_scheduler_v7", scheduler_path)
+        if spec is None or spec.loader is None:
+            return pd.DataFrame(), f"scheduler.py를 불러올 수 없습니다: {scheduler_path}"
+        scheduler_module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(scheduler_module)
+        diagnose_hard_conflicts = getattr(scheduler_module, "diagnose_hard_conflicts", None)
+        if not callable(diagnose_hard_conflicts):
+            return pd.DataFrame(), (
+                "현재 scheduler.py에 diagnose_hard_conflicts 함수가 없습니다. "
+                "app.py와 scheduler.py를 같은 V7 세트로 교체하세요."
+            )
+
+        params = {
+            "doctors": [d.get("name", "") for d in st.session_state.get("doctors", [])],
+            "num_days": int(st.session_state.get("num_days", 0)),
+            "start_date": str(st.session_state.get("start_date", date.today())),
+            "day_types": st.session_state.get("day_types", {}),
+            "duty_requests": st.session_state.get("duty_requests", {}),
+            "shift_requests": {f"{k[0]},{k[1]}": v for k, v in combined_req.items()},
+            "previous_schedule": {
+                f"{k[0]},{k[1]}": v for k, v in st.session_state.get("previous_schedule", {}).items()
+            },
+            "previous_schedule_days": PREVIOUS_SCHEDULE_DAYS,
+            "rules": {str(k): v for k, v in st.session_state.get("rules", {}).items()},
+            "shift_counts": {str(k): v for k, v in st.session_state.get("shift_counts", {}).items()},
+            "maximum_total": {str(k): v for k, v in st.session_state.get("maximum_total", {}).items()},
+        }
+        df = diagnose_hard_conflicts(params)
+        if not isinstance(df, pd.DataFrame):
+            df = pd.DataFrame(df or [])
+        return df, ""
+    except Exception as exc:
+        return pd.DataFrame(), f"확정 hard-conflict 진단 중 오류: {exc}"
+
 def run_hard_bottleneck_diagnostics() -> dict:
     """Run lightweight 1st/2nd-level infeasibility diagnostics.
 
@@ -1285,8 +1388,10 @@ def run_hard_bottleneck_diagnostics() -> dict:
     normalize_doctors()
     normalize_grade_rules()
     normalize_shift_counts()
+    normalize_maximum_total()
     sync_live_total_summary_inputs(st.session_state.num_days)
     combined_req = refresh_combined_shift_requests()
+    exact_conflicts_df, exact_conflicts_error = _run_exact_hard_conflict_diagnostics(combined_req)
 
     doctors_local = st.session_state.get("doctors", [])
     n_docs = len(doctors_local)
@@ -1393,29 +1498,6 @@ def run_hard_bottleneck_diagnostics() -> dict:
                         "부족": fixed_val - possible,
                         "설명": f"{shift_key} 가능 날짜가 고정값보다 적습니다.",
                     })
-        fixed_total = int(sc.get("Total", -1)) if isinstance(sc, dict) else -1
-        if fixed_total >= 0:
-            possible_days = 0
-            for di in range(n_days):
-                if any(_diagnostic_availability_for_shift(ni, di, si, combined_req)[0] for si in range(3)):
-                    possible_days += 1
-            r = st.session_state.rules.get(ni, DEFAULT_RULES.copy())
-            r6 = int(r.get("rule_max_shifts_per_week", DEFAULT_RULES["rule_max_shifts_per_week"]))
-            r5 = int(r.get("rule_max_consec_days", DEFAULT_RULES["rule_max_consec_days"]))
-            possible_total = possible_days
-            if n_days <= 7 and r6 > 0:
-                possible_total = min(possible_total, r6)
-            possible_total = min(possible_total, _diagnostic_max_workdays_without_consecutive_run(n_days, r5))
-            if fixed_total > possible_total:
-                fixed_rows.append({
-                    "이름": name,
-                    "항목": "fixed_Total",
-                    "고정값": fixed_total,
-                    "단순 가능 최대": possible_total,
-                    "부족": fixed_total - possible_total,
-                    "설명": "연차/x/불가요청 및 연속근무/주간상한을 고려한 단순 최대보다 fixed_Total이 큽니다.",
-                })
-
     # 2차: window-level bottlenecks. This uses upper-bound availability, so if demand
     # exceeds this value the window is structurally impossible under current hard inputs.
     window_rows = []
@@ -1496,11 +1578,17 @@ def run_hard_bottleneck_diagnostics() -> dict:
     fixed_df = pd.DataFrame(fixed_rows)
     window_df = pd.DataFrame(window_rows)
     return {
+        "exact_conflicts_df": exact_conflicts_df,
+        "exact_conflicts_error": exact_conflicts_error,
         "duty_df": duty_df,
         "fixed_df": fixed_df,
         "window_df": window_df,
         "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-        "note": "이 진단은 1차/2차 병목 후보를 찾는 사전 검사입니다. N-rest, E→D 금지, 연속근무 등 전체 조합 충돌은 일부만 근사하므로, 원인 후보로 해석하세요.",
+        "note": (
+            "0차는 PreviousSchedule·대문자 D/E/N·x/a·fixed/maximum_total·개인 sequence rule 사이의 확정 충돌과, "
+            "fixed_Total이 실제 개인 hard rule 아래에서 정확히 달성 가능한지를 CP-SAT로 검사합니다. "
+            "1차/2차는 후보 수와 구간 capacity를 보는 병목 검사이므로 원인 후보로 해석하세요."
+        ),
     }
 
 
@@ -1512,9 +1600,25 @@ def render_hard_bottleneck_diagnostics(results: dict):
     st.caption(results.get("note", ""))
     st.caption(f"생성 시각: {results.get('generated_at', '')}")
 
+    exact_df = results.get("exact_conflicts_df", pd.DataFrame())
+    exact_error = results.get("exact_conflicts_error", "")
     duty_df = results.get("duty_df", pd.DataFrame())
     fixed_df = results.get("fixed_df", pd.DataFrame())
     window_df = results.get("window_df", pd.DataFrame())
+
+    st.markdown("**0차 진단 · hard coding 충돌 + fixed_Total 정확 달성 가능성**")
+    st.caption(
+        "대문자 D/E/N은 solver에서 반드시 배정되는 hard-fixed 근무로 해석됩니다. "
+        "직전 5일 스케줄과 N-rest/N-gap, E→D, 연속근무, sliding 7일 상한, fixed/maximum_total을 서로 대조하고, "
+        "fixed_Total이 있는 사람은 실제 개인 hard rule과 동일한 CP-SAT 모델로 그 정확한 총근무수가 가능한지도 검사합니다."
+    )
+    if exact_error:
+        st.warning(exact_error)
+    elif exact_df is None or exact_df.empty:
+        st.success("직접적인 hard coding 충돌이나 개인 fixed_Total 달성 불가 문제는 발견되지 않았습니다.")
+    else:
+        st.error(f"확정 충돌 {len(exact_df)}건이 발견되었습니다. 아래 항목은 현재 입력 그대로는 동시에 만족할 수 없습니다.")
+        st.dataframe(exact_df, use_container_width=True, hide_index=True)
 
     st.markdown("**1차 진단 · 날짜/Duty별 후보 부족**")
     if duty_df is None or duty_df.empty:
@@ -1522,9 +1626,9 @@ def render_hard_bottleneck_diagnostics(results: dict):
     else:
         st.dataframe(duty_df, use_container_width=True, hide_index=True)
 
-    st.markdown("**1차 진단 · 개인 fixed_Total / fixed_D/E/N 가능성**")
+    st.markdown("**1차 진단 · 개인 fixed_D/E/N 단순 가능성**")
     if fixed_df is None or fixed_df.empty:
-        st.success("개인 fixed count가 단순 가능 최대를 초과하는 경우는 발견되지 않았습니다.")
+        st.success("개인 fixed_D/E/N이 단순 가능 최대를 초과하는 경우는 발견되지 않았습니다.")
     else:
         st.dataframe(fixed_df, use_container_width=True, hide_index=True)
 
@@ -1657,6 +1761,7 @@ def run_hard_rule_diagnostics() -> dict:
     normalize_doctors()
     normalize_grade_rules()
     normalize_shift_counts()
+    normalize_maximum_total()
     combined_req = refresh_combined_shift_requests()
 
     doctors = st.session_state.doctors
@@ -1756,6 +1861,9 @@ def run_hard_rule_diagnostics() -> dict:
             if fixed_total >= 0:
                 # fixed_Total itself should not create interval proof, but it is still an upper bound on total shifts.
                 doc_cap = min(doc_cap, fixed_total)
+            max_total = parse_fixed_count_value(st.session_state.maximum_total.get(ni, -1))
+            if max_total >= 0:
+                doc_cap = min(doc_cap, max_total)
             total += doc_cap
         return int(total)
 
@@ -1918,6 +2026,11 @@ def render_readme_guide(expanded: bool = False):
         st.markdown(read_readme_text())
 
 
+def _parse_result_shift_codes(value) -> list[str]:
+    text = str(value or "").strip().upper()
+    return [s for s in ("D", "E", "N") if s in text]
+
+
 def build_schedule_excel_bytes(
     *,
     doctors,
@@ -1928,6 +2041,7 @@ def build_schedule_excel_bytes(
     metrics: list,
     sol_idx: int,
     display_order: list[int],
+    additional_availability: dict | None = None,
 ) -> bytes:
     """Build the result Excel file lazily, only when the user requests export."""
     date_cols = []
@@ -1980,17 +2094,43 @@ def build_schedule_excel_bytes(
             "이름": doc["name"],
             "grade": int(doc.get("grade", DEFAULT_DOCTOR_GRADE)),
             "shift_adj": st.session_state.shift_adj.get(ni, 0),
+            "maximum_total": fixed_count_excel_value(st.session_state.maximum_total.get(ni, -1)),
         }
         for key in rule_col_order:
             row[rule_col_labels[key]] = r.get(key, "")
         rules_rows.append(row)
     rules_df = pd.DataFrame(rules_rows)
 
+    availability_rows = []
+    additional_availability = additional_availability or {}
+    for ni in display_order:
+        current_total = sum(len(_parse_result_shift_codes(sol.get((ni, di), ""))) for di in range(num_days))
+        max_total = parse_fixed_count_value(st.session_state.maximum_total.get(ni, -1))
+        for di in range(num_days):
+            candidates = additional_availability.get((ni, di), [])
+            if not candidates:
+                continue
+            d = start_date + timedelta(days=di)
+            availability_rows.append({
+                "No": ni + 1,
+                "Name": doctors[ni]["name"],
+                "Date": d.strftime("%Y-%m-%d"),
+                "Day": get_day_label(start_date, di),
+                "Current": (sol.get((ni, di), "") or "").upper(),
+                "Can_add": "/".join(candidates),
+                "Current_Total": current_total,
+                "maximum_total": "" if max_total < 0 else max_total,
+                "Remaining_to_max": "" if max_total < 0 else max_total - current_total,
+            })
+    availability_df = pd.DataFrame(availability_rows)
+
     towrite = BytesIO()
     with pd.ExcelWriter(towrite, engine="openpyxl") as writer:
         export_df.to_excel(writer, sheet_name="Schedule", index=False)
         summary_display.to_excel(writer, sheet_name="Summary", index=False)
         rules_df.to_excel(writer, sheet_name="Rules", index=False)
+        if not availability_df.empty:
+            availability_df.to_excel(writer, sheet_name="AdditionalAvailability", index=False)
         grade_rules_to_df(st.session_state.grade_rules).to_excel(writer, sheet_name="GradeRules", index=False)
         if metrics and sol_idx < len(metrics):
             pd.DataFrame([metrics[sol_idx]]).to_excel(writer, sheet_name="Metrics", index=False)
@@ -2034,6 +2174,7 @@ CHUNK = 7  # Number of days per chunk for display
 normalize_doctors()
 normalize_grade_rules()
 normalize_shift_counts()
+normalize_maximum_total()
 normalize_shift_request_layers()
 
 
@@ -2072,6 +2213,7 @@ with st.sidebar:
                 st.session_state.rules[n] = DEFAULT_RULES.copy()
                 st.session_state.shift_adj[n] = 0
                 st.session_state.shift_counts[n] = {"D": -1, "E": -1, "N": -1, "Total": -1}
+                st.session_state.maximum_total[n] = -1
                 st.rerun()
 
     if st.session_state.doctors:
@@ -2142,6 +2284,7 @@ with st.sidebar:
             row["fixed_E"] = fixed_count_excel_value(sc.get("E", -1))
             row["fixed_N"] = fixed_count_excel_value(sc.get("N", -1))
             row["fixed_Total"] = fixed_count_excel_value(sc.get("Total", -1))
+            row["maximum_total"] = fixed_count_excel_value(st.session_state.maximum_total.get(ni, -1))
             rules_rows.append(row)
         df_rules = pd.DataFrame(rules_rows, index=doctor_names)
         df_rules.index.name = 'Name'
@@ -2248,9 +2391,11 @@ with st.sidebar:
                     "N": ["fixed_N", "fixed_n", "N 고정"],
                     "Total": ["fixed_Total", "fixed_total", "fixed_TOTAL", "Total 고정", "fixed total"],
                 }
+                maximum_total_aliases = ["maximum_total", "maximum_Total", "max_total", "Maximum Total", "총근무 최대", "maximum total"]
 
                 new_rules = {}
                 new_shift_counts = {}
+                new_maximum_total = {}
                 for i, doc in enumerate(st.session_state.doctors):
                     row = find_row_by_name_or_position(df_rules, doc['name'], i)
                     base_rule = DEFAULT_RULES.copy()
@@ -2266,10 +2411,13 @@ with st.sidebar:
                         shift_key: safe_int(row_get_any(row, aliases, -1), -1, -1, 60)
                         for shift_key, aliases in fixed_aliases.items()
                     }
+                    new_maximum_total[i] = safe_int(row_get_any(row, maximum_total_aliases, -1), -1, -1, 60)
 
                 st.session_state.rules = new_rules
                 st.session_state.shift_counts = new_shift_counts
+                st.session_state.maximum_total = new_maximum_total
                 normalize_shift_counts()
+                normalize_maximum_total()
                 # Excel 불러오기 후 Total/D/E/N 고정 개수 입력 위젯이 이전 값을 붙잡지 않도록 key version 갱신
                 st.session_state["shift_count_version"] = st.session_state.get("shift_count_version", 0) + 1
 
@@ -2521,8 +2669,8 @@ with tab2:
         save_duty_settings = st.form_submit_button("저장", use_container_width=True)
         st.caption("Duty 숫자를 여러 칸 수정한 뒤 저장을 눌러야 실제 설정에 반영됩니다.")
         st.markdown('<div class="section-label">날짜별 필요 인원 설정</div>', unsafe_allow_html=True)
-        st.caption("각 날짜마다 Day / Evening / Night 에 필요한 의사 수를 설정합니다.")
-        st.caption("아래 요약에서 Duty 총합과 fixed_total 합을 먼저 확인하세요. 숫자가 맞지 않으면 solver가 해를 찾을 수 없습니다.")
+        st.caption("각 날짜마다 Day / Evening / Night의 최소 필요 인원을 설정합니다. solver는 fixed_total 같은 exact 조건을 맞추기 위해 필요한 경우 이 숫자보다 더 배정할 수 있습니다.")
+        st.caption("아래 요약의 Duty 합은 '최소 필요 근무수'입니다. fixed_total 합이 더 커도 오류가 아니며, 차이만큼 가능한 duty에 추가 배정합니다.")
         render_fixed_total_duty_summary(num_days)
 
         for chunk_start in range(0, num_days, CHUNK):
@@ -2592,8 +2740,8 @@ for ni in range(len(doctors)):
         st.session_state.shift_adj[ni] = 0
 
 with tab3:
-    st.markdown('<div class="section-label">근무 조정값 & fixed D/E/N/Total / Duty 총합 확인</div>', unsafe_allow_html=True)
-    st.caption("fixed schedule 관련 표를 rule 화면의 가장 위에 배치했습니다. 근무 조정값과 fixed_D/E/N/Total을 한 번에 수정할 수 있습니다.")
+    st.markdown('<div class="section-label">월 근무수 설정</div>', unsafe_allow_html=True)
+    st.caption("Duty는 날짜별 최소 필요 인원입니다. fixed_Total은 정확한 월 근무수이고, maximum_total은 총근무 상한입니다.")
     render_fixed_total_duty_summary(num_days)
     render_fixed_total_editor_table()
     st.divider()
@@ -2696,7 +2844,7 @@ with tab3:
 
         st.divider()
         st.markdown('<div class="section-label">개인별 Grade & 근무 규칙 설정</div>', unsafe_allow_html=True)
-        st.caption("7명씩 나눠서 표시됩니다. Grade와 개인 rule을 입력하세요. 근무 조정값과 fixed count는 위 표에서 수정합니다.")
+        st.caption("7명씩 나눠서 표시됩니다. Grade와 개인 rule을 입력하세요. 근무 조정값, fixed count, maximum_total은 위 표에서 수정합니다.")
 
         doc_names = [d["name"] for d in doctors]
         DOC_CHUNK = 7
@@ -2743,6 +2891,27 @@ with tab3:
                 )
                 doctors[ni]["grade"] = int(new_grade)
 
+            # maximum_total: also expose it directly in the per-doctor rule grid.
+            # Blank means no upper bound; 0+ means a hard upper bound on total D/E/N duties.
+            max_cols = st.columns([2] + [1] * chunk_size)
+            max_cols[0].markdown(
+                "<span style='font-size:0.75rem'><b>maximum_total</b><br>총근무 최대 (빈칸=제한없음)</span>",
+                unsafe_allow_html=True,
+            )
+            for ci, ni in enumerate(range(chunk_start, chunk_end)):
+                current_max = parse_fixed_count_value(st.session_state.maximum_total.get(ni, -1))
+                max_text = max_cols[ci+1].text_input(
+                    f"maximum_total_{ni}",
+                    value="" if current_max < 0 else str(current_max),
+                    label_visibility="collapsed",
+                    key=f"doc_maximum_total_{ni}_v{st.session_state.get('shift_count_version', 0)}",
+                    placeholder="",
+                    help="빈칸 = 제한 없음, 0 이상 = 총 D/E/N 근무가 이 값을 넘지 않음",
+                )
+                st.session_state.maximum_total[ni] = parse_fixed_count_value(max_text)
+
+            st.caption("maximum_total은 fixed_total과 달리 정확한 개수가 아니라 상한입니다. 예: 12 → 0~12회 허용")
+
             # 근무 조정값과 fixed Total/D/E/N counts are edited in the table above.
 
             # 규칙 rows
@@ -2780,7 +2949,11 @@ with tab3:
     if save_grade_rule_settings:
         st.session_state["grade_rule_version"] = st.session_state.get("grade_rule_version", 0) + 1
         st.session_state["grade_version"] = st.session_state.get("grade_version", 0) + 1
-        st.toast("✅ 개인 규칙 / Grade 설정이 저장되었습니다.", icon="✅")
+        # maximum_total is also editable in this form. Recreate the top fixed/max
+        # editor from the newly committed values so both views stay synchronized.
+        st.session_state["shift_count_version"] = st.session_state.get("shift_count_version", 0) + 1
+        st.session_state["fixed_counts_editor_pending_df"] = None
+        st.toast("✅ 개인 규칙 / Grade / maximum_total 설정이 저장되었습니다.", icon="✅")
         st.rerun()
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -2844,16 +3017,62 @@ if st.session_state.get("trigger_solve"):
         # immediately clicks "스케줄 생성".
         sync_live_total_summary_inputs(num_days)
         fixed_total_info = get_fixed_total_summary()
+        normalize_maximum_total()
         precheck_error = ""
-        if fixed_total_info["fixed_count"] > 0 and fixed_total_info["remaining"] < 0:
-            precheck_error = (
-                f"fixed_total 합이 Duty 총합보다 {-fixed_total_info['remaining']}개 많습니다. "
-                f"Duty 설정에서 총 근무를 {-fixed_total_info['remaining']}개 추가하거나 fixed_total을 줄여주세요."
+
+        # fixed_total is exact; maximum_total is only an upper bound. Validate the
+        # interaction before invoking CP-SAT so input mistakes are immediately visible.
+        for ni, doc in enumerate(doctors):
+            fixed_val = parse_fixed_count_value(st.session_state.shift_counts.get(ni, {}).get("Total", -1))
+            max_val = parse_fixed_count_value(st.session_state.maximum_total.get(ni, -1))
+            if fixed_val >= 0 and max_val >= 0 and fixed_val > max_val:
+                precheck_error = f"{doc['name']}의 fixed_total({fixed_val})이 maximum_total({max_val})보다 큽니다."
+                break
+            fixed_shift_sum = sum(
+                parse_fixed_count_value(st.session_state.shift_counts.get(ni, {}).get(sk, -1))
+                for sk in ("D", "E", "N")
+                if parse_fixed_count_value(st.session_state.shift_counts.get(ni, {}).get(sk, -1)) >= 0
             )
-        elif fixed_total_info["fixed_count"] > 0 and fixed_total_info["free_count"] == 0 and fixed_total_info["remaining"] != 0:
+            if max_val >= 0 and fixed_shift_sum > max_val:
+                precheck_error = (
+                    f"{doc['name']}의 fixed_D/E/N 지정 합({fixed_shift_sum})이 maximum_total({max_val})보다 큽니다."
+                )
+                break
+
+        if not precheck_error:
+            upper_bounds = []
+            all_bounded = True
+            for ni in range(len(doctors)):
+                fixed_val = parse_fixed_count_value(st.session_state.shift_counts.get(ni, {}).get("Total", -1))
+                max_val = parse_fixed_count_value(st.session_state.maximum_total.get(ni, -1))
+                if fixed_val >= 0:
+                    upper_bounds.append(fixed_val)
+                elif max_val >= 0:
+                    upper_bounds.append(max_val)
+                else:
+                    all_bounded = False
+                    break
+            if all_bounded and sum(upper_bounds) < fixed_total_info["total_duty"]:
+                precheck_error = (
+                    f"전체 total 상한 합({sum(upper_bounds)})이 Duty 최소합({fixed_total_info['total_duty']})보다 작습니다. "
+                    f"maximum_total/fixed_total을 늘리거나 Duty 최소 인원을 줄여주세요."
+                )
+
+        # fixed_total is exact; DutyRequests are minimum staffing.
+        # fixed_total sum ABOVE the Duty minimum is valid and will be absorbed by
+        # overstaffing active duties.  Only an all-fixed total BELOW the minimum is
+        # immediately impossible.
+        if (
+            not precheck_error
+            and fixed_total_info["fixed_count"] > 0
+            and fixed_total_info["free_count"] == 0
+            and fixed_total_info["fixed_sum"] < fixed_total_info["total_duty"]
+        ):
             precheck_error = (
-                f"모든 의사의 fixed_total이 지정되어 있는데 Duty 총합과 {fixed_total_info['remaining']}개 차이가 납니다. "
-                "Duty 설정 또는 fixed_total을 맞춰주세요."
+                f"모든 인원의 fixed_total 합({fixed_total_info['fixed_sum']})이 "
+                f"Duty 최소합({fixed_total_info['total_duty']})보다 "
+                f"{fixed_total_info['total_duty'] - fixed_total_info['fixed_sum']}개 작습니다. "
+                "최소 필요 인원을 채울 수 없습니다."
             )
 
         if precheck_error:
@@ -2861,26 +3080,48 @@ if st.session_state.get("trigger_solve"):
             st.session_state.solutions = []
             st.session_state.summaries = []
             st.session_state.metrics = []
+            st.session_state.additional_availability = []
             st.session_state["solve_failed"] = True
             st.session_state["solve_failure_message"] = precheck_error
             st.error(precheck_error)
-            st.info("📋 Duty 설정 또는 개인 규칙 / Grade 탭의 fixed_total 요약을 확인하세요. 결과 탭에서 진단모드를 실행할 수도 있습니다.")
+            st.info("📋 Duty 최소 인원, fixed/maximum total, 개인 규칙을 확인하세요. 결과 탭에서 진단모드를 실행할 수도 있습니다.")
         else:
             with st.spinner("최적 스케줄을 계산 중입니다..."):
                 try:
-                    try:
-                        from scheduler import build_and_solve
-                    except ModuleNotFoundError:
-                        # Robust fallback for test/deployment runners that do not add
-                        # the app.py directory to sys.path automatically.
-                        import importlib.util
-                        scheduler_path = Path(__file__).with_name("scheduler.py")
-                        spec = importlib.util.spec_from_file_location("scheduler", scheduler_path)
-                        if spec is None or spec.loader is None:
-                            raise ImportError(f"scheduler.py를 불러올 수 없습니다: {scheduler_path}")
-                        scheduler_module = importlib.util.module_from_spec(spec)
-                        spec.loader.exec_module(scheduler_module)
-                        build_and_solve = scheduler_module.build_and_solve
+                    # Always load the scheduler.py that sits next to THIS app.py.
+                    # This avoids accidentally importing an older scheduler.py from
+                    # another folder or a stale module left in Python's import cache.
+                    import importlib.util
+                    scheduler_path = Path(__file__).resolve().with_name("scheduler.py")
+                    if not scheduler_path.exists():
+                        raise ImportError(f"같은 폴더에 scheduler.py가 없습니다: {scheduler_path}")
+
+                    spec = importlib.util.spec_from_file_location("autoscheduler_local_scheduler_v7", scheduler_path)
+                    if spec is None or spec.loader is None:
+                        raise ImportError(f"scheduler.py를 불러올 수 없습니다: {scheduler_path}")
+                    scheduler_module = importlib.util.module_from_spec(spec)
+                    spec.loader.exec_module(scheduler_module)
+
+                    expected_scheduler_api = '2026-08-19-v7-exact-fixed-total-diagnostics'
+                    actual_scheduler_api = getattr(scheduler_module, "SCHEDULER_API_VERSION", None)
+                    if actual_scheduler_api != expected_scheduler_api:
+                        raise ImportError(
+                            "app.py와 scheduler.py 버전이 맞지 않습니다. "
+                            f"현재 app 기대 버전={expected_scheduler_api}, "
+                            f"scheduler 버전={actual_scheduler_api or '구버전/표시없음'}. "
+                            f"반드시 같은 압축파일에 들어 있는 두 파일을 함께 사용하세요. "
+                            f"읽은 scheduler 경로: {scheduler_path}"
+                        )
+
+                    build_and_solve = getattr(scheduler_module, "build_and_solve", None)
+                    evaluate_additional_availability = getattr(scheduler_module, "evaluate_additional_availability", None)
+                    diagnose_hard_conflicts = getattr(scheduler_module, "diagnose_hard_conflicts", None)
+                    if not callable(build_and_solve) or not callable(evaluate_additional_availability) or not callable(diagnose_hard_conflicts):
+                        raise ImportError(
+                            "scheduler.py에 필요한 함수가 없습니다: "
+                            "build_and_solve / evaluate_additional_availability / diagnose_hard_conflicts. "
+                            f"읽은 파일: {scheduler_path}"
+                        )
 
                     params = {
                         "doctors": [d["name"] for d in doctors],
@@ -2894,6 +3135,7 @@ if st.session_state.get("trigger_solve"):
                         "rules": {str(k): v for k, v in st.session_state.rules.items()},
                         "shift_adj": {str(k): v for k, v in st.session_state.shift_adj.items()},
                         "shift_counts": {str(k): v for k, v in st.session_state.shift_counts.items()},
+                        "maximum_total": {str(k): v for k, v in st.session_state.maximum_total.items()},
                         "grades": {str(i): int(d.get("grade", DEFAULT_DOCTOR_GRADE)) for i, d in enumerate(doctors)},
                         "grade_rules": {k: int(v) for k, v in st.session_state.grade_rules.items()},
                         "solver_mode": st.session_state.solver_mode,
@@ -2906,6 +3148,10 @@ if st.session_state.get("trigger_solve"):
                     st.session_state.solutions = solutions
                     st.session_state.summaries = summaries
                     st.session_state.metrics = metrics
+                    st.session_state.additional_availability = [
+                        evaluate_additional_availability(params, sol_item) for sol_item in solutions
+                    ]
+                    st.session_state.last_solve_params = params
                     st.session_state.sol_idx = 0
                     st.session_state.solved = True
                     st.session_state["solve_failed"] = False
@@ -2919,6 +3165,7 @@ if st.session_state.get("trigger_solve"):
                     st.session_state.solutions = []
                     st.session_state.summaries = []
                     st.session_state.metrics = []
+                    st.session_state.additional_availability = []
                     st.session_state["solve_failed"] = True
                     st.session_state["solve_failure_message"] = msg
                     st.toast(f"❌ 조건을 만족하는 해가 없습니다: {msg}", icon="❌")
@@ -2927,6 +3174,7 @@ if st.session_state.get("trigger_solve"):
                     st.session_state.solutions = []
                     st.session_state.summaries = []
                     st.session_state.metrics = []
+                    st.session_state.additional_availability = []
                     st.session_state["solve_failed"] = True
                     st.session_state["solve_failure_message"] = str(e)
                     st.toast(f"❌ 오류 발생: {e}", icon="❌")
@@ -2944,7 +3192,7 @@ with tab5:
             st.error("조건을 만족하는 스케줄을 찾지 못했습니다.")
             if st.session_state.get("solve_failure_message"):
                 st.caption(st.session_state.get("solve_failure_message"))
-            st.info("진단모드는 자동으로 실행하지 않습니다. 아래 버튼을 누르면 1차/2차 hard-rule 병목 후보만 계산합니다.")
+            st.info("진단모드는 자동으로 실행하지 않습니다. 아래 버튼을 누르면 먼저 hard coding 간 확정 충돌을 찾고, 이어서 1차/2차 병목 후보를 계산합니다.")
             if st.button("🧪 진단모드 실행", key="btn_run_diagnostics"):
                 sync_live_total_summary_inputs(num_days)
                 st.session_state["diagnostic_results"] = run_hard_bottleneck_diagnostics()
@@ -2991,6 +3239,10 @@ with tab5:
         # Tue_N은 더 이상 표시하지 않고, 연차는 Total 바로 옆에 둔다.
         if "Tue_N" in summary_display.columns:
             summary_display = summary_display.drop(columns=["Tue_N"])
+        if "maximum_total" in summary_display.columns:
+            summary_display["maximum_total"] = summary_display["maximum_total"].apply(
+                lambda v: "" if pd.isna(v) or int(v) < 0 else int(v)
+            )
 
         # 연차는 solver summary에 이미 들어오더라도, 표시/export 단계에서 다시 계산해 보강한다.
         # 이렇게 하면 이전 solved session이나 legacy summary에도 항상 연차 컬럼이 보인다.
@@ -3028,6 +3280,57 @@ with tab5:
         except ImportError:
             st.dataframe(summary_display, use_container_width=True, hide_index=True)
 
+        # ── 추가 근무 가능일 (개인 hard rule 기준) ─────────────────────────
+        availability = {}
+        availability_list = st.session_state.get("additional_availability", [])
+        if sol_idx < len(availability_list):
+            availability = availability_list[sol_idx] or {}
+
+        st.markdown('<div class="section-label">추가 근무 가능일 · 개인 hard rule 기준</div>', unsafe_allow_html=True)
+        st.caption(
+            "현재 완성된 스케줄에 D/E/N을 1개 추가한다고 가정했을 때, 개인 근무불가 요청, 직전 5일 연속 규칙, "
+            "개인 rule, fixed_D/E/N, fixed_total, maximum_total을 모두 만족하는 후보만 표시합니다. "
+            "이 표는 대체/증원 후보 확인용이므로 날짜별 Duty 필요 인원과 senior/junior/grade 조합 같은 그룹 조건은 계산하지 않습니다."
+        )
+        availability_summary_rows = []
+        availability_detail_rows = []
+        for ni in display_order:
+            current_total = sum(len(_parse_result_shift_codes(sol.get((ni, di), ""))) for di in range(num_days))
+            max_total = parse_fixed_count_value(st.session_state.maximum_total.get(ni, -1))
+            entries = []
+            available_date_count = 0
+            for di in range(num_days):
+                candidates = availability.get((ni, di), [])
+                if not candidates:
+                    continue
+                available_date_count += 1
+                d = start_date + timedelta(days=di)
+                day_lbl = get_day_label(start_date, di)
+                cand_text = "/".join(candidates)
+                entries.append(f"{d.day}{day_lbl} {cand_text}")
+                availability_detail_rows.append({
+                    "No": ni + 1,
+                    "Name": doctors[ni]["name"],
+                    "날짜": d.strftime("%Y-%m-%d"),
+                    "요일": day_lbl,
+                    "현재 근무": (sol.get((ni, di), "") or "·").upper(),
+                    "추가 가능": cand_text,
+                })
+            availability_summary_rows.append({
+                "No": ni + 1,
+                "Name": doctors[ni]["name"],
+                "현재 Total": current_total,
+                "maximum_total": "" if max_total < 0 else max_total,
+                "max까지 여유": "" if max_total < 0 else max_total - current_total,
+                "가능 날짜수": available_date_count,
+                "추가 가능 날짜/shift": " · ".join(entries) if entries else "-",
+            })
+        availability_summary_df = pd.DataFrame(availability_summary_rows)
+        st.dataframe(availability_summary_df, use_container_width=True, hide_index=True)
+        if availability_detail_rows:
+            with st.expander("추가 근무 가능일 상세 보기"):
+                st.dataframe(pd.DataFrame(availability_detail_rows), use_container_width=True, hide_index=True)
+
         # 편차 정보 (k (DE), k1 (holiday), k2 (N), k3 (total), k4 (grade))
         if metrics and sol_idx < len(metrics):
             m = metrics[sol_idx]
@@ -3042,7 +3345,9 @@ with tab5:
 
             st.markdown(
                 f"<div style='font-size:0.85rem; color:var(--text-dim);'>"
-                f"** 편차*가중치 합={m.get('adv')} "
+                f"** 추가배정:** {m.get('duty_extra', 0)}개 "
+                f"(최소 {m.get('duty_minimum_total', '')} → 실제 {m.get('actual_duty_total', '')}) "
+                f"| ** 편차*가중치 합={m.get('adv')} "
                 f"| **최적 편차:** {m.get('best_adv', m.get('adv'))} "
                 f"| **허용 상한:** {m.get('allowed_adv', m.get('adv'))} "
                 f"| **balance penalty:** {m.get('balance_penalty', 'NA')} "
@@ -3087,6 +3392,7 @@ with tab5:
                 metrics=metrics,
                 sol_idx=sol_idx,
                 display_order=display_order,
+                additional_availability=availability,
             )
             st.session_state.prepared_excel_export = {
                 "sol_idx": sol_idx,
@@ -3316,7 +3622,7 @@ with tab5:
 
         # ── 날짜별 duty 구성 요약 ─────────────────────────────────────────────
         st.markdown('<div class="section-label">Daily duty 구성 요약</div>', unsafe_allow_html=True)
-        st.caption("각 날짜·D/E/N별 실제 배정 인원, 필요 인원, 평균 grade, 근무자를 확인합니다.")
+        st.caption("각 날짜·D/E/N별 실제 배정 인원과 최소 필요 인원을 비교합니다. fixed_total을 맞추기 위해 실제 인원이 최소값보다 많을 수 있습니다.")
 
         duty_summary_rows = []
         shift_labels = [('D', 'Day'), ('E', 'Evening'), ('N', 'Night')]
@@ -3328,7 +3634,7 @@ with tab5:
             date_label = f"{d.strftime('%m/%d')} ({lbl}{'·휴' if is_weekday_public_holiday else ''})"
             is_holiday_type = dtype in ('토', '일', '공')
             for si, (shift_key, shift_name) in enumerate(shift_labels):
-                staff = [ni for ni in range(len(doctors)) if sol.get((ni, di), '') == shift_key.lower()]
+                staff = [ni for ni in range(len(doctors)) if shift_key.lower() in str(sol.get((ni, di), '')).lower()]
                 grades_for_shift = [int(doctors[ni].get('grade', DEFAULT_DOCTOR_GRADE)) for ni in staff]
                 avg_grade = round(sum(grades_for_shift) / len(grades_for_shift), 2) if grades_for_shift else None
                 required = st.session_state.duty_requests.get(di, [0, 0, 0])[si]
@@ -3340,7 +3646,8 @@ with tab5:
                     "날짜": date_label,
                     "유형": dtype,
                     "Duty": shift_key,
-                    "인원/필요": f"{len(staff)}/{required}",
+                    "실제/최소": f"{len(staff)}/{required}",
+                    "추가배정": max(0, len(staff) - int(required)),
                     "평균 Grade": avg_grade if avg_grade is not None else "-",
                     "근무자": staff_with_grade,
                     "_is_holiday": is_holiday_type,
