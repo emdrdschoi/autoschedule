@@ -291,7 +291,7 @@ def _init_state():
         "start_date": start_of_month,
         "day_types": {},          # {day_idx: '평일'|'토'|'일'|'공'}
         "duty_requests": {},      # {day_idx: [D, E, N]} minimum staffing
-        "ideal_duty_requests": {},# {day_idx: [D, E, N]} soft preferred staffing; -1 = blank/not used
+        "ideal_duty_requests": {},# {day_idx: [D, E, N]} soft preferred staffing; defaults to minimum
         "shift_requests": {},     # combined view: base_shift_requests + fixed_shift_requests
         "base_shift_requests": {}, # user-entered wanted/cannot schedule
         "fixed_shift_requests": {},# result-cell locks overlaid on top of base requests
@@ -302,7 +302,6 @@ def _init_state():
         "shift_adj": {},          # {n: int}
         "shift_counts": {},       # {n: {"D": -1|int, "E": -1|int, "N": -1|int, "Total": -1|int}}
         "maximum_total": {},       # {n: -1|int}; -1 = no maximum, 0+ = hard upper bound
-        "maximum_N": {},           # {n: -1|int}; -1 = no N maximum, 0+ = hard upper bound
         "grade_rules": {          # Global grade/balancing policy; not per-doctor
             "senior_min_grade": 2,
             "senior_min_count": 1,
@@ -501,16 +500,6 @@ def normalize_maximum_total():
         )
 
 
-def normalize_maximum_n():
-    """Ensure per-doctor maximum_N values exist. -1 means no Night upper bound."""
-    if "maximum_N" not in st.session_state or not isinstance(st.session_state.maximum_N, dict):
-        st.session_state.maximum_N = {}
-    for ni in range(len(st.session_state.get("doctors", []))):
-        st.session_state.maximum_N[ni] = parse_fixed_count_value(
-            st.session_state.maximum_N.get(ni, -1)
-        )
-
-
 def sync_live_total_summary_inputs(num_days: int | None = None):
     """Synchronize live number_input widget values before rendering fixed_total summary.
 
@@ -536,24 +525,25 @@ def sync_live_total_summary_inputs(num_days: int | None = None):
                 vals[shift_i] = bounded_int(st.session_state.get(widget_key), vals[shift_i], 0, max(0, len(st.session_state.get("doctors", []))))
         st.session_state.duty_requests[di] = [int(vals[0]), int(vals[1]), int(vals[2])]
 
-    # Ideal staffing is OPTIONAL. Blank means no Ideal preference.
+    # Ideal staffing is a soft target.  Old configs/pages may not have it, in which
+    # case it defaults to the minimum.  Ideal is never allowed below minimum.
     if "ideal_duty_requests" not in st.session_state or not isinstance(st.session_state.ideal_duty_requests, dict):
         st.session_state.ideal_duty_requests = {}
     ideal_ver = st.session_state.get("ideal_duty_req_version", 0)
     for di in range(int(num_days)):
         minimums = list(st.session_state.duty_requests.get(di, [1, 1, 1]))
-        vals = list(st.session_state.ideal_duty_requests.get(di, [-1, -1, -1]))
+        vals = list(st.session_state.ideal_duty_requests.get(di, minimums))
         if len(vals) < 3:
-            vals = (vals + [-1, -1, -1])[:3]
+            vals = (vals + minimums)[:3]
         for shift_i in range(3):
             widget_key = f"ideal_duty_{di}_{shift_i}_v{ideal_ver}"
             if widget_key in st.session_state:
-                vals[shift_i] = normalized_ideal_duty_value(
-                    minimums[shift_i], st.session_state.get(widget_key)
+                vals[shift_i] = bounded_int(
+                    st.session_state.get(widget_key), vals[shift_i], 0,
+                    max(0, len(st.session_state.get("doctors", [])))
                 )
-            else:
-                vals[shift_i] = normalized_ideal_duty_value(minimums[shift_i], vals[shift_i])
-        st.session_state.ideal_duty_requests[di] = vals
+            vals[shift_i] = normalized_ideal_duty_value(minimums[shift_i], vals[shift_i])
+        st.session_state.ideal_duty_requests[di] = [int(vals[0]), int(vals[1]), int(vals[2])]
 
     # fixed_Total/D/E/N are edited in the fixed count table and applied only when
     # the user presses the save/apply button. Do not read unsaved editor state here;
@@ -584,15 +574,16 @@ def sync_duty_request_widget(di: int, shift_i: int, widget_key: str):
 
 
 def sync_ideal_duty_request_widget(di: int, shift_i: int, widget_key: str):
-    """Callback/helper for an optional Ideal Duty value; blank disables the target."""
+    """Callback/helper for an Ideal Duty value; enforce ideal >= minimum."""
     if "ideal_duty_requests" not in st.session_state or not isinstance(st.session_state.ideal_duty_requests, dict):
         st.session_state.ideal_duty_requests = {}
     minimums = list(st.session_state.duty_requests.get(di, [1, 1, 1]))
-    vals = list(st.session_state.ideal_duty_requests.get(di, [-1, -1, -1]))
+    vals = list(st.session_state.ideal_duty_requests.get(di, minimums))
     if len(vals) < 3:
-        vals = (vals + [-1, -1, -1])[:3]
-    vals[shift_i] = normalized_ideal_duty_value(minimums[shift_i], st.session_state.get(widget_key))
-    st.session_state.ideal_duty_requests[di] = vals
+        vals = (vals + minimums)[:3]
+    raw = bounded_int(st.session_state.get(widget_key), vals[shift_i], 0, max(0, len(st.session_state.get("doctors", []))))
+    vals[shift_i] = normalized_ideal_duty_value(minimums[shift_i], raw)
+    st.session_state.ideal_duty_requests[di] = [int(vals[0]), int(vals[1]), int(vals[2])]
 
 
 def sync_shift_count_widget(ni: int, shift_key: str, widget_key: str):
@@ -603,7 +594,7 @@ def sync_shift_count_widget(ni: int, shift_key: str, widget_key: str):
     st.session_state.shift_counts[ni][shift_key] = bounded_int(st.session_state.get(widget_key), -1, -1, 60)
 
 
-FIXED_TOTAL_EDITOR_SCHEMA_VERSION = 4  # v4 adds per-person maximum_N
+FIXED_TOTAL_EDITOR_SCHEMA_VERSION = 3  # v3 puts maximum_total visibly next to Name
 
 def get_fixed_total_editor_key() -> str:
     """Versioned key for the fixed/max count table editor.
@@ -695,7 +686,7 @@ def pending_fixed_total_editor_df_is_valid(pending_df: object, base_df: pd.DataF
         return False
 
     required_cols = (
-        "No", "Name", "maximum_total", "maximum_N", "fixed_Total", "Grade", "Senior", "Junior", "초저년차", "연차(a)",
+        "No", "Name", "maximum_total", "fixed_Total", "Grade", "Senior", "Junior", "초저년차", "연차(a)",
         "근무조정값", "fixed_D", "fixed_E", "fixed_N",
     )
     if any(col not in pending_df.columns for col in required_cols):
@@ -730,7 +721,6 @@ def build_fixed_total_editor_df() -> pd.DataFrame:
     normalize_grade_rules()
     normalize_shift_counts()
     normalize_maximum_total()
-    normalize_maximum_n()
     gr = st.session_state.grade_rules
     senior_min_grade = int(gr.get("senior_min_grade", DEFAULT_GRADE_RULES["senior_min_grade"]))
     junior_max_grade = int(gr.get("junior_max_grade", DEFAULT_GRADE_RULES["junior_max_grade"]))
@@ -748,9 +738,8 @@ def build_fixed_total_editor_df() -> pd.DataFrame:
         rows.append({
             "No": ni + 1,
             "Name": doc.get("name", ""),
-            # Keep total/N upper bounds visible near the name.
+            # Put maximum_total immediately after Name so it is always visible.
             "maximum_total": fixed_count_display_value(st.session_state.maximum_total.get(ni, -1)),
-            "maximum_N": fixed_count_display_value(st.session_state.maximum_N.get(ni, -1)),
             "fixed_Total": fixed_count_display_value(sc.get("Total", -1)),
             "Grade": grade,
             "Senior": "Y" if grade >= senior_min_grade else "",
@@ -778,7 +767,6 @@ def sync_fixed_total_editor_widget():
     editor_state = st.session_state.get(key)
     normalize_shift_counts()
     normalize_maximum_total()
-    normalize_maximum_n()
 
     editable_cols = (("fixed_D", "D"), ("fixed_E", "E"), ("fixed_N", "N"), ("fixed_Total", "Total"))
 
@@ -803,8 +791,6 @@ def sync_fixed_total_editor_widget():
                         st.session_state.shift_counts[ni][shift_key] = parse_fixed_count_value(changes.get(col))
                 if "maximum_total" in changes:
                     st.session_state.maximum_total[ni] = parse_fixed_count_value(changes.get("maximum_total"))
-                if "maximum_N" in changes:
-                    st.session_state.maximum_N[ni] = parse_fixed_count_value(changes.get("maximum_N"))
         return
 
     # Defensive compatibility for Streamlit versions or testing paths where the
@@ -828,7 +814,6 @@ def apply_fixed_total_editor_df(edited_df: pd.DataFrame):
         return
     normalize_shift_counts()
     normalize_maximum_total()
-    normalize_maximum_n()
     for pos, (_, row) in enumerate(edited_df.iterrows()):
         if pos >= len(st.session_state.get("doctors", [])):
             break
@@ -841,8 +826,6 @@ def apply_fixed_total_editor_df(edited_df: pd.DataFrame):
                 st.session_state.shift_counts[pos][shift_key] = parse_fixed_count_value(row.get(col, ""))
         if "maximum_total" in edited_df.columns:
             st.session_state.maximum_total[pos] = parse_fixed_count_value(row.get("maximum_total", ""))
-        if "maximum_N" in edited_df.columns:
-            st.session_state.maximum_N[pos] = parse_fixed_count_value(row.get("maximum_N", ""))
 
 
 def render_fixed_total_editor_table():
@@ -854,8 +837,8 @@ def render_fixed_total_editor_table():
     """
     estimated_average = get_estimated_average_total()
     st.caption(
-        "빈칸은 자동 배정/제한 없음입니다. fixed_D/E/N/Total은 정확한 개수, maximum_N은 N근무 상한, "
-        "maximum_total은 총근무 상한입니다. 근무조정값은 자동 평준화 목표를 ±조정합니다. 저장을 눌러야 실제 반영됩니다."
+        "빈칸은 자동 배정입니다. fixed_D/E/N/Total은 정확한 개수, maximum_total은 총근무 상한, "
+        "근무조정값은 자동 평준화 목표를 ±조정합니다. 저장을 눌러야 실제 반영됩니다."
     )
     with st.expander("입력값 설명", expanded=False):
         st.markdown(
@@ -863,7 +846,7 @@ def render_fixed_total_editor_table():
 - **근무조정값**: fixed_Total이 없는 사람의 자동 평준화 목표를 조정합니다. `+1`은 약 1근무 증가, `-1`은 약 1근무 감소 방향입니다.
 - **fixed_D / fixed_E / fixed_N**: 해당 shift를 정확히 그 개수로 고정합니다. `0`도 정확한 0개라는 뜻입니다.
 - **fixed_Total**: 월 총근무수를 정확히 고정합니다. 더 많거나 적게 배정할 수 없습니다.
-- **maximum_N**: 월 Night 근무 상한입니다. 예: `4`이면 N은 최대 4개까지 배정됩니다. fixed_N과 달리 더 적게 배정할 수 있습니다.\n- **maximum_total**: 월 총근무 상한입니다. 그보다 적게 근무하는 것은 허용됩니다.
+- **maximum_total**: 월 총근무 상한입니다. 그보다 적게 근무하는 것은 허용됩니다.
 - **연차(a)**: 근무 요청에서 입력한 `a` 개수입니다. 자동계산 시 fixed_Total이 없는 사람의 권장 근무조정값에 반영됩니다.
 - **Duty 기준 평균**: 현재 Duty 최소합 ÷ 전체 인원 = 약 **{estimated_average:.1f}개/명**입니다. 실제 자동 목표는 fixed_Total, 근무조정값 및 개인 rule에 따라 달라질 수 있습니다.
             """
@@ -887,7 +870,6 @@ def render_fixed_total_editor_table():
             use_container_width=True,
             key=key,
             disabled=["No", "Name", "Grade", "Senior", "Junior", "초저년차", "연차(a)"],
-            column_order=["No", "Name", "maximum_total", "maximum_N", "fixed_Total", "Grade", "Senior", "Junior", "초저년차", "연차(a)", "근무조정값", "fixed_D", "fixed_E", "fixed_N"],
             column_config={
                 "No": st.column_config.NumberColumn("No", width="small", disabled=True),
                 "Name": st.column_config.TextColumn("Name", width="medium", disabled=True),
@@ -930,11 +912,6 @@ def render_fixed_total_editor_table():
                     width="small",
                     help="빈칸 = 자동 평준화, 0 = 총근무 없음, 1 이상 = 총 D/E/N 근무 수 고정",
                 ),
-                "maximum_N": st.column_config.TextColumn(
-                    "maximum_N",
-                    width="small",
-                    help="빈칸 = 제한 없음, 0 이상 = Night 근무 수의 최대 허용값. fixed_N과 달리 더 적게 근무하는 것은 허용",
-                ),
                 "maximum_total": st.column_config.TextColumn(
                     "maximum_total",
                     width="small",
@@ -963,61 +940,22 @@ def get_total_duty_count() -> int:
     """Total number of required assignments in DutyRequests."""
     return int(sum(sum(map(int, st.session_state.duty_requests.get(di, [0, 0, 0]))) for di in range(st.session_state.num_days)))
 
-def normalized_ideal_duty_value(minimum: int, ideal) -> int:
-    """Normalize optional Ideal staffing.
-
-    -1 / None / blank means: no Ideal preference for this duty.
-    When explicitly entered, Ideal is clamped to at least Minimal.
-    Minimal=0 means the duty is closed, so Ideal is disabled (-1).
-    """
+def normalized_ideal_duty_value(minimum: int, ideal: int) -> int:
+    """Normalize Ideal while preserving legacy Min=0 => closed duty semantics."""
     minimum = int(minimum)
     if minimum <= 0:
-        return -1
-    if ideal is None:
-        return -1
-    if isinstance(ideal, str):
-        ideal = ideal.strip()
-        if ideal == "":
-            return -1
-    try:
-        value = int(float(ideal))
-    except (TypeError, ValueError):
-        return -1
-    if value < 0:
-        return -1
-    return max(minimum, value)
+        return 0
+    return max(minimum, int(ideal))
 
 
-def ideal_duty_display_value(minimum: int, ideal) -> str:
-    """Display optional Ideal as blank unless explicitly configured."""
-    value = normalized_ideal_duty_value(minimum, ideal)
-    return "" if value < 0 else str(value)
-
-
-def get_ideal_duty_summary() -> dict:
-    """Summary of explicitly entered Ideal targets only."""
-    configured_cells = 0
-    configured_total = 0
-    extra_capacity = 0
-    by_shift = [0, 0, 0]
+def get_total_ideal_duty_count() -> int:
+    """Total preferred staffing in Ideal DutyRequests (soft target)."""
+    total = 0
     for di in range(st.session_state.num_days):
         mins = list(st.session_state.duty_requests.get(di, [0, 0, 0]))
-        ideals = list(st.session_state.get("ideal_duty_requests", {}).get(di, [-1, -1, -1]))
-        if len(ideals) < 3:
-            ideals = (ideals + [-1, -1, -1])[:3]
-        for si in range(3):
-            ideal = normalized_ideal_duty_value(mins[si], ideals[si])
-            if ideal >= 0:
-                configured_cells += 1
-                configured_total += ideal
-                by_shift[si] += ideal
-                extra_capacity += max(0, ideal - int(mins[si]))
-    return {
-        "configured_cells": configured_cells,
-        "configured_total": configured_total,
-        "extra_capacity": extra_capacity,
-        "by_shift": by_shift,
-    }
+        ideals = list(st.session_state.get("ideal_duty_requests", {}).get(di, mins))
+        total += sum(normalized_ideal_duty_value(mins[si], ideals[si]) for si in range(3))
+    return int(total)
 
 
 def get_fixed_total_summary():
@@ -1048,9 +986,10 @@ def render_fixed_total_duty_summary(num_days: int):
     d_total = sum(st.session_state.duty_requests.get(di, [0, 0, 0])[0] for di in range(num_days))
     e_total = sum(st.session_state.duty_requests.get(di, [0, 0, 0])[1] for di in range(num_days))
     n_total = sum(st.session_state.duty_requests.get(di, [0, 0, 0])[2] for di in range(num_days))
-    ideal_info = get_ideal_duty_summary()
-    ideal_cells = int(ideal_info["configured_cells"])
-    ideal_extra_capacity = int(ideal_info["extra_capacity"])
+    ideal_d_total = sum(normalized_ideal_duty_value(st.session_state.duty_requests.get(di, [0,0,0])[0], st.session_state.get("ideal_duty_requests", {}).get(di, st.session_state.duty_requests.get(di, [0,0,0]))[0]) for di in range(num_days))
+    ideal_e_total = sum(normalized_ideal_duty_value(st.session_state.duty_requests.get(di, [0,0,0])[1], st.session_state.get("ideal_duty_requests", {}).get(di, st.session_state.duty_requests.get(di, [0,0,0]))[1]) for di in range(num_days))
+    ideal_n_total = sum(normalized_ideal_duty_value(st.session_state.duty_requests.get(di, [0,0,0])[2], st.session_state.get("ideal_duty_requests", {}).get(di, st.session_state.duty_requests.get(di, [0,0,0]))[2]) for di in range(num_days))
+    ideal_total = ideal_d_total + ideal_e_total + ideal_n_total
     annual_total = int(sum(get_annual_leave_counts_by_doc().values()))
     minimum_total = fixed_total_info["total_duty"]
     fixed_sum = fixed_total_info["fixed_sum"]
@@ -1094,8 +1033,8 @@ def render_fixed_total_duty_summary(num_days: int):
             <div>
                 <span style='color:#ffffff;'>Duty 최소합</span> <b>{minimum_total}</b>
                 <span style='color:#e5e7eb;'>(D {d_total} / E {e_total} / N {n_total})</span>
-                &nbsp;|&nbsp; <span style='color:#ffffff;'>Ideal 입력</span> <b>{ideal_cells}칸</b>
-                <span style='color:#e5e7eb;'>({("추가 선호 +" + str(ideal_extra_capacity)) if ideal_cells else "미사용"})</span>
+                &nbsp;|&nbsp; <span style='color:#ffffff;'>Ideal 합</span> <b>{ideal_total}</b>
+                <span style='color:#e5e7eb;'>(+{max(0, ideal_total-minimum_total)})</span>
                 &nbsp;|&nbsp; <span style='color:#ffffff;'>최소기준 평균</span> <b>{duty_average:.1f}/명</b>
                 &nbsp;|&nbsp; <span style='color:#ffffff;'>fixed_Total</span> <b>{fixed_count}명 · 합 {fixed_sum}</b>
                 &nbsp;|&nbsp; <span style='color:#ffffff;'>미지정</span> <b>{free_count}명</b>
@@ -1232,15 +1171,16 @@ def duty_value_from_row(row, shift_label: str, fallback_pos: int) -> int:
 
 
 def ideal_duty_value_from_row(row, shift_label: str, minimum_value: int) -> int:
-    """Read optional soft Ideal D/E/N; missing/blank means not used (-1)."""
+    """Read soft Ideal D/E/N; missing old-file values default to the minimum."""
     aliases = [
         f"Ideal_{shift_label}", f"IDEAL_{shift_label}", f"ideal_{shift_label}",
         f"선호_{shift_label}", f"이상적_{shift_label}",
     ]
     val = row_get_any(row, aliases, default=None)
-    if val is None or (isinstance(val, float) and pd.isna(val)) or str(val).strip() == "":
-        return -1
-    return normalized_ideal_duty_value(minimum_value, val)
+    if val is None or (isinstance(val, float) and pd.isna(val)):
+        return int(minimum_value)
+    parsed = safe_int(val, int(minimum_value), 0, max(0, len(st.session_state.get("doctors", []))))
+    return normalized_ideal_duty_value(minimum_value, parsed)
 
 
 def parse_start_date_from_duty_index(df_duty: pd.DataFrame, fallback: date) -> date:
@@ -1491,7 +1431,7 @@ def _run_exact_hard_conflict_diagnostics(combined_req: dict) -> tuple[pd.DataFra
         if not callable(diagnose_hard_conflicts):
             return pd.DataFrame(), (
                 "현재 scheduler.py에 diagnose_hard_conflicts 함수가 없습니다. "
-                "app.py와 scheduler.py를 같은 V12 세트로 교체하세요."
+                "app.py와 scheduler.py를 같은 V9 세트로 교체하세요."
             )
 
         params = {
@@ -1509,7 +1449,6 @@ def _run_exact_hard_conflict_diagnostics(combined_req: dict) -> tuple[pd.DataFra
             "rules": {str(k): v for k, v in st.session_state.get("rules", {}).items()},
             "shift_counts": {str(k): v for k, v in st.session_state.get("shift_counts", {}).items()},
             "maximum_total": {str(k): v for k, v in st.session_state.get("maximum_total", {}).items()},
-            "maximum_N": {str(k): v for k, v in st.session_state.get("maximum_N", {}).items()},
         }
         df = diagnose_hard_conflicts(params)
         if not isinstance(df, pd.DataFrame):
@@ -1901,7 +1840,6 @@ def run_hard_rule_diagnostics() -> dict:
     normalize_grade_rules()
     normalize_shift_counts()
     normalize_maximum_total()
-    normalize_maximum_n()
     combined_req = refresh_combined_shift_requests()
 
     doctors = st.session_state.doctors
@@ -2004,13 +1942,6 @@ def run_hard_rule_diagnostics() -> dict:
             max_total = parse_fixed_count_value(st.session_state.maximum_total.get(ni, -1))
             if max_total >= 0:
                 doc_cap = min(doc_cap, max_total)
-            if shift_filter == "N":
-                max_n = parse_fixed_count_value(st.session_state.maximum_N.get(ni, -1))
-                fixed_n = parse_fixed_count_value(st.session_state.shift_counts.get(ni, {}).get("N", -1))
-                if fixed_n >= 0:
-                    doc_cap = min(doc_cap, fixed_n)
-                elif max_n >= 0:
-                    doc_cap = min(doc_cap, max_n)
             total += doc_cap
         return int(total)
 
@@ -2242,7 +2173,6 @@ def build_schedule_excel_bytes(
             "grade": int(doc.get("grade", DEFAULT_DOCTOR_GRADE)),
             "shift_adj": st.session_state.shift_adj.get(ni, 0),
             "maximum_total": fixed_count_excel_value(st.session_state.maximum_total.get(ni, -1)),
-            "maximum_N": fixed_count_excel_value(st.session_state.maximum_N.get(ni, -1)),
         }
         for key in rule_col_order:
             row[rule_col_labels[key]] = r.get(key, "")
@@ -2254,7 +2184,6 @@ def build_schedule_excel_bytes(
     for ni in display_order:
         current_total = sum(len(_parse_result_shift_codes(sol.get((ni, di), ""))) for di in range(num_days))
         max_total = parse_fixed_count_value(st.session_state.maximum_total.get(ni, -1))
-        max_n = parse_fixed_count_value(st.session_state.maximum_N.get(ni, -1))
         for di in range(num_days):
             candidates = additional_availability.get((ni, di), [])
             if not candidates:
@@ -2269,7 +2198,6 @@ def build_schedule_excel_bytes(
                 "Can_add": "/".join(candidates),
                 "Current_Total": current_total,
                 "maximum_total": "" if max_total < 0 else max_total,
-                "maximum_N": "" if max_n < 0 else max_n,
                 "Remaining_to_max": "" if max_total < 0 else max_total - current_total,
             })
     availability_df = pd.DataFrame(availability_rows)
@@ -2280,9 +2208,7 @@ def build_schedule_excel_bytes(
     for di in range(num_days):
         d = start_date + timedelta(days=di)
         mins = list(st.session_state.duty_requests.get(di, [0, 0, 0]))
-        ideals = list(st.session_state.get("ideal_duty_requests", {}).get(di, [-1, -1, -1]))
-        if len(ideals) < 3:
-            ideals = (ideals + [-1, -1, -1])[:3]
+        ideals = list(st.session_state.get("ideal_duty_requests", {}).get(di, mins))
         for si, shift_key in enumerate(shift_keys):
             minimum = int(mins[si])
             ideal = normalized_ideal_duty_value(minimum, ideals[si])
@@ -2296,10 +2222,10 @@ def build_schedule_excel_bytes(
                 "Duty": shift_key,
                 "Actual": actual,
                 "Minimal": minimum,
-                "Ideal": "" if ideal < 0 else ideal,
+                "Ideal": ideal,
                 "Min_Extra": max(0, actual - minimum),
-                "Ideal_Shortfall": "" if ideal < 0 else max(0, ideal - actual),
-                "Over_Ideal": "" if ideal < 0 else max(0, actual - ideal),
+                "Ideal_Shortfall": max(0, ideal - actual),
+                "Over_Ideal": max(0, actual - ideal),
             })
     duty_staffing_df = pd.DataFrame(duty_staffing_rows)
 
@@ -2355,7 +2281,6 @@ normalize_doctors()
 normalize_grade_rules()
 normalize_shift_counts()
 normalize_maximum_total()
-normalize_maximum_n()
 normalize_shift_request_layers()
 
 
@@ -2395,7 +2320,6 @@ with st.sidebar:
                 st.session_state.shift_adj[n] = 0
                 st.session_state.shift_counts[n] = {"D": -1, "E": -1, "N": -1, "Total": -1}
                 st.session_state.maximum_total[n] = -1
-                st.session_state.maximum_N[n] = -1
                 st.rerun()
 
     if st.session_state.doctors:
@@ -2467,7 +2391,6 @@ with st.sidebar:
             row["fixed_N"] = fixed_count_excel_value(sc.get("N", -1))
             row["fixed_Total"] = fixed_count_excel_value(sc.get("Total", -1))
             row["maximum_total"] = fixed_count_excel_value(st.session_state.maximum_total.get(ni, -1))
-            row["maximum_N"] = fixed_count_excel_value(st.session_state.maximum_N.get(ni, -1))
             rules_rows.append(row)
         df_rules = pd.DataFrame(rules_rows, index=doctor_names)
         df_rules.index.name = 'Name'
@@ -2475,15 +2398,11 @@ with st.sidebar:
         duty_rows = []
         for di in range(num_days):
             mins = list(st.session_state.duty_requests.get(di, [1, 1, 1]))
-            ideals = list(st.session_state.get("ideal_duty_requests", {}).get(di, [-1, -1, -1]))
-            if len(ideals) < 3:
-                ideals = (ideals + [-1, -1, -1])[:3]
+            ideals = list(st.session_state.get("ideal_duty_requests", {}).get(di, mins))
             ideals = [normalized_ideal_duty_value(mins[si], ideals[si]) for si in range(3)]
             duty_rows.append({
                 "D": int(mins[0]), "E": int(mins[1]), "N": int(mins[2]),
-                "Ideal_D": "" if ideals[0] < 0 else ideals[0],
-                "Ideal_E": "" if ideals[1] < 0 else ideals[1],
-                "Ideal_N": "" if ideals[2] < 0 else ideals[2],
+                "Ideal_D": ideals[0], "Ideal_E": ideals[1], "Ideal_N": ideals[2],
             })
         df_duty = pd.DataFrame(duty_rows, index=date_list)
 
@@ -2587,12 +2506,10 @@ with st.sidebar:
                     "Total": ["fixed_Total", "fixed_total", "fixed_TOTAL", "Total 고정", "fixed total"],
                 }
                 maximum_total_aliases = ["maximum_total", "maximum_Total", "max_total", "Maximum Total", "총근무 최대", "maximum total"]
-                maximum_n_aliases = ["maximum_N", "maximum_n", "max_N", "max_n", "Maximum N", "N근무 최대", "N 최대", "maximum N"]
 
                 new_rules = {}
                 new_shift_counts = {}
                 new_maximum_total = {}
-                new_maximum_n = {}
                 for i, doc in enumerate(st.session_state.doctors):
                     row = find_row_by_name_or_position(df_rules, doc['name'], i)
                     base_rule = DEFAULT_RULES.copy()
@@ -2609,15 +2526,12 @@ with st.sidebar:
                         for shift_key, aliases in fixed_aliases.items()
                     }
                     new_maximum_total[i] = safe_int(row_get_any(row, maximum_total_aliases, -1), -1, -1, 60)
-                    new_maximum_n[i] = safe_int(row_get_any(row, maximum_n_aliases, -1), -1, -1, 60)
 
                 st.session_state.rules = new_rules
                 st.session_state.shift_counts = new_shift_counts
                 st.session_state.maximum_total = new_maximum_total
-                st.session_state.maximum_N = new_maximum_n
                 normalize_shift_counts()
                 normalize_maximum_total()
-                normalize_maximum_n()
                 # Excel 불러오기 후 Total/D/E/N 고정 개수 입력 위젯이 이전 값을 붙잡지 않도록 key version 갱신
                 st.session_state["shift_count_version"] = st.session_state.get("shift_count_version", 0) + 1
 
@@ -2635,7 +2549,7 @@ with st.sidebar:
                 st.session_state["grade_version"] = st.session_state.get("grade_version", 0) + 1
 
                 # 3) DutyRequests: D/E/N are MINIMUM staffing; Ideal_D/E/N are soft targets.
-                # Older files without Ideal columns load with Ideal blank/not used.
+                # Older files without Ideal columns load with Ideal == Minimum.
                 loaded_duty = {}
                 loaded_ideal_duty = {}
                 if df_duty is not None and not df_duty.empty:
@@ -2657,7 +2571,7 @@ with st.sidebar:
                 else:
                     fallback_days = int(st.session_state.get("num_days", 31))
                     loaded_duty = {i: [1, 1, 1] for i in range(fallback_days)}
-                    loaded_ideal_duty = {i: [-1, -1, -1] for i in range(fallback_days)}
+                    loaded_ideal_duty = {i: [1, 1, 1] for i in range(fallback_days)}
 
                 st.session_state.duty_requests = loaded_duty
                 st.session_state.ideal_duty_requests = loaded_ideal_duty
@@ -2775,17 +2689,14 @@ if not st.session_state.day_types or len(st.session_state.day_types) != num_days
 if not st.session_state.duty_requests or len(st.session_state.duty_requests) != st.session_state.num_days:
     st.session_state.duty_requests = {i: [1, 1, 1] for i in range(st.session_state.num_days)}
 if not st.session_state.get("ideal_duty_requests") or len(st.session_state.ideal_duty_requests) != st.session_state.num_days:
-    # New/default preset: Ideal is BLANK. It only affects the solver when explicitly entered.
     st.session_state.ideal_duty_requests = {
-        i: [-1, -1, -1]
+        i: list(st.session_state.duty_requests.get(i, [1, 1, 1]))
         for i in range(st.session_state.num_days)
     }
 else:
     for i in range(st.session_state.num_days):
         mins = list(st.session_state.duty_requests.get(i, [1, 1, 1]))
-        ideals = list(st.session_state.ideal_duty_requests.get(i, [-1, -1, -1]))
-        if len(ideals) < 3:
-            ideals = (ideals + [-1, -1, -1])[:3]
+        ideals = list(st.session_state.ideal_duty_requests.get(i, mins))
         st.session_state.ideal_duty_requests[i] = [normalized_ideal_duty_value(mins[s], ideals[s]) for s in range(3)]
 
 st.info("각 탭의 변경사항은 저장 버튼을 눌러야 반영됩니다. 스케줄 생성 전에는 관련 탭을 저장했는지 확인하세요.")
@@ -2939,37 +2850,35 @@ with tab2:
                     else:
                         cols2[ci+1].empty()
 
-            # Ideal D/E/N rows: OPTIONAL soft targets. Blank = do not use Ideal for that cell.
+            # Ideal D/E/N rows (soft target, clamped to at least Minimal)
             for shift_i, shift_lbl in enumerate(['D (Day)', 'E (Evening)', 'N (Night)']):
                 cols3 = st.columns(CHUNK + 1)
                 color = '#4f8ef7' if shift_i==0 else '#f0a040' if shift_i==1 else '#8080f0'
-                cols3[0].markdown(
-                    f"<span style='font-family:var(--mono);font-size:0.72rem;color:{color};font-weight:700'>Ideal {shift_lbl}</span>",
-                    unsafe_allow_html=True
-                )
+                cols3[0].markdown(f"<span style='font-family:var(--mono);font-size:0.72rem;color:{color};font-weight:700'>Ideal {shift_lbl}</span>", unsafe_allow_html=True)
                 for ci in range(CHUNK):
                     di = chunk_start + ci
                     if di < num_days:
                         mins = list(st.session_state.duty_requests.get(di, [1,1,1]))
                         if di not in st.session_state.ideal_duty_requests:
-                            st.session_state.ideal_duty_requests[di] = [-1, -1, -1]
-                        ideals = list(st.session_state.ideal_duty_requests.get(di, [-1, -1, -1]))
-                        if len(ideals) < 3:
-                            ideals = (ideals + [-1, -1, -1])[:3]
-                        cur_text = ideal_duty_display_value(mins[shift_i], ideals[shift_i])
+                            st.session_state.ideal_duty_requests[di] = list(mins)
+                        ideals = list(st.session_state.ideal_duty_requests.get(di, mins))
+                        cur_val = normalized_ideal_duty_value(mins[shift_i], ideals[shift_i])
                         ideal_ver = st.session_state.get("ideal_duty_req_version", 0)
                         ideal_key = f"ideal_duty_{di}_{shift_i}_v{ideal_ver}"
-                        new_text = cols3[ci+1].text_input(
-                            f"ideal_duty_{di}_{shift_i}",
-                            value=cur_text,
-                            placeholder="",
-                            label_visibility="collapsed",
-                            key=ideal_key,
+                        # If Minimal changed since this widget key was created, keep the
+                        # widget value inside the new valid semantic range before render.
+                        if ideal_key in st.session_state:
+                            try:
+                                if int(mins[shift_i]) <= 0 or int(st.session_state[ideal_key]) < int(mins[shift_i]):
+                                    st.session_state[ideal_key] = cur_val
+                            except Exception:
+                                st.session_state[ideal_key] = cur_val
+                        new_val = cols3[ci+1].number_input(
+                            f"ideal_duty_{di}_{shift_i}", min_value=0, max_value=len(doctors),
+                            value=cur_val, label_visibility="collapsed", key=ideal_key,
                             disabled=(int(mins[shift_i]) <= 0),
                         )
-                        st.session_state.ideal_duty_requests[di][shift_i] = normalized_ideal_duty_value(
-                            mins[shift_i], new_text
-                        )
+                        st.session_state.ideal_duty_requests[di][shift_i] = normalized_ideal_duty_value(mins[shift_i], new_val)
                     else:
                         cols3[ci+1].empty()
 
@@ -2978,15 +2887,11 @@ with tab2:
 
 
     if save_duty_settings:
-        # Re-normalize optional Ideal after Minimal edits made in the same form.
+        # Re-normalize Ideal after any Minimal edits made in the same form.
         for di in range(num_days):
             mins = list(st.session_state.duty_requests.get(di, [1,1,1]))
-            ideals = list(st.session_state.ideal_duty_requests.get(di, [-1,-1,-1]))
-            if len(ideals) < 3:
-                ideals = (ideals + [-1,-1,-1])[:3]
-            st.session_state.ideal_duty_requests[di] = [
-                normalized_ideal_duty_value(mins[si], ideals[si]) for si in range(3)
-            ]
+            ideals = list(st.session_state.ideal_duty_requests.get(di, mins))
+            st.session_state.ideal_duty_requests[di] = [normalized_ideal_duty_value(mins[si], ideals[si]) for si in range(3)]
         st.session_state["duty_req_version"] = st.session_state.get("duty_req_version", 0) + 1
         st.session_state["ideal_duty_req_version"] = st.session_state.get("ideal_duty_req_version", 0) + 1
         st.toast("✅ Duty 설정이 저장되었습니다.", icon="✅")
@@ -3009,7 +2914,7 @@ for ni in range(len(doctors)):
 
 with tab3:
     st.markdown('<div class="section-label">월 근무수 설정</div>', unsafe_allow_html=True)
-    st.caption("Duty는 날짜별 최소 필요 인원입니다. fixed_Total/fixed_N은 정확한 개수이고, maximum_total/maximum_N은 각각 총근무/N근무 상한입니다.")
+    st.caption("Duty는 날짜별 최소 필요 인원입니다. fixed_Total은 정확한 월 근무수이고, maximum_total은 총근무 상한입니다.")
     render_fixed_total_duty_summary(num_days)
     render_fixed_total_editor_table()
     st.divider()
@@ -3112,7 +3017,7 @@ with tab3:
 
         st.divider()
         st.markdown('<div class="section-label">개인별 Grade & 근무 규칙 설정</div>', unsafe_allow_html=True)
-        st.caption("7명씩 나눠서 표시됩니다. Grade와 개인 rule을 입력하세요. 근무 조정값, fixed count, maximum_total/maximum_N은 위 표에서도 수정할 수 있습니다.")
+        st.caption("7명씩 나눠서 표시됩니다. Grade와 개인 rule을 입력하세요. 근무 조정값, fixed count, maximum_total은 위 표에서 수정합니다.")
 
         doc_names = [d["name"] for d in doctors]
         DOC_CHUNK = 7
@@ -3178,25 +3083,7 @@ with tab3:
                 )
                 st.session_state.maximum_total[ni] = parse_fixed_count_value(max_text)
 
-            # maximum_N: per-person Night hard upper bound.
-            max_n_cols = st.columns([2] + [1] * chunk_size)
-            max_n_cols[0].markdown(
-                "<span style='font-size:0.75rem'><b>maximum_N</b><br>N근무 최대 (빈칸=제한없음)</span>",
-                unsafe_allow_html=True,
-            )
-            for ci, ni in enumerate(range(chunk_start, chunk_end)):
-                current_max_n = parse_fixed_count_value(st.session_state.maximum_N.get(ni, -1))
-                max_n_text = max_n_cols[ci+1].text_input(
-                    f"maximum_N_{ni}",
-                    value="" if current_max_n < 0 else str(current_max_n),
-                    label_visibility="collapsed",
-                    key=f"doc_maximum_N_{ni}_v{st.session_state.get('shift_count_version', 0)}",
-                    placeholder="",
-                    help="빈칸 = 제한 없음, 0 이상 = Night 근무가 이 값을 넘지 않음",
-                )
-                st.session_state.maximum_N[ni] = parse_fixed_count_value(max_n_text)
-
-            st.caption("maximum_total은 총근무 상한, maximum_N은 N근무 상한입니다. 둘 다 빈칸이면 제한이 없습니다.")
+            st.caption("maximum_total은 fixed_total과 달리 정확한 개수가 아니라 상한입니다. 예: 12 → 0~12회 허용")
 
             # 근무 조정값과 fixed Total/D/E/N counts are edited in the table above.
 
@@ -3239,7 +3126,7 @@ with tab3:
         # editor from the newly committed values so both views stay synchronized.
         st.session_state["shift_count_version"] = st.session_state.get("shift_count_version", 0) + 1
         st.session_state["fixed_counts_editor_pending_df"] = None
-        st.toast("✅ 개인 규칙 / Grade / maximum_total / maximum_N 설정이 저장되었습니다.", icon="✅")
+        st.toast("✅ 개인 규칙 / Grade / maximum_total 설정이 저장되었습니다.", icon="✅")
         st.rerun()
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -3304,19 +3191,13 @@ if st.session_state.get("trigger_solve"):
         sync_live_total_summary_inputs(num_days)
         fixed_total_info = get_fixed_total_summary()
         normalize_maximum_total()
-        normalize_maximum_n()
         precheck_error = ""
 
         # fixed_total is exact; maximum_total is only an upper bound. Validate the
         # interaction before invoking CP-SAT so input mistakes are immediately visible.
         for ni, doc in enumerate(doctors):
             fixed_val = parse_fixed_count_value(st.session_state.shift_counts.get(ni, {}).get("Total", -1))
-            fixed_n_val = parse_fixed_count_value(st.session_state.shift_counts.get(ni, {}).get("N", -1))
             max_val = parse_fixed_count_value(st.session_state.maximum_total.get(ni, -1))
-            max_n_val = parse_fixed_count_value(st.session_state.maximum_N.get(ni, -1))
-            if fixed_n_val >= 0 and max_n_val >= 0 and fixed_n_val > max_n_val:
-                precheck_error = f"{doc['name']}의 fixed_N({fixed_n_val})이 maximum_N({max_n_val})보다 큽니다."
-                break
             if fixed_val >= 0 and max_val >= 0 and fixed_val > max_val:
                 precheck_error = f"{doc['name']}의 fixed_total({fixed_val})이 maximum_total({max_val})보다 큽니다."
                 break
@@ -3348,28 +3229,6 @@ if st.session_state.get("trigger_solve"):
                 precheck_error = (
                     f"전체 total 상한 합({sum(upper_bounds)})이 Duty 최소합({fixed_total_info['total_duty']})보다 작습니다. "
                     f"maximum_total/fixed_total을 늘리거나 Duty 최소 인원을 줄여주세요."
-                )
-
-        # If every person's Night count has a finite upper bound, those bounds must
-        # cover the monthly minimum Night demand.
-        if not precheck_error:
-            n_upper_bounds = []
-            all_n_bounded = True
-            for ni in range(len(doctors)):
-                fixed_n_val = parse_fixed_count_value(st.session_state.shift_counts.get(ni, {}).get("N", -1))
-                max_n_val = parse_fixed_count_value(st.session_state.maximum_N.get(ni, -1))
-                if fixed_n_val >= 0:
-                    n_upper_bounds.append(fixed_n_val)
-                elif max_n_val >= 0:
-                    n_upper_bounds.append(max_n_val)
-                else:
-                    all_n_bounded = False
-                    break
-            n_minimum = sum(int(st.session_state.duty_requests.get(di, [0, 0, 0])[2]) for di in range(num_days))
-            if all_n_bounded and sum(n_upper_bounds) < n_minimum:
-                precheck_error = (
-                    f"전체 N 상한 합({sum(n_upper_bounds)})이 N Duty 최소합({n_minimum})보다 작습니다. "
-                    f"maximum_N/fixed_N을 늘리거나 N 최소 필요 인원을 줄여주세요."
                 )
 
         # fixed_total is exact; DutyRequests are minimum staffing.
@@ -3416,7 +3275,7 @@ if st.session_state.get("trigger_solve"):
                     scheduler_module = importlib.util.module_from_spec(spec)
                     spec.loader.exec_module(scheduler_module)
 
-                    expected_scheduler_api = '2026-08-19-v12.1-maximum-n-ideal-fix'
+                    expected_scheduler_api = '2026-08-19-v9-minimal-ideal-staffing'
                     actual_scheduler_api = getattr(scheduler_module, "SCHEDULER_API_VERSION", None)
                     if actual_scheduler_api != expected_scheduler_api:
                         raise ImportError(
@@ -3451,7 +3310,6 @@ if st.session_state.get("trigger_solve"):
                         "shift_adj": {str(k): v for k, v in st.session_state.shift_adj.items()},
                         "shift_counts": {str(k): v for k, v in st.session_state.shift_counts.items()},
                         "maximum_total": {str(k): v for k, v in st.session_state.maximum_total.items()},
-                        "maximum_N": {str(k): v for k, v in st.session_state.maximum_N.items()},
                         "grades": {str(i): int(d.get("grade", DEFAULT_DOCTOR_GRADE)) for i, d in enumerate(doctors)},
                         "grade_rules": {k: int(v) for k, v in st.session_state.grade_rules.items()},
                         "solver_mode": st.session_state.solver_mode,
@@ -3559,10 +3417,6 @@ with tab5:
             summary_display["maximum_total"] = summary_display["maximum_total"].apply(
                 lambda v: "" if pd.isna(v) or int(v) < 0 else int(v)
             )
-        if "maximum_N" in summary_display.columns:
-            summary_display["maximum_N"] = summary_display["maximum_N"].apply(
-                lambda v: "" if pd.isna(v) or int(v) < 0 else int(v)
-            )
 
         # 연차는 solver summary에 이미 들어오더라도, 표시/export 단계에서 다시 계산해 보강한다.
         # 이렇게 하면 이전 solved session이나 legacy summary에도 항상 연차 컬럼이 보인다.
@@ -3609,7 +3463,7 @@ with tab5:
         st.markdown('<div class="section-label">추가 근무 가능일 · 개인 hard rule 기준</div>', unsafe_allow_html=True)
         st.caption(
             "현재 완성된 스케줄에 D/E/N을 1개 추가한다고 가정했을 때, 개인 근무불가 요청, 직전 5일 연속 규칙, "
-            "개인 rule, fixed_D/E/N, fixed_total, maximum_total, maximum_N을 모두 만족하는 후보만 표시합니다. "
+            "개인 rule, fixed_D/E/N, fixed_total, maximum_total을 모두 만족하는 후보만 표시합니다. "
             "이 표는 대체/증원 후보 확인용이므로 날짜별 Duty 필요 인원과 senior/junior/grade 조합 같은 그룹 조건은 계산하지 않습니다."
         )
         availability_summary_rows = []
@@ -3617,8 +3471,6 @@ with tab5:
         for ni in display_order:
             current_total = sum(len(_parse_result_shift_codes(sol.get((ni, di), ""))) for di in range(num_days))
             max_total = parse_fixed_count_value(st.session_state.maximum_total.get(ni, -1))
-            max_n = parse_fixed_count_value(st.session_state.maximum_N.get(ni, -1))
-            current_n = sum(1 for di in range(num_days) if "N" in _parse_result_shift_codes(sol.get((ni, di), "")))
             entries = []
             available_date_count = 0
             for di in range(num_days):
@@ -3643,8 +3495,6 @@ with tab5:
                 "Name": doctors[ni]["name"],
                 "현재 Total": current_total,
                 "maximum_total": "" if max_total < 0 else max_total,
-                "maximum_N": "" if max_n < 0 else max_n,
-                "N 여유": "" if max_n < 0 else max_n - current_n,
                 "max까지 여유": "" if max_total < 0 else max_total - current_total,
                 "가능 날짜수": available_date_count,
                 "추가 가능 날짜/shift": " · ".join(entries) if entries else "-",
@@ -3967,11 +3817,8 @@ with tab5:
                 grades_for_shift = [int(doctors[ni].get('grade', DEFAULT_DOCTOR_GRADE)) for ni in staff]
                 avg_grade = round(sum(grades_for_shift) / len(grades_for_shift), 2) if grades_for_shift else None
                 required = int(st.session_state.duty_requests.get(di, [0, 0, 0])[si])
-                ideal_values = list(st.session_state.get("ideal_duty_requests", {}).get(di, [-1, -1, -1]))
-                if len(ideal_values) < 3:
-                    ideal_values = (ideal_values + [-1, -1, -1])[:3]
-                ideal = normalized_ideal_duty_value(required, ideal_values[si])
-                ideal_text = "-" if ideal < 0 else str(ideal)
+                ideal = int(st.session_state.get("ideal_duty_requests", {}).get(di, st.session_state.duty_requests.get(di, [0,0,0]))[si])
+                ideal = normalized_ideal_duty_value(required, ideal)
                 staff_with_grade = ", ".join(
                     f"{doctors[ni]['name']} [{int(doctors[ni].get('grade', DEFAULT_DOCTOR_GRADE))}]"
                     for ni in staff
@@ -3980,10 +3827,10 @@ with tab5:
                     "날짜": date_label,
                     "유형": dtype,
                     "Duty": shift_key,
-                    "실제/Min/Ideal": f"{len(staff)}/{required}/{ideal_text}",
+                    "실제/Min/Ideal": f"{len(staff)}/{required}/{ideal}",
                     "Min초과": max(0, len(staff) - required),
-                    "Ideal부족": "-" if ideal < 0 else max(0, ideal - len(staff)),
-                    "Ideal초과": "-" if ideal < 0 else max(0, len(staff) - ideal),
+                    "Ideal부족": max(0, ideal - len(staff)),
+                    "Ideal초과": max(0, len(staff) - ideal),
                     "평균 Grade": avg_grade if avg_grade is not None else "-",
                     "근무자": staff_with_grade,
                     "_is_holiday": is_holiday_type,

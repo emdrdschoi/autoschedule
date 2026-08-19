@@ -29,7 +29,7 @@
 
 ```text
 DutyRequests (D/E/N) = 그 날짜/shift에 반드시 필요한 Minimal 인원
-Ideal_D/E/N = **선택 입력값**. 빈칸이면 사용하지 않고, 숫자를 입력한 날짜/Duty에만 추가 배정 선호도를 적용
+Ideal_D/E/N = 추가 배정이 필요할 때 우선적으로 맞추는 soft 선호 인원
 fixed_Total  = 그 사람이 반드시 해야 하는 정확한 월 근무수
 maximum_total = 그 사람이 넘으면 안 되는 월 총근무 상한
 ```
@@ -240,7 +240,7 @@ fixed_Total = 18
 
 ## 5. Duty 설정 탭
 
-각 날짜/D/E/N에 대해 **Minimal은 필수로 입력**하고, **Ideal은 필요할 때만 선택적으로 입력**합니다. 새 스케줄의 Ideal preset은 모두 빈칸입니다.
+각 날짜/D/E/N에 대해 **Minimal**과 **Ideal**을 함께 입력합니다.
 
 예:
 
@@ -254,7 +254,7 @@ fixed_Total = 18
 
 ```text
 Minimal = 반드시 채워야 하는 hard 최소 인원
-Ideal   = 선택적 soft 선호 인원. **빈칸이면 해당 날짜/Duty에는 Ideal 선호도를 적용하지 않음**
+Ideal   = 추가근무가 어차피 필요할 때 우선적으로 맞추는 soft 선호 인원
 ```
 
 예를 들어 `Min D=1, Ideal D=2`이면 D 1명은 반드시 필요하고, fixed_Total 등 때문에 추가근무가 생기면 두 번째 D를 넣는 것을 선호합니다. 하지만 Ideal 때문에 추가근무 총량을 일부러 늘리지는 않습니다.
@@ -264,10 +264,8 @@ Ideal   = 선택적 soft 선호 인원. **빈칸이면 해당 날짜/Duty에는 
 ```text
 Minimal = 0 → 정확히 0명, closed duty
 Minimal > 0 → 그 숫자 이상 배정 가능
-Ideal을 입력하는 경우 Ideal >= Minimal. **빈칸은 허용되며 'Ideal 미사용'을 의미**
+Ideal >= Minimal
 ```
-
-> **V11 변경:** `Ideal_D/E/N`의 기본 preset은 모두 **빈칸**입니다. 빈칸인 셀은 Ideal objective에 전혀 참여하지 않습니다. 예를 들어 9/2 E에만 `Ideal_E=3`을 입력하면 그 셀만 추가배정 선호 대상으로 사용됩니다. `Ideal=Minimal`을 명시적으로 입력하면 그 duty는 Minimal을 넘는 추가배정을 상대적으로 피하도록 하는 soft target으로 작동할 수 있습니다.
 
 ### 5.1 Ideal을 이용한 추가배정 위치 선택
 
@@ -574,31 +572,6 @@ fixed_D/E/N을 모두 지정했고 fixed_Total도 지정했다면 그 합은 fix
 ```text
 1 / 2 / 2 / 4 / 1 / 0 / 0 / 5 / 5 / 0
 ```
-
-
-
-### maximum_N: 개인별 Night 근무 상한
-
-`maximum_N`은 한 사람에게 한 달 동안 배정할 수 있는 **Night 근무의 최대 개수**를 정하는 hard rule입니다.
-
-```text
-빈칸 = 제한 없음
-0    = N 근무 금지
-4    = N을 최대 4개까지 허용
-```
-
-`fixed_N`과 의미가 다릅니다.
-
-| 설정 | 의미 |
-|---|---|
-| `fixed_N = 4` | N을 **정확히 4개** 배정 |
-| `maximum_N = 4` | N을 **0~4개** 범위에서 자동 배정 |
-| `fixed_N = 4`, `maximum_N = 4` | N은 정확히 4개 |
-| `fixed_N = 5`, `maximum_N = 4` | 서로 충돌하므로 infeasible / 진단 오류 |
-
-`maximum_N`은 `maximum_total`과 동시에 사용할 수 있습니다. 예를 들어 `maximum_N=4`, `maximum_total=18`이면 총근무는 최대 18개이고 그중 N은 최대 4개입니다.
-
-모든 사람의 `fixed_N` 또는 `maximum_N`으로 계산한 N 상한 합이 월간 N Duty 최소합보다 작으면 스케줄을 만들 수 없으므로, 스케줄 생성 전 pre-check 및 진단모드에서 알려줍니다.
 
 
 ### 6.7 개인별 근무 규칙
@@ -923,7 +896,7 @@ maximum_total
 | 2026-09-01 | 1 | 2 | 1 | 1 | 2 | 1 |
 | 2026-09-02 | 1 | 2 | 1 | 2 | 3 | 2 |
 
-`D/E/N`은 hard Minimal, `Ideal_D/E/N`은 soft 선호 staffing입니다. Ideal 컬럼이 없거나 셀이 빈 기존 Excel은 **Ideal 미사용(빈칸)**으로 읽습니다. `Min_D/Min_E/Min_N` 형태의 컬럼도 불러오기 시 인식합니다. Minimal=0인 duty는 닫힌 duty라 Ideal도 0으로 정규화됩니다.
+`D/E/N`은 hard Minimal, `Ideal_D/E/N`은 soft 선호 staffing입니다. Ideal 컬럼이 없는 기존 Excel은 자동으로 **Ideal = Minimal**로 읽습니다. `Min_D/Min_E/Min_N` 형태의 컬럼도 불러오기 시 인식합니다. Minimal=0인 duty는 닫힌 duty라 Ideal도 0으로 정규화됩니다.
 
 또한 최신 앱은 DutyRequests의 날짜 index를 읽어 시작 날짜를 맞추고, 행 수를 총 일수로 사용합니다.
 
@@ -1121,7 +1094,7 @@ fixed_Total = 18
 [ ] 근무자 이름과 입력 순서 확인
 [ ] Grade 확인
 [ ] 날짜 유형 평일/토/일/공 확인
-[ ] DutyRequests D/E/N은 Minimal이고, Ideal_D/E/N은 필요한 셀에만 선택 입력했는지 확인 (기본 빈칸)
+[ ] DutyRequests D/E/N은 Minimal, Ideal_D/E/N은 soft 선호값임을 확인
 [ ] ShiftRequests d/e/n/x/a/D/E/N 확인
 [ ] 직전 5일 실제 스케줄 입력 확인
 [ ] 연차는 a로 입력했는지 확인
@@ -1378,13 +1351,3 @@ Grade / 개인 rule / maximum_total 수정 → `저장`
 11. 결과에서 추가 근무 가능 날짜/shift 확인 가능
 12. app.py / scheduler.py는 반드시 같은 동기화 세트를 사용
 ```
-
-## V12.1 bug fix: optional Ideal metrics
-
-V12에서 `Ideal_D/E/N`을 빈칸으로 둘 수 있게 만든 뒤, solver 결과 metrics에서 `ideal_configured_cells` 변수를 참조하면서 실제 계산 정의가 누락된 문제가 수정되었습니다.
-
-- Ideal 빈칸: 해당 날짜/Duty의 Ideal 선호도 **미사용**
-- Ideal 입력: 그 셀만 soft target으로 사용
-- `ideal_configured_cells`: 실제 Ideal이 입력된 셀 수만 계산
-- `duty_ideal_total`: Ideal이 입력된 셀의 값만 합산
-

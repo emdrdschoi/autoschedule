@@ -9,7 +9,7 @@ from typing import Any
 import pandas as pd
 from datetime import date, timedelta
 
-SCHEDULER_API_VERSION = '2026-08-19-v12.1-maximum-n-ideal-fix'
+SCHEDULER_API_VERSION = '2026-08-19-v9-minimal-ideal-staffing'
 
 try:
     from ortools.sat.python import cp_model
@@ -70,7 +70,7 @@ def _build_personal_hard_model(params: dict[str, Any], n: int, *, total_target: 
       - D/E/N/x/a requests
       - closed duties (DutyRequests == 0)
       - all personal sequence rules
-      - fixed_D/E/N, maximum_N and maximum_total
+      - fixed_D/E/N and maximum_total
 
     fixed_Total itself is *not* added unless ``total_target`` is supplied.  This lets the
     diagnostic solver ask both "is this exact fixed_Total feasible?" and "what is the true
@@ -93,7 +93,6 @@ def _build_personal_hard_model(params: dict[str, Any], n: int, *, total_target: 
     shift_counts_raw = params.get("shift_counts", {}) or {}
     shift_counts = {int(k): (v or {}) for k, v in shift_counts_raw.items()}
     maximum_total = {int(k): int(v) for k, v in (params.get("maximum_total", {}) or {}).items()}
-    maximum_n = {int(k): int(v) for k, v in (params.get("maximum_N", {}) or {}).items()}
 
     def get_rule(key: str, default: int) -> int:
         try:
@@ -266,9 +265,6 @@ def _build_personal_hard_model(params: dict[str, Any], n: int, *, total_target: 
     num_total = model.NewIntVar(0, num_days * 3, f"diag_total_{n}")
     model.Add(num_total == sum(num_s))
 
-    max_n = int(maximum_n.get(n, -1))
-    if max_n >= 0:
-        model.Add(num_s[2] <= max_n)
     max_total = int(maximum_total.get(n, -1))
     if max_total >= 0:
         model.Add(num_total <= max_total)
@@ -390,7 +386,6 @@ def diagnose_hard_conflicts(params: dict[str, Any]) -> pd.DataFrame:
     shift_counts_raw = params.get("shift_counts", {}) or {}
     shift_counts = {int(k): (v or {}) for k, v in shift_counts_raw.items()}
     maximum_total = {int(k): int(v) for k, v in (params.get("maximum_total", {}) or {}).items()}
-    maximum_n = {int(k): int(v) for k, v in (params.get("maximum_N", {}) or {}).items()}
 
     shift_keys = ["D", "E", "N"]
     rows: list[dict[str, Any]] = []
@@ -473,7 +468,6 @@ def diagnose_hard_conflicts(params: dict[str, Any]) -> pd.DataFrame:
         except (TypeError, ValueError):
             fixed_total = -1
         max_total = int(maximum_total.get(n, -1))
-        max_n = int(maximum_n.get(n, -1))
 
         # minimum forced/current facts and definitely-impossible shifts.
         on = [[0, 0, 0] for _ in range(timeline_len)]
@@ -581,20 +575,6 @@ def diagnose_hard_conflicts(params: dict[str, Any]) -> pd.DataFrame:
                 explanation=f"대문자 hard-fixed 근무가 {current_forced_total}개인데 maximum_total={max_total}입니다.",
                 related=f"hard-fixed total={current_forced_total}, maximum_total={max_total}",
                 suggestion="대문자 고정근무 일부를 해제하거나 maximum_total을 늘리세요.",
-            )
-        if max_n >= 0 and current_forced_counts[2] > max_n:
-            add_conflict(
-                n, day_t=None, rule="maximum_N vs hard-fixed N",
-                explanation=f"대문자 N hard-fixed가 {current_forced_counts[2]}개인데 maximum_N={max_n}입니다.",
-                related=f"hard-fixed N={current_forced_counts[2]}, maximum_N={max_n}",
-                suggestion="대문자 N 일부를 해제하거나 maximum_N을 늘리세요.",
-            )
-        if fixed_shift["N"] >= 0 and max_n >= 0 and fixed_shift["N"] > max_n:
-            add_conflict(
-                n, day_t=None, rule="fixed_N vs maximum_N",
-                explanation=f"fixed_N={fixed_shift['N']}은 정확한 N 개수인데 maximum_N={max_n}보다 큽니다.",
-                related=f"fixed_N={fixed_shift['N']}, maximum_N={max_n}",
-                suggestion="fixed_N을 줄이거나 maximum_N을 늘리세요.",
             )
         fixed_positive_sum = sum(v for v in fixed_shift.values() if v >= 0)
         if fixed_total >= 0 and fixed_positive_sum > fixed_total:
@@ -854,7 +834,7 @@ def evaluate_additional_availability(params: dict[str, Any], sol: dict[tuple[int
     This intentionally ignores duty headcount and group-level grade composition, because
     it is meant as a backup/extra-work availability view after a complete schedule exists.
     It *does* enforce the doctor's requests, previous-five-day sequence context, all
-    per-doctor sequence rules, fixed D/E/N/Total counts, maximum_N, and maximum_total.
+    per-doctor sequence rules, fixed D/E/N/Total counts, and maximum_total.
 
     Returns a dict {(doctor_idx, day_idx): ["D", "E", "N", ...]} for candidates.
     """
@@ -869,7 +849,6 @@ def evaluate_additional_availability(params: dict[str, Any], sol: dict[tuple[int
     shift_counts_raw = params.get("shift_counts", {}) or {}
     shift_counts = {int(k): {sk: int(sv) for sk, sv in v.items()} for k, v in shift_counts_raw.items()}
     maximum_total = {int(k): int(v) for k, v in (params.get("maximum_total", {}) or {}).items()}
-    maximum_n = {int(k): int(v) for k, v in (params.get("maximum_N", {}) or {}).items()}
 
     history = [[[0, 0, 0] for _ in range(previous_days)] for _ in range(num_doctors)]
     for key, cell in previous_raw.items():
@@ -996,7 +975,6 @@ def evaluate_additional_availability(params: dict[str, Any], sol: dict[tuple[int
         sc = shift_counts.get(n, {})
         fixed_total = int(sc.get("Total", -1))
         max_total = int(maximum_total.get(n, -1))
-        max_n = int(maximum_n.get(n, -1))
 
         # Exact fixed total means no extra assignment can be added without breaking it.
         if fixed_total >= 0 and current_total >= fixed_total:
@@ -1017,8 +995,6 @@ def evaluate_additional_availability(params: dict[str, Any], sol: dict[tuple[int
                 # Exact per-shift and total counts remain hard constraints.
                 fixed_shift = int(sc.get(shift_key, -1))
                 if fixed_shift >= 0 and current_counts[s] + 1 > fixed_shift:
-                    continue
-                if s == 2 and max_n >= 0 and current_counts[2] + 1 > max_n:
                     continue
                 if fixed_total >= 0 and current_total + 1 > fixed_total:
                     continue
@@ -1043,14 +1019,13 @@ def build_and_solve(params: dict[str, Any]):
         start_date    : str  (YYYY-MM-DD)
         day_types     : dict {str(day_idx) -> '평일'|'토'|'일'|'공'}
         duty_requests : dict {str(day_idx) -> [D, E, N]}  # hard minimum staffing per duty
-        ideal_duty_requests: dict {str(day_idx) -> [D, E, N]}  # optional soft staffing; -1/missing = unused
+        ideal_duty_requests: dict {str(day_idx) -> [D, E, N]}  # soft preferred staffing; missing = minimum
         shift_requests: dict {"n,d" -> cell_str}
         previous_schedule: dict {"n,h" -> actual shift}, h=0 oldest of preceding days
         previous_schedule_days: int (default 5)
         rules         : dict {str(n) -> {rule_key: value}}
         shift_adj     : dict {str(n) -> int}
-        maximum_total : dict {str(n) -> -1|int}; -1 = no total maximum
-        maximum_N     : dict {str(n) -> -1|int}; -1 = no Night maximum
+        maximum_total : dict {str(n) -> -1|int}; -1 = no maximum
         grades        : dict {str(n) -> int}
         grade_rules   : dict with senior/junior policy
         solver_mode   : str
@@ -1079,8 +1054,6 @@ def build_and_solve(params: dict[str, Any]):
     shift_adj    = {int(k): int(v) for k, v in params["shift_adj"].items()}
     maximum_total_raw = params.get("maximum_total", {}) or {}
     maximum_total = {int(k): int(v) for k, v in maximum_total_raw.items()}
-    maximum_n_raw = params.get("maximum_N", {}) or {}
-    maximum_n = {int(k): int(v) for k, v in maximum_n_raw.items()}
     # shift_counts: {n: {"D": -1|int, "E": -1|int, "N": -1|int}}, -1 = auto balance
     shift_counts_raw = params.get("shift_counts", {})
     shift_counts = {}
@@ -1165,35 +1138,23 @@ def build_and_solve(params: dict[str, Any]):
 
     day_names_list = [_get_day_label(start_date, d) for d in all_days]
 
-    # duty_requests[d][s] are HARD minimums.
-    # Ideal is OPTIONAL: -1/missing means "no Ideal preference" for that date/shift.
-    # When explicitly entered, it is clamped to >= Minimal and acts only in placement.
+    # duty_requests[d][s] are HARD minimums. Ideal requests are SOFT targets used
+    # only to choose where unavoidable/additional staffing should go.  For backward
+    # compatibility, minimum 0 still means a closed duty, so its Ideal is forced to 0.
     duty_requests = [[int(duty_req_raw.get(d, [1,1,1])[s]) for s in all_shifts] for d in all_days]
     ideal_duty_requests = []
-    ideal_duty_enabled = []
     for d in all_days:
-        raw_ideal = list(ideal_duty_req_raw.get(d, [-1, -1, -1]))
+        raw_ideal = list(ideal_duty_req_raw.get(d, duty_requests[d]))
         if len(raw_ideal) < 3:
-            raw_ideal = (raw_ideal + [-1, -1, -1])[:3]
+            raw_ideal = (raw_ideal + duty_requests[d])[:3]
         row = []
-        enabled_row = []
         for s in all_shifts:
             minimum = int(duty_requests[d][s])
-            try:
-                raw_value = int(raw_ideal[s])
-            except (TypeError, ValueError):
-                raw_value = -1
-            enabled = minimum > 0 and raw_value >= 0
-            if enabled:
-                row.append(min(num_doctors, max(minimum, raw_value)))
-                enabled_row.append(True)
+            if minimum <= 0:
+                row.append(0)
             else:
-                # Store Minimal only as an arithmetic placeholder; this cell does NOT
-                # create Ideal shortfall/over-Ideal penalties.
-                row.append(max(0, minimum))
-                enabled_row.append(False)
+                row.append(min(num_doctors, max(minimum, int(raw_ideal[s]))))
         ideal_duty_requests.append(row)
-        ideal_duty_enabled.append(enabled_row)
 
     # Validate senior hard rule before building the full model.
     if senior_min_count > 0:
@@ -1252,26 +1213,9 @@ def build_and_solve(params: dict[str, Any]):
 
     # ── Averages ─────────────────────────────────────────────────────────────
     total_duty = sum(sum(duty_requests[d]) for d in all_days)
+    total_ideal_duty = sum(sum(ideal_duty_requests[d]) for d in all_days)
     total_s    = [sum(duty_requests[d][s] for d in all_days) for s in all_shifts]
-
-    # Ideal is optional. Count/sum only cells where the user explicitly entered
-    # an Ideal value. Disabled(blank) cells must not appear as Ideal targets.
-    ideal_configured_cells = sum(
-        1 for d in all_days for s in all_shifts if ideal_duty_enabled[d][s]
-    )
-    total_ideal_duty = sum(
-        ideal_duty_requests[d][s]
-        for d in all_days for s in all_shifts
-        if ideal_duty_enabled[d][s]
-    )
-    total_ideal_s = [
-        sum(
-            ideal_duty_requests[d][s]
-            for d in all_days
-            if ideal_duty_enabled[d][s]
-        )
-        for s in all_shifts
-    ]
+    total_ideal_s = [sum(ideal_duty_requests[d][s] for d in all_days) for s in all_shifts]
     total_holiday_demand = sum(
         duty_requests[d][s] for d in holiday for s in all_shifts
     )
@@ -1301,40 +1245,6 @@ def build_and_solve(params: dict[str, Any]):
             raise RuntimeError(
                 f"{names[n]}의 fixed_total({fixed_total})이 maximum_total({max_total})보다 큽니다."
             )
-
-    # maximum_N is a separate hard upper bound on monthly Night count.
-    max_n_by_doc = {
-        n: int(maximum_n.get(n, -1))
-        for n in all_doctors
-        if int(maximum_n.get(n, -1)) >= 0
-    }
-    for n in all_doctors:
-        sc = shift_counts.get(n, {})
-        fixed_n = int(sc.get("N", -1))
-        max_n = max_n_by_doc.get(n, -1)
-        if fixed_n >= 0 and max_n >= 0 and fixed_n > max_n:
-            raise RuntimeError(
-                f"{names[n]}의 fixed_N({fixed_n})이 maximum_N({max_n})보다 큽니다."
-            )
-
-    # If every doctor has a finite N upper bound (fixed_N itself is exact), the
-    # sum of those bounds must cover the minimum Night staffing.
-    n_upper_bounds = []
-    all_have_n_upper_bound = True
-    for n in all_doctors:
-        fixed_n = int(shift_counts.get(n, {}).get("N", -1))
-        if fixed_n >= 0:
-            n_upper_bounds.append(fixed_n)
-        elif n in max_n_by_doc:
-            n_upper_bounds.append(max_n_by_doc[n])
-        else:
-            all_have_n_upper_bound = False
-            break
-    if all_have_n_upper_bound and sum(n_upper_bounds) < total_s[2]:
-        raise RuntimeError(
-            f"모든 의사의 N 상한 합({sum(n_upper_bounds)})이 N Duty 최소합({total_s[2]})보다 작아 "
-            f"{total_s[2] - sum(n_upper_bounds)}개의 N 근무를 배정할 수 없습니다."
-        )
 
     # If every doctor has a finite total upper bound (fixed_total itself is also an
     # exact upper bound), the sum of those bounds must cover all required duties.
@@ -1632,18 +1542,17 @@ def build_and_solve(params: dict[str, Any]):
                 duty_extra_vars.append(extra)
                 duty_extra_var_map[(d, s)] = extra
 
-                if ideal_duty_enabled[d][s]:
-                    ideal_gap = max(0, requested_ideal - requested_min)
-                    shortfall = model.NewIntVar(0, ideal_gap, f"ideal_shortfall_{d}_{s}")
-                    # shortfall = max(Ideal - actual, 0)
-                    model.AddMaxEquality(shortfall, [requested_ideal - count_var, 0])
-                    ideal_shortfall_vars.append(shortfall)
+                ideal_gap = max(0, requested_ideal - requested_min)
+                shortfall = model.NewIntVar(0, ideal_gap, f"ideal_shortfall_{d}_{s}")
+                # shortfall = max(Ideal - actual, 0)
+                model.AddMaxEquality(shortfall, [requested_ideal - count_var, 0])
+                ideal_shortfall_vars.append(shortfall)
 
-                    over_bound = max(0, num_doctors - requested_ideal)
-                    over_ideal = model.NewIntVar(0, over_bound, f"over_ideal_{d}_{s}")
-                    # over_ideal = max(actual - Ideal, 0)
-                    model.AddMaxEquality(over_ideal, [count_var - requested_ideal, 0])
-                    over_ideal_vars.append(over_ideal)
+                over_bound = max(0, num_doctors - requested_ideal)
+                over_ideal = model.NewIntVar(0, over_bound, f"over_ideal_{d}_{s}")
+                # over_ideal = max(actual - Ideal, 0)
+                model.AddMaxEquality(over_ideal, [count_var - requested_ideal, 0])
+                over_ideal_vars.append(over_ideal)
 
     duty_extra_total = sum(duty_extra_vars) if duty_extra_vars else 0
     ideal_shortfall_total = sum(ideal_shortfall_vars) if ideal_shortfall_vars else 0
@@ -1819,8 +1728,6 @@ def build_and_solve(params: dict[str, Any]):
         if fixed_d >= 0: model.Add(num_s[0] == fixed_d)
         if fixed_e >= 0: model.Add(num_s[1] == fixed_e)
         if fixed_n >= 0: model.Add(num_s[2] == fixed_n)
-        max_n = int(maximum_n.get(n, -1))
-        if max_n >= 0: model.Add(num_s[2] <= max_n)
         if fixed_total >= 0: model.Add(num_total == fixed_total)
         max_total = int(maximum_total.get(n, -1))
         if max_total >= 0:
@@ -1953,7 +1860,7 @@ def build_and_solve(params: dict[str, Any]):
                 'Junior': 'Y' if grades.get(n, 2) <= junior_max_grade else '',
                 '초저년차': 'Y' if grades.get(n, 2) <= ultra_junior_max_grade else '',
                 'D': d_cnt, 'E': e_cnt, 'N': n_cnt,
-                'Total': tot, 'maximum_total': int(maximum_total.get(n, -1)), 'maximum_N': int(maximum_n.get(n, -1)), '연차': annual_cnt, 'Holiday': hol,
+                'Total': tot, 'maximum_total': int(maximum_total.get(n, -1)), '연차': annual_cnt, 'Holiday': hol,
                 'Fri_N': fri_n,
                 '주간평균hr': round((d_cnt*8 + e_cnt*9 + n_cnt*8) / num_days * 7, 2),
             })
@@ -2009,7 +1916,6 @@ def build_and_solve(params: dict[str, Any]):
             "duty_extra": value_fn(duty_extra_total) if duty_extra_vars else 0,
             "duty_minimum_total": total_duty,
             "duty_ideal_total": total_ideal_duty,
-            "ideal_configured_cells": ideal_configured_cells,
             "duty_ideal_D": total_ideal_s[0],
             "duty_ideal_E": total_ideal_s[1],
             "duty_ideal_N": total_ideal_s[2],
