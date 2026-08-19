@@ -1399,3 +1399,141 @@ V12에서 `Ideal_D/E/N`을 빈칸으로 둘 수 있게 만든 뒤, solver 결과
 - DutyRequests는 최소 필요 인원이므로 hard-fixed 인원이 Minimal보다 많다는 이유만으로 충돌로 표시하던 오래된 진단 조건을 제거했습니다.
 - 사람을 중간에서 삭제할 때 rules, shift_adj, fixed counts, maximum_N/maximum_total, 근무요청, 고정 셀, 직전 5일 스케줄의 doctor index를 함께 재정렬합니다.
 - 중복되어 있던 `get_day_label()` 정의를 하나로 정리했습니다.
+
+
+---
+
+## V12.3: 스케줄 생성 전 0차 Hard rule 사전검사
+
+이 버전부터 **스케줄을 생성하기 전에 0차 Hard rule 사전검사 결과를 항상 화면에 표시**합니다.
+
+검사 대상에는 다음이 포함됩니다.
+
+- `fixed_Total` 정확값이 개인 hard rule상 실제로 달성 가능한지
+- 개인 hard rule을 모두 적용했을 때의 정확 최대/최소 Total
+- `fixed_N > maximum_N`
+- `fixed_Total > maximum_total`
+- `fixed_D/E/N` 합과 Total 상한의 충돌
+- 전체 Total 상한 합이 Duty 최소합보다 작은 경우
+- 전체 N 상한 합이 N Duty 최소합보다 작은 경우
+- 직전 5일 스케줄과 `N-rest / N-gap`
+- 대문자 `D/E/N` hard-fixed와 `x/a/불가 요청`
+- 최대 연속근무, sliding 7일 최대근무 등 확정 hard input 충돌
+
+화면에는 항상 다음 중 하나가 보입니다.
+
+```text
+✅ 확정 hard-rule 충돌이 발견되지 않았습니다.
+```
+
+또는
+
+```text
+❌ 확정 hard-rule 충돌 N건
+이름 | 날짜 | 충돌 규칙 | 설명 | 수정 제안
+```
+
+확정 충돌이 있는 상태에서 `스케줄 생성`을 눌러도 **전체 roster CP-SAT solver는 실행하지 않습니다.**
+먼저 사전검사에서 표시된 충돌을 수정해야 합니다.
+
+사전검사는 저장된 hard input의 signature를 기준으로 cache합니다. 따라서 Streamlit 화면이 단순 rerun될 때마다 개인 CP-SAT 검사를 반복하지 않고, **저장된 hard 설정이 바뀐 경우에만 자동 재검사**합니다.
+
+주의: 0차 사전검사에서 충돌이 없다는 것은 **확정된 개인/hard coding 모순이 없다는 뜻**이며, 전체 인력 조합까지 반드시 feasible하다는 보장은 아닙니다. 날짜별 후보 부족, grade 조합 등 전체 병목은 상세 진단모드가 추가로 확인합니다.
+
+
+---
+
+## V12.4: 전원 fixed_Total 최적화 생략 / UNKNOWN 구분 / feasible fallback
+
+간호사처럼 모든 사람에게 `fixed_Total`이 지정된 경우에는 전체 월 근무수가 이미 정확히 정해져 있습니다.
+
+예:
+
+```text
+Duty Minimal 합 = 580
+전체 fixed_Total 합 = 646
+→ 실제 총근무 = 646
+→ 추가근무 = 66
+```
+
+이 경우 `추가근무를 몇 개로 최소화할지`는 solver가 결정할 문제가 아니므로, V12.4부터는 **extra 최소화 objective를 생략**하고 `추가근무=66`을 hard로 고정한 뒤 **feasibility 탐색부터 시작**합니다.
+
+Solver 흐름:
+
+```text
+[전원 fixed_Total]
+1. Feasibility: hard rule + Minimal + fixed_Total + maximum_N 등을 만족하는 해 찾기
+2. Placement: 어차피 필요한 extra를 Ideal / 날짜분산 / Duty분산에 맞게 배치
+3. Quality: N/D/E/휴일/grade 등의 soft balance 개선
+```
+
+`fixed_Total` 미지정자가 있는 경우에는 기존처럼 먼저 extra 수를 최소화합니다.
+
+### INFEASIBLE과 UNKNOWN을 구분
+
+이제 두 상태를 같은 오류로 표시하지 않습니다.
+
+- `INFEASIBLE`: CP-SAT이 hard constraint상 해가 없다고 증명함
+- `UNKNOWN`: 제한 시간 안에 feasible 해를 찾지 못함. **해가 없다는 뜻이 아님**
+
+### 뒤 단계 시간초과 시 feasible 해 유지
+
+Phase 1에서 feasible 근무표를 찾은 뒤 Placement 또는 Quality 최적화가 시간초과되어도, 이미 찾은 feasible 근무표를 버리지 않습니다.
+
+```text
+Feasibility 성공
+→ Placement UNKNOWN
+→ Feasibility 결과 반환
+
+Placement 성공
+→ Quality UNKNOWN
+→ Placement 결과 반환
+```
+
+따라서 soft optimization이 완전히 끝나지 않았다는 이유만으로 전체 스케줄 생성이 실패하지 않습니다.
+
+### Solver hint
+
+앞 단계의 feasible shift assignment를 가능한 OR-Tools 버전에서는 다음 단계의 solver hint로 전달합니다. Hint 지원 차이 때문에 오류가 나지 않도록 optional performance aid로만 사용합니다.
+
+
+---
+
+## V12.5: minimum_N 추가
+
+
+### minimum_N: 개인별 Night 근무 하한
+
+`minimum_N`은 한 사람에게 한 달 동안 배정해야 하는 **Night 근무의 최소 개수**를 정하는 hard rule입니다.
+
+```text
+빈칸 = 최소 제한 없음
+0    = 최소 0개 (실질적으로 하한 없음)
+3    = N을 최소 3개 이상 반드시 배정
+```
+
+`minimum_N`과 `maximum_N`을 같이 사용하면 Night 근무 범위를 정할 수 있습니다.
+
+| 설정 | 의미 |
+|---|---|
+| `minimum_N = 3` | N을 최소 3개 이상 |
+| `maximum_N = 5` | N을 최대 5개 이하 |
+| `minimum_N = 3`, `maximum_N = 5` | N을 **3~5개** 범위에서 자동 배정 |
+| `fixed_N = 4` | N을 **정확히 4개** |
+| `fixed_N = 4`, `minimum_N = 3`, `maximum_N = 5` | 가능. 정확히 4개 |
+| `fixed_N = 2`, `minimum_N = 3` | 충돌 |
+| `minimum_N = 6`, `maximum_N = 5` | 충돌 |
+
+`minimum_N`은 `fixed_Total`과도 동시에 적용됩니다. 예를 들어 `fixed_Total=18`, `minimum_N=3`, `maximum_N=5`이면 **총 18근무를 정확히 배정하면서 그중 N은 3~5개**가 되어야 합니다.
+
+또한 개인의 연차/불가일, N block/rest/gap, 직전 5일 스케줄 때문에 `minimum_N` 자체를 달성할 수 없는 경우에는 **0차 Hard rule 사전검사**에서 개인 exact CP-SAT 진단으로 표시됩니다.
+
+Excel `Rules` sheet에는 다음 컬럼을 사용할 수 있습니다.
+
+```text
+minimum_N
+maximum_N
+maximum_total
+```
+
+빈칸은 해당 하한/상한을 사용하지 않는다는 뜻입니다.

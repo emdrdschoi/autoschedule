@@ -7,9 +7,10 @@ Translated from the Google Colab prototype.
 from __future__ import annotations
 from typing import Any
 import pandas as pd
+import time
 from datetime import date, timedelta
 
-SCHEDULER_API_VERSION = '2026-08-19-v12.2-internal-consistency'
+SCHEDULER_API_VERSION = '2026-08-19-v12.5-minimum-n'
 
 try:
     from ortools.sat.python import cp_model
@@ -70,7 +71,7 @@ def _build_personal_hard_model(params: dict[str, Any], n: int, *, total_target: 
       - D/E/N/x/a requests
       - closed duties (DutyRequests == 0)
       - all personal sequence rules
-      - fixed_D/E/N, maximum_N and maximum_total
+      - fixed_D/E/N, minimum_N, maximum_N and maximum_total
 
     fixed_Total itself is *not* added unless ``total_target`` is supplied.  This lets the
     diagnostic solver ask both "is this exact fixed_Total feasible?" and "what is the true
@@ -93,6 +94,7 @@ def _build_personal_hard_model(params: dict[str, Any], n: int, *, total_target: 
     shift_counts_raw = params.get("shift_counts", {}) or {}
     shift_counts = {int(k): (v or {}) for k, v in shift_counts_raw.items()}
     maximum_total = {int(k): int(v) for k, v in (params.get("maximum_total", {}) or {}).items()}
+    minimum_n = {int(k): int(v) for k, v in (params.get("minimum_N", {}) or {}).items()}
     maximum_n = {int(k): int(v) for k, v in (params.get("maximum_N", {}) or {}).items()}
 
     def get_rule(key: str, default: int) -> int:
@@ -266,6 +268,9 @@ def _build_personal_hard_model(params: dict[str, Any], n: int, *, total_target: 
     num_total = model.NewIntVar(0, num_days * 3, f"diag_total_{n}")
     model.Add(num_total == sum(num_s))
 
+    min_n = int(minimum_n.get(n, -1))
+    if min_n >= 0:
+        model.Add(num_s[2] >= min_n)
     max_n = int(maximum_n.get(n, -1))
     if max_n >= 0:
         model.Add(num_s[2] <= max_n)
@@ -370,7 +375,7 @@ def diagnose_hard_conflicts(params: dict[str, Any]) -> pd.DataFrame:
     - uppercase D/E/N must-work requests,
     - x/a/lowercase cannot-work requests,
     - zero duty demand,
-    - fixed D/E/N/Total and maximum_total,
+    - fixed D/E/N/Total, maximum_N and maximum_total,
     - personal sequence hard rules that are already forced by those facts.
 
     It does not claim that an otherwise empty/optional day will be worked, so the
@@ -390,6 +395,7 @@ def diagnose_hard_conflicts(params: dict[str, Any]) -> pd.DataFrame:
     shift_counts_raw = params.get("shift_counts", {}) or {}
     shift_counts = {int(k): (v or {}) for k, v in shift_counts_raw.items()}
     maximum_total = {int(k): int(v) for k, v in (params.get("maximum_total", {}) or {}).items()}
+    minimum_n = {int(k): int(v) for k, v in (params.get("minimum_N", {}) or {}).items()}
     maximum_n = {int(k): int(v) for k, v in (params.get("maximum_N", {}) or {}).items()}
 
     shift_keys = ["D", "E", "N"]
@@ -473,6 +479,7 @@ def diagnose_hard_conflicts(params: dict[str, Any]) -> pd.DataFrame:
         except (TypeError, ValueError):
             fixed_total = -1
         max_total = int(maximum_total.get(n, -1))
+        min_n = int(minimum_n.get(n, -1))
         max_n = int(maximum_n.get(n, -1))
 
         # minimum forced/current facts and definitely-impossible shifts.
@@ -581,6 +588,20 @@ def diagnose_hard_conflicts(params: dict[str, Any]) -> pd.DataFrame:
                 explanation=f"대문자 hard-fixed 근무가 {current_forced_total}개인데 maximum_total={max_total}입니다.",
                 related=f"hard-fixed total={current_forced_total}, maximum_total={max_total}",
                 suggestion="대문자 고정근무 일부를 해제하거나 maximum_total을 늘리세요.",
+            )
+        if min_n >= 0 and max_n >= 0 and min_n > max_n:
+            add_conflict(
+                n, day_t=None, rule="minimum_N vs maximum_N",
+                explanation=f"minimum_N={min_n}인데 maximum_N={max_n}입니다.",
+                related=f"minimum_N={min_n}, maximum_N={max_n}",
+                suggestion="minimum_N을 줄이거나 maximum_N을 늘리세요.",
+            )
+        if fixed_shift["N"] >= 0 and min_n >= 0 and fixed_shift["N"] < min_n:
+            add_conflict(
+                n, day_t=None, rule="fixed_N vs minimum_N",
+                explanation=f"fixed_N={fixed_shift['N']}은 정확한 N 개수인데 minimum_N={min_n}보다 작습니다.",
+                related=f"fixed_N={fixed_shift['N']}, minimum_N={min_n}",
+                suggestion="fixed_N을 늘리거나 minimum_N을 줄이세요.",
             )
         if max_n >= 0 and current_forced_counts[2] > max_n:
             add_conflict(
@@ -854,7 +875,7 @@ def evaluate_additional_availability(params: dict[str, Any], sol: dict[tuple[int
     This intentionally ignores duty headcount and group-level grade composition, because
     it is meant as a backup/extra-work availability view after a complete schedule exists.
     It *does* enforce the doctor's requests, previous-five-day sequence context, all
-    per-doctor sequence rules, fixed D/E/N/Total counts, maximum_N, and maximum_total.
+    per-doctor sequence rules, fixed D/E/N/Total counts, minimum_N, maximum_N, and maximum_total.
 
     Returns a dict {(doctor_idx, day_idx): ["D", "E", "N", ...]} for candidates.
     """
@@ -869,6 +890,7 @@ def evaluate_additional_availability(params: dict[str, Any], sol: dict[tuple[int
     shift_counts_raw = params.get("shift_counts", {}) or {}
     shift_counts = {int(k): {sk: int(sv) for sk, sv in v.items()} for k, v in shift_counts_raw.items()}
     maximum_total = {int(k): int(v) for k, v in (params.get("maximum_total", {}) or {}).items()}
+    minimum_n = {int(k): int(v) for k, v in (params.get("minimum_N", {}) or {}).items()}
     maximum_n = {int(k): int(v) for k, v in (params.get("maximum_N", {}) or {}).items()}
 
     history = [[[0, 0, 0] for _ in range(previous_days)] for _ in range(num_doctors)]
@@ -1079,6 +1101,8 @@ def build_and_solve(params: dict[str, Any]):
     shift_adj    = {int(k): int(v) for k, v in params["shift_adj"].items()}
     maximum_total_raw = params.get("maximum_total", {}) or {}
     maximum_total = {int(k): int(v) for k, v in maximum_total_raw.items()}
+    minimum_n_raw = params.get("minimum_N", {}) or {}
+    minimum_n = {int(k): int(v) for k, v in minimum_n_raw.items()}
     maximum_n_raw = params.get("maximum_N", {}) or {}
     maximum_n = {int(k): int(v) for k, v in maximum_n_raw.items()}
     # shift_counts: {n: {"D": -1|int, "E": -1|int, "N": -1|int}}, -1 = auto balance
@@ -1302,7 +1326,12 @@ def build_and_solve(params: dict[str, Any]):
                 f"{names[n]}의 fixed_total({fixed_total})이 maximum_total({max_total})보다 큽니다."
             )
 
-    # maximum_N is a separate hard upper bound on monthly Night count.
+    # minimum_N / maximum_N are separate hard lower/upper bounds on monthly Night count.
+    min_n_by_doc = {
+        n: int(minimum_n.get(n, -1))
+        for n in all_doctors
+        if int(minimum_n.get(n, -1)) >= 0
+    }
     max_n_by_doc = {
         n: int(maximum_n.get(n, -1))
         for n in all_doctors
@@ -1311,10 +1340,38 @@ def build_and_solve(params: dict[str, Any]):
     for n in all_doctors:
         sc = shift_counts.get(n, {})
         fixed_n = int(sc.get("N", -1))
+        fixed_total = int(sc.get("Total", -1))
+        min_n = min_n_by_doc.get(n, -1)
         max_n = max_n_by_doc.get(n, -1)
+        max_total = max_total_by_doc.get(n, -1)
+
+        if min_n >= 0 and max_n >= 0 and min_n > max_n:
+            raise RuntimeError(
+                f"{names[n]}의 minimum_N({min_n})이 maximum_N({max_n})보다 큽니다."
+            )
+        if fixed_n >= 0 and min_n >= 0 and fixed_n < min_n:
+            raise RuntimeError(
+                f"{names[n]}의 fixed_N({fixed_n})이 minimum_N({min_n})보다 작습니다."
+            )
         if fixed_n >= 0 and max_n >= 0 and fixed_n > max_n:
             raise RuntimeError(
                 f"{names[n]}의 fixed_N({fixed_n})이 maximum_N({max_n})보다 큽니다."
+            )
+        required_n = fixed_n if fixed_n >= 0 else (min_n if min_n >= 0 else 0)
+        fixed_d = int(sc.get("D", -1))
+        fixed_e = int(sc.get("E", -1))
+        required_lower_sum = (
+            (fixed_d if fixed_d >= 0 else 0)
+            + (fixed_e if fixed_e >= 0 else 0)
+            + required_n
+        )
+        if fixed_total >= 0 and required_lower_sum > fixed_total:
+            raise RuntimeError(
+                f"{names[n]}의 필수 D/E/N 하한 합({required_lower_sum})이 fixed_total({fixed_total})보다 큽니다."
+            )
+        if max_total >= 0 and required_lower_sum > max_total:
+            raise RuntimeError(
+                f"{names[n]}의 필수 D/E/N 하한 합({required_lower_sum})이 maximum_total({max_total})보다 큽니다."
             )
 
     # If every doctor has a finite N upper bound (fixed_N itself is exact), the
@@ -1819,6 +1876,8 @@ def build_and_solve(params: dict[str, Any]):
         if fixed_d >= 0: model.Add(num_s[0] == fixed_d)
         if fixed_e >= 0: model.Add(num_s[1] == fixed_e)
         if fixed_n >= 0: model.Add(num_s[2] == fixed_n)
+        min_n = int(minimum_n.get(n, -1))
+        if min_n >= 0: model.Add(num_s[2] >= min_n)
         max_n = int(maximum_n.get(n, -1))
         if max_n >= 0: model.Add(num_s[2] <= max_n)
         if fixed_total >= 0: model.Add(num_total == fixed_total)
@@ -1917,13 +1976,42 @@ def build_and_solve(params: dict[str, Any]):
         + duty_concentration_total * duty_cell_spread_weight
     )
 
-    # Phase 1: Ideal never creates extra work. Minimize only assignments above Minimal.
-    model.Minimize(duty_extra_total)
+    # Phase 1 differs by staffing model:
+    # - If EVERYONE has fixed_Total, the monthly total assignment count is already
+    #   mathematically fixed. There is nothing to optimize about the number of extras.
+    #   We hard-fix that known extra count and make phase 1 a pure feasibility search.
+    # - Otherwise, keep the original strict first priority: minimize extra staffing.
+    all_totals_fixed = (len(free_total_doctors) == 0)
+    predetermined_extra_duty = None
+
+    def _clear_objective():
+        try:
+            model.ClearObjective()
+        except AttributeError:
+            try:
+                model.clear_objective()
+            except AttributeError:
+                pass
+
+    if all_totals_fixed:
+        predetermined_extra_duty = int(fixed_total_sum - total_duty)
+        if predetermined_extra_duty < 0:
+            raise RuntimeError(
+                f"INFEASIBLE: 모든 사람의 fixed_Total 합({fixed_total_sum})이 "
+                f"Duty 최소합({total_duty})보다 작습니다."
+            )
+        if duty_extra_vars:
+            model.Add(duty_extra_total == predetermined_extra_duty)
+        elif predetermined_extra_duty != 0:
+            raise RuntimeError(
+                "INFEASIBLE: fixed_Total 합 때문에 추가근무가 필요하지만 "
+                "추가배정 가능한 활성 Duty가 없습니다."
+            )
+        _clear_objective()
+    else:
+        model.Minimize(duty_extra_total)
 
     # ── Solve ─────────────────────────────────────────────────────────────────
-    solver = cp_model.CpSolver()
-    solver.parameters.max_time_in_seconds = time_max
-    solver.parameters.linearization_level = 0
 
     solutions = []
     summaries = []
@@ -1957,7 +2045,7 @@ def build_and_solve(params: dict[str, Any]):
                 'Junior': 'Y' if grades.get(n, 2) <= junior_max_grade else '',
                 '초저년차': 'Y' if grades.get(n, 2) <= ultra_junior_max_grade else '',
                 'D': d_cnt, 'E': e_cnt, 'N': n_cnt,
-                'Total': tot, 'maximum_total': int(maximum_total.get(n, -1)), 'maximum_N': int(maximum_n.get(n, -1)), '연차': annual_cnt, 'Holiday': hol,
+                'Total': tot, 'maximum_total': int(maximum_total.get(n, -1)), 'minimum_N': int(minimum_n.get(n, -1)), 'maximum_N': int(maximum_n.get(n, -1)), '연차': annual_cnt, 'Holiday': hol,
                 'Fri_N': fri_n,
                 '주간평균hr': round((d_cnt*8 + e_cnt*9 + n_cnt*8) / num_days * 7, 2),
             })
@@ -1965,46 +2053,163 @@ def build_and_solve(params: dict[str, Any]):
 
     metrics = []
 
-    # Split the user's time budget across three phases. This keeps the priorities
-    # semantically clear without huge combined-objective coefficients.
+    # The total time budget is shared dynamically.  Unused time from an earlier
+    # phase automatically remains available to later phases.
     total_time_budget = max(3.0, float(time_max))
-    extra_time = max(1.0, total_time_budget * 0.25)
-    placement_time = max(1.0, total_time_budget * 0.35)
-    quality_time = max(1.0, total_time_budget - extra_time - placement_time)
+    solve_started_at = time.monotonic()
 
-    # Phase 1: minimum total extras above Minimal.
-    solver.parameters.max_time_in_seconds = extra_time
-    extra_status = solver.Solve(model)
-    if extra_status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
-        raise RuntimeError("최적해가 없습니다.")
-    best_extra_duty = solver.Value(duty_extra_total) if duty_extra_vars else 0
-    model.Add(duty_extra_total == best_extra_duty)
+    def _remaining_time() -> float:
+        return max(0.0, total_time_budget - (time.monotonic() - solve_started_at))
 
-    # Phase 2: with the extra count fixed, trade Ideal preference against even spread.
-    try:
-        model.ClearObjective()
-    except AttributeError:
-        pass
-    model.Minimize(placement_penalty)
-    solver.parameters.max_time_in_seconds = placement_time
-    placement_status = solver.Solve(model)
-    if placement_status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
-        raise RuntimeError("최적해가 없습니다.")
-    best_placement_penalty = solver.Value(placement_penalty)
-    model.Add(placement_penalty == best_placement_penalty)
+    def _new_solver(limit_seconds: float):
+        s = cp_model.CpSolver()
+        s.parameters.max_time_in_seconds = max(0.1, float(limit_seconds))
+        s.parameters.linearization_level = 0
+        return s
 
-    # Phase 3: existing individual/grade/junior quality inside that placement score.
-    try:
-        model.ClearObjective()
-    except AttributeError:
-        pass
-    model.Minimize(adv)
-    solver.parameters.max_time_in_seconds = quality_time
-    status = solver.Solve(model)
-    if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
-        raise RuntimeError("최적해가 없습니다.")
+    def _is_solution_status(status_code) -> bool:
+        return status_code in (cp_model.OPTIMAL, cp_model.FEASIBLE)
 
-    best_adv = solver.Value(adv)
+    def _status_name(solver_obj, status_code) -> str:
+        try:
+            return solver_obj.StatusName(status_code)
+        except Exception:
+            return str(status_code)
+
+    def _raise_primary_failure(stage_label: str, solver_obj, status_code):
+        name = _status_name(solver_obj, status_code).upper()
+        if status_code == cp_model.INFEASIBLE or name == "INFEASIBLE":
+            raise RuntimeError(
+                f"INFEASIBLE: {stage_label}에서 hard constraint를 만족하는 해가 없다고 증명되었습니다."
+            )
+        if status_code == cp_model.MODEL_INVALID or name == "MODEL_INVALID":
+            raise RuntimeError(
+                f"MODEL_INVALID: {stage_label} 모델이 유효하지 않습니다. 코드/입력 검사가 필요합니다."
+            )
+        # UNKNOWN means the solver did NOT prove infeasibility; it simply did not
+        # find a feasible schedule within the allotted search time.
+        raise RuntimeError(
+            f"UNKNOWN: {stage_label}에서 제한 시간 내 feasible 해를 찾지 못했습니다. "
+            "불가능하다고 증명된 것은 아닙니다. 탐색 시간을 늘리거나 hard rule을 확인하세요."
+        )
+
+    # Keep a feasible shift assignment as a solver hint for later optimization.
+    # ClearHints is version-dependent, so older OR-Tools versions simply retain
+    # the first feasible hint instead of replacing it.
+    hint_already_added = False
+
+    def _apply_shift_hint(source_solver):
+        nonlocal hint_already_added
+        cleared = False
+        for method_name in ("ClearHints", "clear_hints"):
+            method = getattr(model, method_name, None)
+            if callable(method):
+                try:
+                    method()
+                    cleared = True
+                    hint_already_added = False
+                except Exception:
+                    pass
+                break
+        if hint_already_added and not cleared:
+            return
+        try:
+            for var in shifts.values():
+                model.AddHint(var, int(source_solver.Value(var)))
+            hint_already_added = True
+        except Exception:
+            # Hints are a performance aid only; never make correctness depend on them.
+            pass
+
+    # ── Phase 1 ──────────────────────────────────────────────────────────────
+    # All-fixed_Total roster: pure FEASIBILITY search with the known extra count.
+    # Otherwise: optimize the minimum number of extras as before.
+    phase1_label = "feasibility" if all_totals_fixed else "extra 최소화"
+    phase1_fraction = 0.50 if all_totals_fixed else 0.40
+    phase1_limit = max(1.0, min(_remaining_time(), total_time_budget * phase1_fraction))
+    phase1_solver = _new_solver(phase1_limit)
+    phase1_status = phase1_solver.Solve(model)
+
+    if not _is_solution_status(phase1_status):
+        _raise_primary_failure(phase1_label, phase1_solver, phase1_status)
+
+    phase1_status_name = _status_name(phase1_solver, phase1_status)
+    if all_totals_fixed:
+        best_extra_duty = int(predetermined_extra_duty or 0)
+        extra_status_name = "SKIPPED_FIXED_TOTAL_ALL"
+        feasibility_status_name = phase1_status_name
+    else:
+        best_extra_duty = phase1_solver.Value(duty_extra_total) if duty_extra_vars else 0
+        model.Add(duty_extra_total == best_extra_duty)
+        extra_status_name = phase1_status_name
+        feasibility_status_name = phase1_status_name
+
+    # For the all-fixed case the equality was already added before phase 1.
+    _apply_shift_hint(phase1_solver)
+
+    # The latest successful solver is always preserved.  Later soft optimization
+    # is allowed to time out without throwing this feasible schedule away.
+    final_solver = phase1_solver
+    final_stage = "feasibility" if all_totals_fixed else "extra"
+    fallback_used = False
+
+    placement_solver = None
+    placement_status = None
+    placement_status_name = "SKIPPED_NO_TIME"
+    best_placement_penalty = phase1_solver.Value(placement_penalty)
+    placement_completed = False
+
+    # ── Phase 2: Ideal + even placement ─────────────────────────────────────
+    remaining = _remaining_time()
+    if remaining >= 0.75:
+        _clear_objective()
+        model.Minimize(placement_penalty)
+
+        # Leave meaningful time for phase 3 when possible.
+        placement_limit = max(0.5, remaining * 0.60)
+        placement_solver = _new_solver(placement_limit)
+        placement_status = placement_solver.Solve(model)
+        placement_status_name = _status_name(placement_solver, placement_status)
+
+        if _is_solution_status(placement_status):
+            best_placement_penalty = placement_solver.Value(placement_penalty)
+            model.Add(placement_penalty == best_placement_penalty)
+            final_solver = placement_solver
+            final_stage = "placement"
+            placement_completed = True
+            _apply_shift_hint(placement_solver)
+        else:
+            # IMPORTANT: objective optimization failure is not a schedule failure.
+            # We keep the already feasible phase-1 schedule.
+            fallback_used = True
+
+    # ── Phase 3: individual/grade/junior quality ────────────────────────────
+    quality_solver = None
+    quality_status = None
+    quality_status_name = "SKIPPED"
+    quality_completed = False
+
+    if placement_completed and _remaining_time() >= 0.50:
+        _clear_objective()
+        model.Minimize(adv)
+
+        quality_solver = _new_solver(_remaining_time())
+        quality_status = quality_solver.Solve(model)
+        quality_status_name = _status_name(quality_solver, quality_status)
+
+        if _is_solution_status(quality_status):
+            final_solver = quality_solver
+            final_stage = "quality"
+            quality_completed = True
+            _apply_shift_hint(quality_solver)
+        else:
+            # Keep phase-2 feasible result. UNKNOWN here only means quality
+            # optimization did not finish/find a solution in its remaining time.
+            fallback_used = True
+
+    # Even if phase 2/3 timed out, final_solver is guaranteed feasible because
+    # phase 1 only reaches this point with FEASIBLE/OPTIMAL.
+    best_adv = final_solver.Value(adv)
     allowed_adv = best_adv + adv_limit if is_multi else best_adv
 
     def _metric_dict(value_fn):
@@ -2061,27 +2266,36 @@ def build_and_solve(params: dict[str, Any]):
             "best_adv": best_adv,
             "allowed_adv": allowed_adv,
             "adv_extra_allowed": adv_limit if is_multi else 0,
-            "extra_optimization_status": solver.StatusName(extra_status),
-            "placement_optimization_status": solver.StatusName(placement_status),
+            "all_totals_fixed": all_totals_fixed,
+            "predetermined_extra_duty": predetermined_extra_duty,
+            "feasibility_status": feasibility_status_name,
+            "extra_optimization_status": extra_status_name,
+            "placement_optimization_status": placement_status_name,
             "best_placement_penalty": best_placement_penalty,
-            "optimization_status": solver.StatusName(status),
+            "optimization_status": quality_status_name,
+            "final_solution_stage": final_stage,
+            "fallback_used": fallback_used,
+            "quality_completed": quality_completed,
         }
 
     if not is_multi:
-        sol, summ = _extract(solver.Value)
+        sol, summ = _extract(final_solver.Value)
         solutions.append(sol)
         summaries.append(summ)
-        metrics.append(_metric_dict(solver.Value))
+        metrics.append(_metric_dict(final_solver.Value))
     else:
-        # Multi-solution search after the three optimization phases. Extra count and
-        # placement score are already fixed; enumerate quality-nearby alternatives.
-        model.Add(adv <= allowed_adv)
-        try:
-            model.ClearObjective()
-        except AttributeError:
-            pass
+        # Preserve the known feasible solution before attempting enumeration.
+        fallback_sol, fallback_summ = _extract(final_solver.Value)
+        fallback_metric = _metric_dict(final_solver.Value)
 
-        solver.parameters.enumerate_all_solutions = True
+        # Multi-solution search is optional refinement. Failure/timeout here must
+        # never erase the feasible schedule already found above.
+        model.Add(adv <= allowed_adv)
+        _clear_objective()
+        _apply_shift_hint(final_solver)
+
+        enum_solver = _new_solver(max(1.0, total_time_budget * 0.25))
+        enum_solver.parameters.enumerate_all_solutions = True
 
         class _CB(cp_model.CpSolverSolutionCallback):
             def __init__(self):
@@ -2098,12 +2312,15 @@ def build_and_solve(params: dict[str, Any]):
                     self.StopSearch()
 
         cb = _CB()
-        solver.Solve(model, cb)
+        enum_status = enum_solver.Solve(model, cb)
 
         if not solutions:
-            raise RuntimeError(
-                f"조건을 만족하는 다중 솔루션이 없습니다. 최적 편차={best_adv}, "
-                f"허용 상한={allowed_adv}입니다. 추가 허용 편차 또는 탐색 시간을 늘려 보세요."
-            )
+            fallback_metric = dict(fallback_metric)
+            fallback_metric["fallback_used"] = True
+            fallback_metric["multi_enumeration_status"] = _status_name(enum_solver, enum_status)
+            fallback_metric["final_solution_stage"] = final_stage + "+multi_fallback"
+            solutions.append(fallback_sol)
+            summaries.append(fallback_summ)
+            metrics.append(fallback_metric)
 
     return solutions, summaries, metrics
