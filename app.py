@@ -2834,7 +2834,7 @@ with st.sidebar:
     st.divider()
     st.markdown('<div class="section-label">🔧 솔버 설정</div>', unsafe_allow_html=True)
     solver_mode = st.selectbox("모드", ["최적해 1개 (main)", "다중 솔루션 탐색 (main_alt)"], key="solver_mode")
-    time_max = st.slider("최대 탐색 시간 (초)", 10, 300, 60, key="time_max")
+    time_max = st.slider("최대 탐색 시간 (초)", 10, 2400, 60, key="time_max")
     if solver_mode.startswith("다중"):
         sol_limit = st.number_input("최대 솔루션 수", 1, 100, 5, key="sol_limit")
         adv_limit = st.number_input("최소 편차에 추가 허용 편차", 0, 100, 0, key="adv_limit")
