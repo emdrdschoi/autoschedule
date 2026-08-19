@@ -1378,3 +1378,13 @@ Grade / 개인 rule / maximum_total 수정 → `저장`
 11. 결과에서 추가 근무 가능 날짜/shift 확인 가능
 12. app.py / scheduler.py는 반드시 같은 동기화 세트를 사용
 ```
+
+## V12.1 bug fix: optional Ideal metrics
+
+V12에서 `Ideal_D/E/N`을 빈칸으로 둘 수 있게 만든 뒤, solver 결과 metrics에서 `ideal_configured_cells` 변수를 참조하면서 실제 계산 정의가 누락된 문제가 수정되었습니다.
+
+- Ideal 빈칸: 해당 날짜/Duty의 Ideal 선호도 **미사용**
+- Ideal 입력: 그 셀만 soft target으로 사용
+- `ideal_configured_cells`: 실제 Ideal이 입력된 셀 수만 계산
+- `duty_ideal_total`: Ideal이 입력된 셀의 값만 합산
+

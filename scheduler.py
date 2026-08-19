@@ -9,7 +9,7 @@ from typing import Any
 import pandas as pd
 from datetime import date, timedelta
 
-SCHEDULER_API_VERSION = '2026-08-19-v12-maximum-n'
+SCHEDULER_API_VERSION = '2026-08-19-v12.1-maximum-n-ideal-fix'
 
 try:
     from ortools.sat.python import cp_model
@@ -1252,9 +1252,26 @@ def build_and_solve(params: dict[str, Any]):
 
     # ── Averages ─────────────────────────────────────────────────────────────
     total_duty = sum(sum(duty_requests[d]) for d in all_days)
-    total_ideal_duty = sum(sum(ideal_duty_requests[d]) for d in all_days)
     total_s    = [sum(duty_requests[d][s] for d in all_days) for s in all_shifts]
-    total_ideal_s = [sum(ideal_duty_requests[d][s] for d in all_days) for s in all_shifts]
+
+    # Ideal is optional. Count/sum only cells where the user explicitly entered
+    # an Ideal value. Disabled(blank) cells must not appear as Ideal targets.
+    ideal_configured_cells = sum(
+        1 for d in all_days for s in all_shifts if ideal_duty_enabled[d][s]
+    )
+    total_ideal_duty = sum(
+        ideal_duty_requests[d][s]
+        for d in all_days for s in all_shifts
+        if ideal_duty_enabled[d][s]
+    )
+    total_ideal_s = [
+        sum(
+            ideal_duty_requests[d][s]
+            for d in all_days
+            if ideal_duty_enabled[d][s]
+        )
+        for s in all_shifts
+    ]
     total_holiday_demand = sum(
         duty_requests[d][s] for d in holiday for s in all_shifts
     )

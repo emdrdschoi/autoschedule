@@ -3416,7 +3416,7 @@ if st.session_state.get("trigger_solve"):
                     scheduler_module = importlib.util.module_from_spec(spec)
                     spec.loader.exec_module(scheduler_module)
 
-                    expected_scheduler_api = '2026-08-19-v12-maximum-n'
+                    expected_scheduler_api = '2026-08-19-v12.1-maximum-n-ideal-fix'
                     actual_scheduler_api = getattr(scheduler_module, "SCHEDULER_API_VERSION", None)
                     if actual_scheduler_api != expected_scheduler_api:
                         raise ImportError(
