@@ -70,6 +70,51 @@ html, body, [class*="css"] {
     margin-top: 0.15rem;
 }
 
+/* Ideal staffing inputs */
+input[aria-label^="Ideal "] {
+    background: rgba(240, 160, 64, 0.20) !important;
+    border: 1px solid rgba(240, 160, 64, 0.85) !important;
+    color: #ffd7a0 !important;
+    font-weight: 700 !important;
+}
+div[data-testid="stNumberInput"]:has(input[aria-label^="Ideal "]) button {
+    background: rgba(240, 160, 64, 0.22) !important;
+    border-color: rgba(240, 160, 64, 0.62) !important;
+    color: #ffd7a0 !important;
+}
+.friendly-note {
+    background: rgba(79, 142, 247, 0.08);
+    border: 1px solid rgba(79, 142, 247, 0.30);
+    border-radius: 7px;
+    padding: 0.72rem 0.9rem;
+    margin: 0.45rem 0 0.85rem;
+    font-size: 0.82rem;
+    line-height: 1.55;
+}
+.friendly-note strong { color: #ffffff; }
+.ideal-note {
+    background: rgba(240, 160, 64, 0.10);
+    border-color: rgba(240, 160, 64, 0.45);
+}
+.rule-label-help {
+    cursor: help;
+    border-bottom: 1px dotted #7b8499;
+}
+.solve-progress-track {
+    width: min(520px, 75vw);
+    height: 4px;
+    background: rgba(255,255,255,0.10);
+    border-radius: 999px;
+    overflow: hidden;
+    margin: 0.45rem auto 0;
+}
+.solve-progress-fill {
+    height: 100%;
+    width: 100%;
+    background: var(--accent);
+    transform-origin: left center;
+}
+
 /* Header */
 .main-header {
     padding: 2rem 0 1.5rem;
@@ -716,6 +761,35 @@ def sync_duty_request_widget(di: int, shift_i: int, widget_key: str):
     st.session_state.duty_requests[di] = [int(vals[0]), int(vals[1]), int(vals[2])]
 
 
+def optional_ideal_number_input(container, *, label: str, current_value, minimum: int, maximum: int, key: str, disabled: bool = False):
+    """Blank-capable Ideal input with +/- steppers where supported."""
+    normalized = normalized_ideal_duty_value(minimum, current_value)
+    shown_value = None if normalized < 0 else int(normalized)
+    try:
+        return container.number_input(
+            label,
+            min_value=int(minimum),
+            max_value=int(maximum),
+            value=shown_value,
+            step=1,
+            placeholder="선택",
+            label_visibility="collapsed",
+            key=key,
+            disabled=disabled,
+            help="Ideal은 추가근무가 필요한 경우 이 인원까지 우선 채우도록 선호하는 값입니다. 빈칸이면 사용하지 않습니다. +/- 버튼으로 조절할 수 있습니다.",
+        )
+    except TypeError:
+        return container.text_input(
+            label,
+            value="" if normalized < 0 else str(normalized),
+            placeholder="선택",
+            label_visibility="collapsed",
+            key=f"{key}_legacy",
+            disabled=disabled,
+            help="Ideal은 추가근무가 필요한 경우 우선 채우고 싶은 인원입니다. 빈칸이면 사용하지 않습니다.",
+        )
+
+
 def sync_ideal_duty_request_widget(di: int, shift_i: int, widget_key: str):
     """Callback/helper for an optional Ideal Duty value; blank disables the target."""
     if "ideal_duty_requests" not in st.session_state or not isinstance(st.session_state.ideal_duty_requests, dict):
@@ -736,7 +810,7 @@ def sync_shift_count_widget(ni: int, shift_key: str, widget_key: str):
     st.session_state.shift_counts[ni][shift_key] = bounded_int(st.session_state.get(widget_key), -1, -1, 60)
 
 
-FIXED_TOTAL_EDITOR_SCHEMA_VERSION = 5  # v5 adds per-person minimum_N
+FIXED_TOTAL_EDITOR_SCHEMA_VERSION = 6  # v6 nurse-friendly labels
 
 def get_fixed_total_editor_key() -> str:
     """Versioned key for the fixed/max count table editor.
@@ -994,19 +1068,31 @@ def render_fixed_total_editor_table():
     the values to session_state.shift_counts.
     """
     estimated_average = get_estimated_average_total()
-    st.caption(
-        "빈칸은 자동 배정/제한 없음입니다. fixed_D/E/N/Total은 정확한 개수, minimum_N/maximum_N은 N근무 하한/상한, "
-        "maximum_total은 총근무 상한입니다. 근무조정값은 자동 평준화 목표를 ±조정합니다. 저장을 눌러야 실제 반영됩니다."
+    st.markdown(
+        """
+        <div class="friendly-note">
+        <strong>월 근무수는 여기서 설정합니다.</strong><br>
+        • <b>고정 총근무수</b>: 이번 달에 반드시 해야 하는 정확한 근무수<br>
+        • <b>최대 근무수</b>: 이 숫자를 넘지 않도록 제한<br>
+        • <b>최소 N근무수 / 최대 N근무수</b>: N근무 범위를 지정<br>
+        • 빈칸은 해당 제한을 사용하지 않는다는 뜻입니다.
+        </div>
+        """,
+        unsafe_allow_html=True,
     )
-    with st.expander("입력값 설명", expanded=False):
+    with st.expander("각 항목이 무엇인지 보기", expanded=False):
         st.markdown(
             f"""
-- **근무조정값**: fixed_Total이 없는 사람의 자동 평준화 목표를 조정합니다. `+1`은 약 1근무 증가, `-1`은 약 1근무 감소 방향입니다.
-- **fixed_D / fixed_E / fixed_N**: 해당 shift를 정확히 그 개수로 고정합니다. `0`도 정확한 0개라는 뜻입니다.
-- **fixed_Total**: 월 총근무수를 정확히 고정합니다. 더 많거나 적게 배정할 수 없습니다.
-- **minimum_N**: 월 Night 근무 하한입니다. 예: `3`이면 N을 최소 3개 이상 반드시 배정합니다.\n- **maximum_N**: 월 Night 근무 상한입니다. 예: `5`이면 N은 최대 5개까지 배정됩니다.\n  `minimum_N=3`, `maximum_N=5`를 같이 쓰면 N은 3~5개 범위에서 자동 배정됩니다.\n- **maximum_total**: 월 총근무 상한입니다. 그보다 적게 근무하는 것은 허용됩니다.
-- **연차(a)**: 근무 요청에서 입력한 `a` 개수입니다. 자동계산 시 fixed_Total이 없는 사람의 권장 근무조정값에 반영됩니다.
-- **Duty 기준 평균**: 현재 Duty 최소합 ÷ 전체 인원 = 약 **{estimated_average:.1f}개/명**입니다. 실제 자동 목표는 fixed_Total, 근무조정값 및 개인 rule에 따라 달라질 수 있습니다.
+- **고정 총근무수**: 월 총근무수를 정확히 고정합니다. 예: `18` → 반드시 18근무.
+- **최대 근무수**: 월 총근무수의 상한입니다. 예: `18` → 18 이하로 배정.
+- **최소 N근무수**: N을 적어도 이만큼 배정합니다. 예: `3` → N 3개 이상.
+- **최대 N근무수**: N을 이 숫자 이하로 제한합니다. 예: `5` → N 5개 이하.
+- **고정 D / 고정 E / 고정 N**: 해당 근무의 정확한 월 개수를 지정합니다. `0`은 정확히 0개입니다.
+- **근무조정값**: 고정 총근무수가 없는 사람의 자동 배정량을 조금 늘리거나 줄입니다. 특별한 이유가 없으면 `0`으로 두면 됩니다.
+- **연차(a)**: 근무 요청 탭에서 `a`로 표시한 연차 개수입니다.
+- **최소인원 기준 평균**: 현재 Duty 최소합 ÷ 전체 간호사 수 = 약 **{estimated_average:.1f}개/명**입니다.
+
+💡 표의 항목 이름에 마우스를 올리면 더 자세한 설명을 볼 수 있습니다.
             """
         )
     key = get_fixed_total_editor_key()
@@ -1030,9 +1116,9 @@ def render_fixed_total_editor_table():
             disabled=["No", "Name", "Grade", "Senior", "Junior", "초저년차", "연차(a)"],
             column_order=["No", "Name", "maximum_total", "minimum_N", "maximum_N", "fixed_Total", "Grade", "Senior", "Junior", "초저년차", "연차(a)", "근무조정값", "fixed_D", "fixed_E", "fixed_N"],
             column_config={
-                "No": st.column_config.NumberColumn("No", width="small", disabled=True),
-                "Name": st.column_config.TextColumn("Name", width="medium", disabled=True),
-                "Grade": st.column_config.NumberColumn("Grade", width="small", disabled=True),
+                "No": st.column_config.NumberColumn("No", width="small", disabled=True, help="입력한 간호사 순서입니다."),
+                "Name": st.column_config.TextColumn("이름", width="medium", disabled=True, help="간호사 이름입니다."),
+                "Grade": st.column_config.NumberColumn("Grade", width="small", disabled=True, help="경력/숙련도를 나타내는 숫자입니다. 아래 Grade 인력 구성 규칙에 사용합니다."),
                 "Senior": st.column_config.TextColumn("Senior", width="small", disabled=True),
                 "Junior": st.column_config.TextColumn("Junior", width="small", disabled=True),
                 "초저년차": st.column_config.TextColumn("초저년차", width="small", disabled=True),
@@ -1052,39 +1138,39 @@ def render_fixed_total_editor_table():
                     help="근무 평균 목표를 조정합니다. +1은 목표 근무를 1개 늘리고, -1은 1개 줄이는 효과입니다.",
                 ),
                 "fixed_D": st.column_config.TextColumn(
-                    "fixed_D",
+                    "고정 D",
                     width="small",
-                    help="빈칸 = 자동 평준화, 0 = Day 근무 없음, 1 이상 = Day 근무 수 고정",
+                    help="D근무의 정확한 월 개수입니다. 빈칸이면 자동, 0이면 D를 배정하지 않습니다.",
                 ),
                 "fixed_E": st.column_config.TextColumn(
-                    "fixed_E",
+                    "고정 E",
                     width="small",
-                    help="빈칸 = 자동 평준화, 0 = Evening 근무 없음, 1 이상 = Evening 근무 수 고정",
+                    help="E근무의 정확한 월 개수입니다. 빈칸이면 자동, 0이면 E를 배정하지 않습니다.",
                 ),
                 "fixed_N": st.column_config.TextColumn(
-                    "fixed_N",
+                    "고정 N",
                     width="small",
-                    help="빈칸 = 자동 평준화, 0 = Night 근무 없음, 1 이상 = Night 근무 수 고정",
+                    help="N근무의 정확한 월 개수입니다. 빈칸이면 자동, 0이면 N을 배정하지 않습니다.",
                 ),
                 "fixed_Total": st.column_config.TextColumn(
-                    "fixed_Total",
+                    "고정 총근무수",
                     width="small",
-                    help="빈칸 = 자동 평준화, 0 = 총근무 없음, 1 이상 = 총 D/E/N 근무 수 고정",
+                    help="정확한 월 총근무수입니다. 예: 18이면 반드시 총 18근무를 배정합니다. 빈칸이면 자동으로 정합니다.",
                 ),
                 "minimum_N": st.column_config.TextColumn(
-                    "minimum_N",
+                    "최소 N근무수",
                     width="small",
-                    help="빈칸 = 제한 없음, 0 이상 = Night 근무 수의 최소 허용값. 예: 3이면 N을 최소 3개 배정",
+                    help="N근무 하한입니다. 예: 3이면 N을 최소 3개 이상 배정합니다. 빈칸이면 최소 제한이 없습니다.",
                 ),
                 "maximum_N": st.column_config.TextColumn(
-                    "maximum_N",
+                    "최대 N근무수",
                     width="small",
-                    help="빈칸 = 제한 없음, 0 이상 = Night 근무 수의 최대 허용값. 예: 5이면 N을 최대 5개 배정",
+                    help="N근무 상한입니다. 예: 5이면 N을 최대 5개까지만 배정합니다. 빈칸이면 최대 제한이 없습니다.",
                 ),
                 "maximum_total": st.column_config.TextColumn(
-                    "maximum_total",
+                    "최대 근무수",
                     width="small",
-                    help="빈칸 = 제한 없음, 0 이상 = 총 D/E/N 근무 수의 최대 허용값. fixed_Total과 달리 더 적게 근무하는 것은 허용",
+                    help="월 총근무수의 상한입니다. 예: 18이면 18을 넘을 수 없지만 더 적게 배정되는 것은 가능합니다. 고정 총근무수와는 다릅니다.",
                 ),
             },
         )
@@ -1100,6 +1186,7 @@ def render_fixed_total_editor_table():
         apply_fixed_total_editor_df(edited_df)
         st.session_state["fixed_counts_editor_pending_df"] = None
         st.toast("✅ 저장되었습니다.", icon="✅")
+        request_quick_preflight_after_save()
         # Recreate the editor from committed values and refresh the summary boxes above.
         st.session_state["shift_count_version"] = st.session_state.get("shift_count_version", 0) + 1
         st.rerun()
@@ -1911,13 +1998,55 @@ def get_preflight_hard_rule_check(force: bool = False) -> dict:
     return result
 
 
+def request_quick_preflight_after_save():
+    """Ask the next rerun to perform only the fast/basic hard-rule check."""
+    st.session_state["_quick_preflight_after_save"] = True
+
+
+def render_quick_preflight_after_save():
+    """One-time, lightweight check after a settings save.
+
+    This intentionally does NOT run the expensive per-person exact CP-SAT diagnostics.
+    The full exact preflight still runs immediately before schedule generation.
+    """
+    if not st.session_state.pop("_quick_preflight_after_save", False):
+        return
+    if not st.session_state.get("doctors"):
+        return
+
+    normalize_shift_counts()
+    normalize_maximum_total()
+    normalize_minimum_n()
+    normalize_maximum_n()
+    normalize_previous_schedule()
+    combined_req = refresh_combined_shift_requests()
+    params = _hard_preflight_params(combined_req)
+    basic_df = _basic_preflight_conflicts(params)
+
+    if isinstance(basic_df, pd.DataFrame) and not basic_df.empty:
+        st.error(
+            f"저장된 설정에서 바로 확인되는 필수 규칙 충돌이 **{len(basic_df)}건** 있습니다."
+        )
+        show_cols = [
+            c for c in ["이름", "날짜", "충돌 규칙", "설명", "수정 제안"]
+            if c in basic_df.columns
+        ]
+        st.dataframe(basic_df[show_cols], use_container_width=True, hide_index=True)
+    else:
+        st.toast(
+            "✅ 저장 완료 · 기본 필수 규칙 확인 완료 "
+            "(개인별 정밀 검사는 스케줄 생성 직전에 자동 실행)",
+            icon="✅",
+        )
+
+
 def render_preflight_hard_rule_status():
-    """Render the pre-solve hard-rule status on every normal app view."""
+    """Detailed preflight renderer for explicit/manual use only."""
     if not st.session_state.get("doctors"):
         return
 
     with st.container(border=True):
-        st.markdown("**🛡️ 0차 Hard rule 사전검사**")
+        st.markdown("**🛡️ 필수 규칙 정밀 검사**")
         result = get_preflight_hard_rule_check(force=False)
         conflicts = result.get("conflicts", pd.DataFrame())
         error = str(result.get("error", "") or "")
@@ -1936,7 +2065,7 @@ def render_preflight_hard_rule_status():
 
         if isinstance(conflicts, pd.DataFrame) and not conflicts.empty:
             st.error(
-                f"확정 hard-rule 충돌 **{len(conflicts)}건**이 있습니다. "
+                f"확정 필수 규칙 충돌 **{len(conflicts)}건**이 있습니다. "
                 "이 상태에서는 전체 스케줄 solver를 실행하지 않습니다."
             )
             show_cols = [
@@ -1949,11 +2078,11 @@ def render_preflight_hard_rule_status():
                 hide_index=True,
             )
         else:
-            st.success("확정 hard-rule 충돌이 발견되지 않았습니다. ✅")
+            st.success("확정 필수 규칙 충돌이 발견되지 않았습니다. ✅")
             st.caption(
-                "fixed_Total의 개인별 정확 달성 가능성, minimum_N/maximum_N/maximum_total, "
-                "직전 5일과 N-rest/N-gap, 대문자 D/E/N, x/a 등 확정 hard input을 확인했습니다. "
-                "단, 이 검사는 전체 인력 조합의 feasible을 보장하는 검사는 아닙니다."
+                "개인별 고정 총근무수 달성 가능성, 최소/최대 N근무수, 최대 근무수, "
+                "직전 5일, N 휴식/간격, 필수 D/E/N, 근무불가/연차를 확인했습니다. "
+                "이 검사를 통과해도 전체 인력 조합에서 추가 병목이 생길 수 있습니다."
             )
 
 
@@ -2699,6 +2828,7 @@ def build_schedule_excel_bytes(
             "grade": int(doc.get("grade", DEFAULT_DOCTOR_GRADE)),
             "shift_adj": st.session_state.shift_adj.get(ni, 0),
             "maximum_total": fixed_count_excel_value(st.session_state.maximum_total.get(ni, -1)),
+            "minimum_N": fixed_count_excel_value(st.session_state.minimum_N.get(ni, -1)),
             "maximum_N": fixed_count_excel_value(st.session_state.maximum_N.get(ni, -1)),
         }
         for key in rule_col_order:
@@ -2711,6 +2841,7 @@ def build_schedule_excel_bytes(
     for ni in display_order:
         current_total = sum(len(_parse_result_shift_codes(sol.get((ni, di), ""))) for di in range(num_days))
         max_total = parse_fixed_count_value(st.session_state.maximum_total.get(ni, -1))
+        min_n = parse_fixed_count_value(st.session_state.minimum_N.get(ni, -1))
         max_n = parse_fixed_count_value(st.session_state.maximum_N.get(ni, -1))
         for di in range(num_days):
             candidates = additional_availability.get((ni, di), [])
@@ -2828,7 +2959,7 @@ with st.sidebar:
     st.session_state.num_days = int(num_days)
 
     st.divider()
-    st.markdown('<div class="section-label">👨‍⚕️ 의사 관리</div>', unsafe_allow_html=True)
+    st.markdown('<div class="section-label">👩‍⚕️ 간호사 관리</div>', unsafe_allow_html=True)
 
     with st.form("add_doctor_form", clear_on_submit=True):
         new_name = st.text_input("이름 추가", placeholder="홍길동", key="new_doc_name")
@@ -3198,6 +3329,7 @@ with st.sidebar:
                 st.session_state["shift_req_version"] = st.session_state.get("shift_req_version", 0) + 1
 
                 st.toast("✅ 설정 적용 완료!", icon="✅")
+                request_quick_preflight_after_save()
                 st.rerun()
             except Exception as e:
                 st.error(f"불러오기 실패: {e}")
@@ -3207,7 +3339,7 @@ with st.sidebar:
     st.divider()
 
     # Schedule generation button: two-step confirmation so users save forms first.
-    st.caption("스케줄 생성 전 0차 Hard rule 사전검사를 먼저 통과해야 합니다. 각 탭에서 저장된 설정만 검사/생성에 사용됩니다.")
+    st.caption("스케줄 생성을 누르면 먼저 필수 규칙을 정밀 검사한 뒤, 문제가 없으면 자동으로 근무표 탐색을 시작합니다.")
     if st.button("🚀 스케줄 생성", use_container_width=True, key="btn_solve"):
         st.session_state["trigger_solve"] = True
         st.rerun()
@@ -3215,8 +3347,52 @@ with st.sidebar:
     st.caption("by DS Choi 2026.03.19")
 
 
+def render_solver_countdown(slot, seconds: int):
+    """Browser-side countdown for the CP-SAT time budget."""
+    sec = max(1, int(seconds or 1))
+    prop = f"--solve-remaining-{sec}"
+    anim = f"solve_countdown_{sec}"
+    bar_anim = f"solve_bar_{sec}"
+    slot.markdown(
+        f"""
+        <style>
+        @property {prop} {{
+            syntax: "<integer>";
+            initial-value: {sec};
+            inherits: false;
+        }}
+        @keyframes {anim} {{
+            from {{ {prop}: {sec}; }}
+            to {{ {prop}: 0; }}
+        }}
+        @keyframes {bar_anim} {{
+            from {{ transform: scaleX(1); }}
+            to {{ transform: scaleX(0); }}
+        }}
+        .solve-countdown-{sec} {{
+            {prop}: {sec};
+            animation: {anim} {sec}s linear forwards;
+            counter-reset: solveRemain var({prop});
+            color: #ffffff;
+            font-weight: 700;
+        }}
+        .solve-countdown-{sec}::after {{ content: counter(solveRemain) "초"; }}
+        .solve-progress-{sec} {{ animation: {bar_anim} {sec}s linear forwards; }}
+        </style>
+        <div class="solve-running-banner">
+            ⚙️ 스케줄 분석 중입니다…
+            <span class="sub">
+                CP-SAT 근무표 탐색 중 · 남은 시간 약 <span class="solve-countdown-{sec}"></span> · 최대 {sec}초
+            </span>
+            <div class="solve-progress-track"><div class="solve-progress-fill solve-progress-{sec}"></div></div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
 # ── MAIN AREA ────────────────────────────────────────────────────────────────
-st.markdown('<div class="main-header"><h1>🏥 SHIFT SCHEDULER</h1><p>의료진 근무표 최적화 시스템 · OR-Tools CP-SAT, by DSCHOI </p></div>', unsafe_allow_html=True)
+st.markdown('<div class="main-header"><h1>🏥 NURSE SHIFT SCHEDULER</h1><p>간호사 D / E / N 근무표 자동 편성 · by DSCHOI</p></div>', unsafe_allow_html=True)
 
 # Capture this rerun before any expensive preflight/UI work.  The status banner is
 # fixed to the top of the viewport, so it is visible even if the page is scrolled down.
@@ -3228,7 +3404,7 @@ if solve_requested_this_run:
         """
         <div class="solve-running-banner">
             ⏳ 스케줄 분석 중입니다…
-            <span class="sub">0차 Hard rule 사전검사 확인 중</span>
+            <span class="sub">필수 규칙 정밀 검사 중 · 개인별 근무수/N 범위/직전 스케줄까지 확인</span>
         </div>
         """,
         unsafe_allow_html=True,
@@ -3246,7 +3422,7 @@ start_date = st.session_state.start_date
 render_readme_guide(expanded=(not bool(doctors)))
 
 if not doctors:
-    st.info("← 왼쪽 사이드바에서 의사를 추가해 주세요.")
+    st.info("← 왼쪽 사이드바에서 간호사를 추가해 주세요.")
     st.stop()
 
 # Auto-fill day types
@@ -3271,9 +3447,12 @@ else:
 
 st.info("각 탭의 변경사항은 저장 버튼을 눌러야 반영됩니다. 스케줄 생성 전에는 관련 탭을 저장했는지 확인하세요.")
 
-# Always-on pre-solve check. Because the result is cached by the SAVED hard-input
-# signature, ordinary Streamlit reruns do not repeatedly run the exact diagnostics.
-render_preflight_hard_rule_status()
+render_quick_preflight_after_save()
+
+# 0차 필수 규칙 검사는 평소 화면에 계속 표시하지 않습니다.
+# - 저장 직후: 빠른 기본 충돌만 한 번 확인
+# - 스케줄 생성 직전: 개인 exact 진단을 포함한 정밀 사전검사
+# 충돌이 있을 때만 상세 내용을 화면에 표시합니다.
 
 tab1, tab2, tab3, tab4, tab5 = st.tabs(["📅 근무 요청 / 날짜 설정", "📋 Duty 설정", "⚙ 개인 규칙 / Grade", "⏮ 직전 5일 스케줄", "📊 결과"])
 
@@ -3369,6 +3548,7 @@ with tab1:
         refresh_combined_shift_requests()
         st.session_state["shift_req_version"] = st.session_state.get("shift_req_version", 0) + 1
         st.toast("✅ 근무 요청 / 날짜 설정이 저장되었습니다.", icon="✅")
+        request_quick_preflight_after_save()
         st.rerun()
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -3377,10 +3557,20 @@ with tab1:
 with tab2:
     with st.form("duty_settings_form", clear_on_submit=False):
         save_duty_settings = st.form_submit_button("저장", use_container_width=True)
-        st.caption("Duty 숫자를 여러 칸 수정한 뒤 저장을 눌러야 실제 설정에 반영됩니다.")
-        st.markdown('<div class="section-label">날짜별 Minimal / Ideal Duty 설정</div>', unsafe_allow_html=True)
-        st.caption("Minimal은 반드시 채워야 하는 hard 최소 인원입니다. Ideal은 추가근무가 필요할 때 우선적으로 맞추는 soft 선호 인원입니다. Ideal 자체 때문에 근무를 새로 늘리지는 않습니다.")
-        st.caption("추가배정이 필요하면 Ideal 쪽을 더 선호하되 특정 날짜나 duty에 몰리는 것도 penalty를 주어 함께 균형을 맞춥니다. 기본 비중은 Ideal 3 : 날짜 분산 2 : duty 분산 1입니다. Ideal은 Minimal보다 작을 수 없고, Minimal=0인 duty는 기존처럼 닫힌 duty라 Ideal도 0입니다.")
+        st.caption("여러 날짜를 수정한 뒤 저장을 누르면 실제 설정에 반영됩니다.")
+        st.markdown('<div class="section-label">날짜별 최소 인원 / Ideal 인원</div>', unsafe_allow_html=True)
+        st.markdown(
+            """
+            <div class="friendly-note">
+            <strong>최소 인원</strong> = 반드시 필요한 인원입니다. 이 숫자보다 적게 배정할 수 없습니다.<br>
+            <strong>Ideal 인원</strong> = 추가근무가 생겼을 때 우선적으로 채우고 싶은 인원입니다.
+            Ideal을 입력했다고 해서 근무수가 새로 늘어나지는 않습니다.
+            </div>
+            <div class="friendly-note ideal-note">
+            🟠 <strong>주황색 칸이 Ideal입니다.</strong> 빈칸이면 사용하지 않고, 숫자를 넣은 뒤 <b>+ / −</b> 버튼으로 조절할 수 있습니다.
+            </div>
+            """, unsafe_allow_html=True,
+        )
         render_fixed_total_duty_summary(num_days)
 
         for chunk_start in range(0, num_days, CHUNK):
@@ -3408,16 +3598,24 @@ with tab2:
             for shift_i, shift_lbl in enumerate(['D (Day)', 'E (Evening)', 'N (Night)']):
                 cols2 = st.columns(CHUNK + 1)
                 color = '#4f8ef7' if shift_i==0 else '#f0a040' if shift_i==1 else '#8080f0'
-                cols2[0].markdown(f"<span style='font-family:var(--mono);font-size:0.72rem;color:{color}'>Min {shift_lbl}</span>", unsafe_allow_html=True)
+                shift_code = ['D', 'E', 'N'][shift_i]
+                cols2[0].markdown(
+                    f"<span class='rule-label-help' title='이 날짜의 {shift_code} 근무에 반드시 필요한 최소 인원입니다. 0이면 해당 Duty를 닫습니다.' "
+                    f"style='font-family:var(--mono);font-size:0.72rem;color:{color}'>최소 {shift_code} ⓘ</span>",
+                    unsafe_allow_html=True,
+                )
                 for ci in range(CHUNK):
                     di = chunk_start + ci
                     if di < num_days:
                         cur_val = int(st.session_state.duty_requests.get(di, [1,1,1])[shift_i])
                         duty_ver = st.session_state.get("duty_req_version", 0)
                         duty_key = f"duty_{di}_{shift_i}_v{duty_ver}"
+                        d = start_date + timedelta(days=di)
                         new_val = cols2[ci+1].number_input(
-                            f"duty_{di}_{shift_i}", min_value=0, max_value=len(doctors),
-                            value=cur_val, label_visibility="collapsed", key=duty_key,
+                            f"최소 {['D','E','N'][shift_i]} {d.strftime('%m/%d')}",
+                            min_value=0, max_value=len(doctors), value=cur_val, step=1,
+                            label_visibility="collapsed", key=duty_key,
+                            help="반드시 채워야 하는 최소 인원입니다. 0이면 이 Duty에는 아무도 배정하지 않습니다.",
                         )
                         if di not in st.session_state.duty_requests:
                             st.session_state.duty_requests[di] = [1,1,1]
@@ -3429,9 +3627,11 @@ with tab2:
             for shift_i, shift_lbl in enumerate(['D (Day)', 'E (Evening)', 'N (Night)']):
                 cols3 = st.columns(CHUNK + 1)
                 color = '#4f8ef7' if shift_i==0 else '#f0a040' if shift_i==1 else '#8080f0'
+                shift_code = ['D', 'E', 'N'][shift_i]
                 cols3[0].markdown(
-                    f"<span style='font-family:var(--mono);font-size:0.72rem;color:{color};font-weight:700'>Ideal {shift_lbl}</span>",
-                    unsafe_allow_html=True
+                    f"<span class='rule-label-help' title='추가근무가 필요할 때 {shift_code}를 이 인원까지 우선 채우도록 선호합니다. 빈칸이면 사용하지 않습니다.' "
+                    f"style='font-family:var(--mono);font-size:0.72rem;color:#f0a040;font-weight:700'>Ideal {shift_code} (+/−) ⓘ</span>",
+                    unsafe_allow_html=True,
                 )
                 for ci in range(CHUNK):
                     di = chunk_start + ci
@@ -3442,19 +3642,17 @@ with tab2:
                         ideals = list(st.session_state.ideal_duty_requests.get(di, [-1, -1, -1]))
                         if len(ideals) < 3:
                             ideals = (ideals + [-1, -1, -1])[:3]
-                        cur_text = ideal_duty_display_value(mins[shift_i], ideals[shift_i])
                         ideal_ver = st.session_state.get("ideal_duty_req_version", 0)
                         ideal_key = f"ideal_duty_{di}_{shift_i}_v{ideal_ver}"
-                        new_text = cols3[ci+1].text_input(
-                            f"ideal_duty_{di}_{shift_i}",
-                            value=cur_text,
-                            placeholder="",
-                            label_visibility="collapsed",
-                            key=ideal_key,
-                            disabled=(int(mins[shift_i]) <= 0),
+                        d = start_date + timedelta(days=di)
+                        new_ideal = optional_ideal_number_input(
+                            cols3[ci+1],
+                            label=f"Ideal {['D','E','N'][shift_i]} {d.strftime('%m/%d')}",
+                            current_value=ideals[shift_i], minimum=int(mins[shift_i]), maximum=len(doctors),
+                            key=ideal_key, disabled=(int(mins[shift_i]) <= 0),
                         )
                         st.session_state.ideal_duty_requests[di][shift_i] = normalized_ideal_duty_value(
-                            mins[shift_i], new_text
+                            mins[shift_i], new_ideal
                         )
                     else:
                         cols3[ci+1].empty()
@@ -3476,6 +3674,7 @@ with tab2:
         st.session_state["duty_req_version"] = st.session_state.get("duty_req_version", 0) + 1
         st.session_state["ideal_duty_req_version"] = st.session_state.get("ideal_duty_req_version", 0) + 1
         st.toast("✅ Duty 설정이 저장되었습니다.", icon="✅")
+        request_quick_preflight_after_save()
         st.rerun()
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -3495,68 +3694,85 @@ for ni in range(len(doctors)):
 
 with tab3:
     st.markdown('<div class="section-label">월 근무수 설정</div>', unsafe_allow_html=True)
-    st.caption("Duty는 날짜별 최소 필요 인원입니다. fixed_Total/fixed_N은 정확한 개수이고, minimum_N/maximum_N은 N근무 하한/상한, maximum_total은 총근무 상한입니다.")
+    st.caption("먼저 각 간호사의 월 근무수와 N근무 범위를 정합니다.")
     render_fixed_total_duty_summary(num_days)
+    st.markdown(
+        """
+        <div class="friendly-note">
+        <strong>스케줄러가 근무수를 정하는 원칙</strong><br>
+        ① <b>모든 간호사에게 고정 총근무수가 입력된 경우</b>: 전체 근무수는 고정 총근무수의 합으로 정해집니다. 날짜별 최소 인원을 먼저 채우고, 남는 근무는 Ideal이 입력된 날짜/Duty를 우선 고려하면서 골고루 배치합니다.<br>
+        ② <b>고정 총근무수가 비어 있는 간호사가 있는 경우</b>: 고정값이 있는 사람은 그 숫자를 정확히 지키고, 최소 인원을 채우기 위해 더 필요한 근무는 고정값이 없는 사람들에게 개인 규칙과 균형을 고려해 배정합니다.
+        </div>
+        """, unsafe_allow_html=True,
+    )
     render_fixed_total_editor_table()
     st.divider()
 
     with st.form("grade_rule_settings_form", clear_on_submit=False):
         save_grade_rule_settings = st.form_submit_button("저장", use_container_width=True)
-        st.caption("Grade 정책, 가중치, 개인별 Grade/규칙은 여러 항목을 수정한 뒤 저장을 눌러야 실제 설정에 반영됩니다.")
+        st.caption("여러 항목을 수정한 뒤 저장을 누르면 반영됩니다. 일반적으로는 기본값을 유지하고 필요한 항목만 바꾸면 됩니다.")
         st.markdown('<div class="section-label">Grade 정책 설정</div>', unsafe_allow_html=True)
-        st.caption("Grade는 개인 속성이고, 고년차/저년차 기준과 objective 가중치는 전체 스케줄에 적용되는 전역 rule입니다.")
+        st.caption("Grade는 경력/숙련도를 나타내는 숫자입니다. 아래 인력 구성 규칙은 모든 날짜의 D/E/N에 적용됩니다.")
 
         gr = st.session_state.grade_rules
         gr_ver = st.session_state.get("grade_rule_version", 0)
         gcol1, gcol2, gcol3, gcol4, gcol5 = st.columns(5)
         gr["senior_min_grade"] = int(gcol1.number_input(
-            "고년차 기준 grade ≥", min_value=GRADE_MIN_VALUE, max_value=GRADE_MAX_VALUE,
+            "고년차 기준 Grade", min_value=GRADE_MIN_VALUE, max_value=GRADE_MAX_VALUE,
+            help="이 숫자 이상을 고년차로 봅니다. 예: 2이면 Grade 2 이상이 고년차입니다.",
             value=bounded_int(gr.get("senior_min_grade", DEFAULT_GRADE_RULES["senior_min_grade"]), DEFAULT_GRADE_RULES["senior_min_grade"], GRADE_MIN_VALUE, GRADE_MAX_VALUE),
             key=f"grade_senior_min_grade_v{gr_ver}"
         ))
         gr["senior_min_count"] = int(gcol2.number_input(
-            "Duty별 고년차 최소", min_value=0, max_value=10,
+            "한 Duty 고년차 최소 인원", min_value=0, max_value=10,
+            help="필수 규칙입니다. 각 날짜의 D/E/N마다 반드시 포함되어야 하는 고년차 최소 인원입니다.",
             value=bounded_int(gr.get("senior_min_count", DEFAULT_GRADE_RULES["senior_min_count"]), DEFAULT_GRADE_RULES["senior_min_count"], 0, 10),
             key=f"grade_senior_min_count_v{gr_ver}"
         ))
         gr["junior_max_grade"] = int(gcol3.number_input(
-            "저년차 기준 grade ≤", min_value=GRADE_MIN_VALUE, max_value=GRADE_MAX_VALUE,
+            "저년차 기준 Grade", min_value=GRADE_MIN_VALUE, max_value=GRADE_MAX_VALUE,
+            help="이 숫자 이하를 저년차로 봅니다. 권장 인원 분산에 사용합니다.",
             value=bounded_int(gr.get("junior_max_grade", DEFAULT_GRADE_RULES["junior_max_grade"]), DEFAULT_GRADE_RULES["junior_max_grade"], GRADE_MIN_VALUE, GRADE_MAX_VALUE),
             key=f"grade_junior_max_grade_v{gr_ver}"
         ))
         gr["junior_soft_max_count"] = int(gcol4.number_input(
-            "Duty별 저년차 권장 최대", min_value=0, max_value=10,
+            "한 Duty 저년차 권장 인원", min_value=0, max_value=10,
+            help="가능하면 한 Duty에 이 인원 이하가 되도록 선호합니다. 초과해도 스케줄 생성 자체를 막지는 않습니다.",
             value=bounded_int(gr.get("junior_soft_max_count", DEFAULT_GRADE_RULES["junior_soft_max_count"]), DEFAULT_GRADE_RULES["junior_soft_max_count"], 0, 10),
             key=f"grade_junior_soft_max_count_v{gr_ver}"
         ))
         gr["junior_penalty_weight"] = int(gcol5.number_input(
-            "저년차 초과 penalty", min_value=0, max_value=100,
+            "저년차 초과 불이익 점수", min_value=0, max_value=100,
+            help="권장 인원을 1명 초과할 때 추가되는 선호 점수입니다. 클수록 저년차가 한 Duty에 몰리지 않도록 더 강하게 선호합니다.",
             value=bounded_int(gr.get("junior_penalty_weight", DEFAULT_GRADE_RULES["junior_penalty_weight"]), DEFAULT_GRADE_RULES["junior_penalty_weight"], 0, 100),
             key=f"grade_junior_penalty_weight_v{gr_ver}"
         ))
 
-        st.caption("초저년차 hard rule도 Grade 정책 안에서 함께 설정합니다. 0이면 사용하지 않고, 1이면 한 duty에 초저년차 최대 1명까지만 허용합니다.")
+        st.markdown("**초저년차 동시근무 제한 — 필수 규칙**")
+        st.caption("필요할 때만 사용하세요. 최대 인원을 0으로 두면 이 제한은 사용하지 않습니다.")
         ucol1, ucol2, ucol3 = st.columns([1, 1, 3])
         gr["ultra_junior_max_grade"] = int(ucol1.number_input(
-            "초저년차 기준 grade ≤", min_value=GRADE_MIN_VALUE, max_value=GRADE_MAX_VALUE,
+            "초저년차 기준 Grade", min_value=GRADE_MIN_VALUE, max_value=GRADE_MAX_VALUE,
+            help="이 숫자 이하를 초저년차로 봅니다. 초저년차 최대 인원 제한에 사용합니다.",
             value=bounded_int(gr.get("ultra_junior_max_grade", DEFAULT_GRADE_RULES["ultra_junior_max_grade"]), DEFAULT_GRADE_RULES["ultra_junior_max_grade"], GRADE_MIN_VALUE, GRADE_MAX_VALUE),
             key=f"grade_ultra_junior_max_grade_v{gr_ver}"
         ))
         gr["ultra_junior_max_count"] = int(ucol2.number_input(
-            "초저년차 최대 허용", min_value=0, max_value=10,
+            "한 Duty 초저년차 최대 인원", min_value=0, max_value=10,
+            help="필수 제한입니다. 1이면 같은 날짜·같은 D/E/N에 초저년차가 최대 1명입니다. 0이면 제한을 사용하지 않습니다.",
             value=bounded_int(gr.get("ultra_junior_max_count", DEFAULT_GRADE_RULES["ultra_junior_max_count"]), DEFAULT_GRADE_RULES["ultra_junior_max_count"], 0, 10),
             key=f"grade_ultra_junior_max_count_v{gr_ver}"
         ))
         if gr["ultra_junior_max_count"] > 0:
             ucol3.info(
-                f"Hard: grade ≤ {gr['ultra_junior_max_grade']} 인원은 같은 날짜·같은 D/E/N duty에 "
+                f"필수 규칙: Grade ≤ {gr['ultra_junior_max_grade']} 간호사는 같은 날짜·같은 D/E/N에 "
                 f"최대 {gr['ultra_junior_max_count']}명까지만 허용됩니다."
             )
         else:
-            ucol3.caption("0이면 초저년차 동시근무 hard rule은 적용하지 않습니다.")
+            ucol3.caption("현재 사용하지 않음 (0 = 제한 없음)")
 
-        st.markdown('<div class="section-label">편차 가중치 설정</div>', unsafe_allow_html=True)
-        st.caption("Objective = D/E 편차×가중치 + 휴일 편차×가중치 + 총근무 편차×가중치 + N 편차×가중치 + Grade 편차×가중치 + 저년차 초과×가중치")
+        st.markdown('<div class="section-label">고급 설정 · 근무 균형 가중치</div>', unsafe_allow_html=True)
+        st.caption("일반 사용자는 기본값을 그대로 두어도 됩니다. 값이 클수록 해당 균형을 더 중요하게 봅니다.")
         wcol1, wcol2, wcol3, wcol4, wcol5 = st.columns(5)
         gr["weight_de_dev"] = int(wcol1.number_input(
             "D/E 편차 가중치", min_value=0, max_value=100,
@@ -3584,36 +3800,40 @@ with tab3:
             key=f"weight_grade_dev_v{gr_ver}"
         ))
         st.session_state.grade_rules = gr
+        ultra_text = (
+            f"Grade ≤ {gr.get('ultra_junior_max_grade', 1)} 초저년차는 한 Duty에 최대 {gr.get('ultra_junior_max_count', 0)}명"
+            if gr.get("ultra_junior_max_count", 0) > 0 else "초저년차 최대 인원 제한은 사용하지 않음"
+        )
         st.markdown(
-            f"<div style='font-size:0.82rem; color:var(--text-dim);'>"
-            f"Hard: 각 duty마다 <b>grade ≥ {gr['senior_min_grade']}</b> 인원이 최소 <b>{gr['senior_min_count']}</b>명 필요합니다. "
-            f"Soft: <b>grade ≤ {gr['junior_max_grade']}</b> 인원이 duty별 <b>{gr['junior_soft_max_count']}</b>명을 초과하면 "
-            f"초과 1건당 <b>{gr['junior_penalty_weight']}</b>점 penalty를 줍니다. "
-            f"Ultra-hard: <b>grade ≤ {gr.get('ultra_junior_max_grade', 1)}</b> 인원은 duty별 "
-            f"최대 <b>{gr.get('ultra_junior_max_count', 0)}</b>명까지 허용합니다(0=사용안함)."
-            f"</div>",
-            unsafe_allow_html=True
+            f"""
+            <div class="friendly-note">
+            <strong>현재 Grade 규칙 요약</strong><br>
+            • <b>필수:</b> 각 Duty에 Grade ≥ {gr['senior_min_grade']} 간호사가 최소 {gr['senior_min_count']}명 필요<br>
+            • <b>필수:</b> {ultra_text}<br>
+            • <b>권장:</b> Grade ≤ {gr['junior_max_grade']} 저년차는 한 Duty에 {gr['junior_soft_max_count']}명 이내를 선호 (초과 1명당 불이익 점수 {gr['junior_penalty_weight']})
+            </div>
+            """, unsafe_allow_html=True,
         )
 
 
         st.divider()
         st.markdown('<div class="section-label">개인별 Grade & 근무 규칙 설정</div>', unsafe_allow_html=True)
-        st.caption("7명씩 나눠서 표시됩니다. Grade와 개인 rule을 입력하세요. 근무 조정값, fixed count, maximum_total/maximum_N은 위 표에서도 수정할 수 있습니다.")
+        st.caption("7명씩 나누어 표시합니다. 여기서는 Grade와 근무 패턴만 설정합니다. 총근무수와 N근무 범위는 위의 월 근무수 표에서 설정합니다.")
 
         doc_names = [d["name"] for d in doctors]
         DOC_CHUNK = 7
 
         RULE_DEFS = [
-            ("rule_max_shifts_per_day",  "하루 근무 횟수",                          "select", RULE0_OPTIONS, RULE0_LABELS),
-            ("rule_n_block_max",         "N 뭉치 최대 길이",                        "select", [1,2,3], ["1개(NN불가)","2개(NNN불가)","3개(NNNN불가)"]),
-            ("rule_n_rest",              "N뭉치 후 완전 Off 의무일",                "number", 0, 5),
-            ("rule_n_gap",               "N뭉치 후 다음 N까지 총 간격",             "number", 0, 10),
-            ("rule_no_day_after_eve",    "Evening 후 Day 금지",                     "bool",   None, None),
-            ("rule_no_3eve_consec",      "Evening 3연속 금지",                      "bool",   None, None),
-            ("rule_no_3eve_in_4days",    "4일내 Evening 3회 금지",                  "bool",   None, None),
-            ("rule_max_consec_days", "최대 연속 근무일수", "number", 0, 30),
-            ("rule_max_shifts_per_week", "7일 구간 최대 근무수 (0=무제한)",             "number", 0, 7),
-            ("rule_no_3day_consec",      "Day 3연속 금지",                          "bool",   None, None),
+            ("rule_max_shifts_per_day", "하루 최대 근무 종류 수", "select", RULE0_OPTIONS, RULE0_LABELS, "보통 1로 둡니다. 한 사람이 같은 날 D/E/N 중 몇 종류까지 맡을 수 있는지 정합니다."),
+            ("rule_n_block_max", "연속 N 최대", "select", [1,2,3], ["1개(NN불가)","2개(NNN불가)","3개(NNNN불가)"], "N이 연속으로 이어질 수 있는 최대 길이입니다. 2이면 NN은 가능하지만 NNN은 불가합니다."),
+            ("rule_n_rest", "N 종료 후 반드시 쉬는 날", "number", 0, 5, "N 묶음이 끝난 뒤 D/E/N을 모두 하지 않고 완전히 쉬어야 하는 날짜 수입니다."),
+            ("rule_n_gap", "N 종료 후 다음 N까지 간격", "number", 0, 10, "N 묶음이 끝난 뒤 다음 N을 시작하기까지 확보해야 하는 전체 간격입니다."),
+            ("rule_no_day_after_eve", "E 다음날 D 금지", "bool", None, None, "체크하면 Evening 근무 다음날 Day 근무를 배정하지 않습니다."),
+            ("rule_no_3eve_consec", "E 3일 연속 금지", "bool", None, None, "체크하면 E-E-E 3연속 배정을 금지합니다."),
+            ("rule_no_3eve_in_4days", "4일 중 E 3회 금지", "bool", None, None, "체크하면 어떤 연속 4일 구간에서도 E가 3회 이상 들어가지 않도록 합니다."),
+            ("rule_max_consec_days", "최대 연속 근무일수", "number", 0, 30, "D/E/N 종류와 관계없이 연속으로 근무할 수 있는 최대 날짜 수입니다. 0이면 제한하지 않습니다."),
+            ("rule_max_shifts_per_week", "연속 7일 최대 근무수", "number", 0, 7, "어떤 연속 7일을 보더라도 근무일수가 이 숫자를 넘지 않도록 합니다. 0이면 제한하지 않습니다."),
+            ("rule_no_3day_consec", "D 3일 연속 금지", "bool", None, None, "체크하면 D-D-D 3연속 배정을 금지합니다."),
         ]
 
         for chunk_start in range(0, len(doc_names), DOC_CHUNK):
@@ -3623,7 +3843,7 @@ with tab3:
 
             st.markdown(
                 f"<div style='font-family:var(--mono);font-size:0.75rem;color:var(--accent);margin:1rem 0 0.4rem'>"
-                f"의사 {chunk_start+1} ~ {chunk_end}</div>",
+                f"간호사 {chunk_start+1} ~ {chunk_end}</div>",
                 unsafe_allow_html=True
             )
 
@@ -3635,7 +3855,7 @@ with tab3:
 
             # grade
             grade_cols = st.columns([2] + [1] * chunk_size)
-            grade_cols[0].markdown("<span style='font-size:0.75rem'>Grade</span>", unsafe_allow_html=True)
+            grade_cols[0].markdown("<span class='rule-label-help' title='경력/숙련도를 나타내는 숫자입니다. Grade 인력 구성 규칙에 사용합니다.' style='font-size:0.75rem'>Grade ⓘ</span>", unsafe_allow_html=True)
             for ci, ni in enumerate(range(chunk_start, chunk_end)):
                 grade_ver = st.session_state.get("grade_version", 0)
                 cur_grade = bounded_int(doctors[ni].get("grade", DEFAULT_DOCTOR_GRADE), DEFAULT_DOCTOR_GRADE, GRADE_MIN_VALUE, GRADE_MAX_VALUE)
@@ -3645,69 +3865,14 @@ with tab3:
                 )
                 doctors[ni]["grade"] = int(new_grade)
 
-            # maximum_total: also expose it directly in the per-doctor rule grid.
-            # Blank means no upper bound; 0+ means a hard upper bound on total D/E/N duties.
-            max_cols = st.columns([2] + [1] * chunk_size)
-            max_cols[0].markdown(
-                "<span style='font-size:0.75rem'><b>maximum_total</b><br>총근무 최대 (빈칸=제한없음)</span>",
-                unsafe_allow_html=True,
-            )
-            for ci, ni in enumerate(range(chunk_start, chunk_end)):
-                current_max = parse_fixed_count_value(st.session_state.maximum_total.get(ni, -1))
-                max_text = max_cols[ci+1].text_input(
-                    f"maximum_total_{ni}",
-                    value="" if current_max < 0 else str(current_max),
-                    label_visibility="collapsed",
-                    key=f"doc_maximum_total_{ni}_v{st.session_state.get('shift_count_version', 0)}",
-                    placeholder="",
-                    help="빈칸 = 제한 없음, 0 이상 = 총 D/E/N 근무가 이 값을 넘지 않음",
-                )
-                st.session_state.maximum_total[ni] = parse_fixed_count_value(max_text)
+            # 월 총근무수 / 최소·최대 N / 고정 D/E/N은 위의 "월 근무수 설정" 표에서만 편집합니다.
+            # 같은 값을 두 군데에서 수정하면 혼란스러우므로 개인 규칙 표에서는 중복 표시하지 않습니다.
 
-            # minimum_N: per-person Night hard lower bound.
-            min_n_cols = st.columns([2] + [1] * chunk_size)
-            min_n_cols[0].markdown(
-                "<span style='font-size:0.75rem'><b>minimum_N</b><br>N근무 최소 (빈칸=제한없음)</span>",
-                unsafe_allow_html=True,
-            )
-            for ci, ni in enumerate(range(chunk_start, chunk_end)):
-                current_min_n = parse_fixed_count_value(st.session_state.minimum_N.get(ni, -1))
-                min_n_text = min_n_cols[ci+1].text_input(
-                    f"minimum_N_{ni}",
-                    value="" if current_min_n < 0 else str(current_min_n),
-                    label_visibility="collapsed",
-                    key=f"doc_minimum_N_{ni}_v{st.session_state.get('shift_count_version', 0)}",
-                    placeholder="",
-                    help="빈칸 = 제한 없음, 0 이상 = Night 근무가 이 값 이상이어야 함",
-                )
-                st.session_state.minimum_N[ni] = parse_fixed_count_value(min_n_text)
-
-            # maximum_N: per-person Night hard upper bound.
-            max_n_cols = st.columns([2] + [1] * chunk_size)
-            max_n_cols[0].markdown(
-                "<span style='font-size:0.75rem'><b>maximum_N</b><br>N근무 최대 (빈칸=제한없음)</span>",
-                unsafe_allow_html=True,
-            )
-            for ci, ni in enumerate(range(chunk_start, chunk_end)):
-                current_max_n = parse_fixed_count_value(st.session_state.maximum_N.get(ni, -1))
-                max_n_text = max_n_cols[ci+1].text_input(
-                    f"maximum_N_{ni}",
-                    value="" if current_max_n < 0 else str(current_max_n),
-                    label_visibility="collapsed",
-                    key=f"doc_maximum_N_{ni}_v{st.session_state.get('shift_count_version', 0)}",
-                    placeholder="",
-                    help="빈칸 = 제한 없음, 0 이상 = Night 근무가 이 값을 넘지 않음",
-                )
-                st.session_state.maximum_N[ni] = parse_fixed_count_value(max_n_text)
-
-            st.caption("minimum_N/maximum_N은 N근무 하한/상한, maximum_total은 총근무 상한입니다. 빈칸이면 해당 제한을 사용하지 않습니다.")
-
-            # 근무 조정값과 fixed Total/D/E/N counts are edited in the table above.
 
             # 규칙 rows
-            for key, label, rtype, opt1, opt2 in RULE_DEFS:
+            for key, label, rtype, opt1, opt2, help_text in RULE_DEFS:
                 row_cols = st.columns([2] + [1] * chunk_size)
-                row_cols[0].markdown(f"<span style='font-size:0.75rem'>{label}</span>", unsafe_allow_html=True)
+                row_cols[0].markdown(f"<span class='rule-label-help' title='{help_text}' style='font-size:0.75rem'>{label} ⓘ</span>", unsafe_allow_html=True)
                 for ci, ni in enumerate(range(chunk_start, chunk_end)):
                     rules = st.session_state.rules.get(ni, DEFAULT_RULES.copy())
                     if rtype == "select":
@@ -3743,7 +3908,8 @@ with tab3:
         # editor from the newly committed values so both views stay synchronized.
         st.session_state["shift_count_version"] = st.session_state.get("shift_count_version", 0) + 1
         st.session_state["fixed_counts_editor_pending_df"] = None
-        st.toast("✅ 개인 규칙 / Grade / maximum_total / minimum_N / maximum_N 설정이 저장되었습니다.", icon="✅")
+        st.toast("✅ 개인 Grade / 근무 패턴 규칙이 저장되었습니다.", icon="✅")
+        request_quick_preflight_after_save()
         st.rerun()
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -3785,6 +3951,7 @@ with tab4:
         apply_previous_schedule_df(previous_df)
         st.session_state["previous_schedule_version"] = st.session_state.get("previous_schedule_version", 0) + 1
         st.toast("✅ 직전 5일 스케줄이 저장되었습니다.", icon="✅")
+        request_quick_preflight_after_save()
         st.rerun()
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -3799,7 +3966,7 @@ if st.session_state.get("trigger_solve"):
     st.session_state["solve_failure_message"] = ""
 
     if not doctors:
-        st.error("의사를 먼저 추가해 주세요.")
+        st.error("간호사를 먼저 추가해 주세요.")
     else:
         # Make sure the editable fixed count table and duty inputs are reflected
         # before pre-checks and solver parameters are built. This prevents a
@@ -3822,7 +3989,7 @@ if st.session_state.get("trigger_solve"):
         if isinstance(preflight_conflicts, pd.DataFrame) and not preflight_conflicts.empty:
             first = preflight_conflicts.iloc[0]
             precheck_error = (
-                f"0차 Hard rule 사전검사에서 확정 충돌 {len(preflight_conflicts)}건이 발견되었습니다. "
+                f"필수 규칙 정밀 검사에서 확정 충돌 {len(preflight_conflicts)}건이 발견되었습니다. "
                 f"첫 충돌: {first.get('이름', '')} · {first.get('충돌 규칙', '')} — "
                 f"{first.get('설명', '')}"
             )
@@ -3940,14 +4107,9 @@ if st.session_state.get("trigger_solve"):
             st.error(precheck_error)
             st.info("📋 위의 0차 Hard rule 사전검사 표에서 확정 충돌을 먼저 수정하세요. 이후 필요하면 결과 탭의 상세 진단모드를 사용할 수 있습니다.")
         else:
-            solve_status_slot.markdown(
-                """
-                <div class="solve-running-banner">
-                    ⚙️ 스케줄 분석 중입니다…
-                    <span class="sub">CP-SAT 근무표 탐색 중 · 설정한 최대 탐색시간은 이 단계에 적용됩니다</span>
-                </div>
-                """,
-                unsafe_allow_html=True,
+            render_solver_countdown(
+                solve_status_slot,
+                int(st.session_state.get("time_max", 60)),
             )
             with st.spinner("최적 스케줄을 계산 중입니다..."):
                 try:
@@ -3965,7 +4127,7 @@ if st.session_state.get("trigger_solve"):
                     scheduler_module = importlib.util.module_from_spec(spec)
                     spec.loader.exec_module(scheduler_module)
 
-                    expected_scheduler_api = '2026-08-19-v12.7-fast-preflight-top-status'
+                    expected_scheduler_api = '2026-08-20-v12.9-preflight-on-demand'
                     actual_scheduler_api = getattr(scheduler_module, "SCHEDULER_API_VERSION", None)
                     if actual_scheduler_api != expected_scheduler_api:
                         raise ImportError(
@@ -4040,15 +4202,19 @@ if st.session_state.get("trigger_solve"):
                     st.session_state["diagnostic_results"] = None
                     st.session_state.pop("prepared_excel_export", None)
 
-                    preflight_rerun_elapsed = float(st.session_state.get("_preflight_render_elapsed", 0.0))
+                    preflight_was_cache_hit = bool(preflight.get("cache_hit", False))
+                    preflight_elapsed = (
+                        0.0 if preflight_was_cache_hit
+                        else float(preflight.get("duration_seconds", preflight_call_elapsed))
+                    )
                     total_elapsed = (
                         time.perf_counter() - solve_rerun_started_at
                         if solve_rerun_started_at is not None
-                        else solver_elapsed + post_elapsed
+                        else preflight_call_elapsed + solver_elapsed + post_elapsed
                     )
                     st.session_state["last_solve_timing"] = {
-                        "preflight_seconds": preflight_rerun_elapsed,
-                        "preflight_cache_hit": not bool(st.session_state.get("_preflight_render_recomputed", False)),
+                        "preflight_seconds": preflight_elapsed,
+                        "preflight_cache_hit": preflight_was_cache_hit,
                         "solve_preflight_access_seconds": preflight_call_elapsed,
                         "solver_seconds": solver_elapsed,
                         "postprocess_seconds": post_elapsed,
@@ -4136,9 +4302,9 @@ with tab5:
                 f"전체 {float(timing.get('total_seconds', 0.0)):.1f}초"
             )
 
-        # 화면/Excel 표시 순서: 의사 입력 순서 그대로 유지
+        # 화면/Excel 표시 순서: 간호사 입력 순서 그대로 유지
         # Grade는 표시하되, Grade 값으로 재정렬하지 않는다.
-        # 즉 근무 요청/날짜 설정 탭에서 보이는 의사 순서와 결과표/Excel 순서가 동일하다.
+        # 즉 근무 요청/날짜 설정 탭에서 보이는 간호사 순서와 결과표/Excel 순서가 동일하다.
         display_order = list(range(len(doctors)))
         name_to_grade = {doc["name"]: int(doc.get("grade", DEFAULT_DOCTOR_GRADE)) for doc in doctors}
         name_to_display_order = {doctors[ni]["name"]: order for order, ni in enumerate(display_order)}
@@ -4147,7 +4313,7 @@ with tab5:
         if "Grade" not in summary_display.columns:
             summary_display.insert(1, "Grade", summary_display["Name"].map(name_to_grade).fillna(DEFAULT_DOCTOR_GRADE).astype(int))
         # Summary도 Name 정렬이 아니라 근무 요청/날짜 설정 탭의 입력 순서 그대로 표시한다.
-        # 맨 왼쪽 No는 사용자가 입력/Excel에서 보는 의사 순서(1-based index)이다.
+        # 맨 왼쪽 No는 사용자가 입력/Excel에서 보는 간호사 순서(1-based index)이다.
         summary_display["_display_order"] = summary_display["Name"].map(name_to_display_order).fillna(9999).astype(int)
         summary_display = (
             summary_display
@@ -4197,21 +4363,27 @@ with tab5:
         # Summary stats
         st.markdown('<div class="section-label">근무 통계</div>', unsafe_allow_html=True)
         st.caption("No는 근무 요청/날짜 설정 탭 및 Excel 입력 순서 기준입니다. 연차와 Total+연차는 현재 근무 요청의 a 개수 기준입니다.")
+        summary_view = summary_display.rename(columns={
+            "Name": "이름",
+            "maximum_total": "최대 근무수",
+            "minimum_N": "최소 N근무수",
+            "maximum_N": "최대 N근무수",
+        })
         try:
-            gradient_subsets = [col for col in ['Total', 'Total+연차'] if col in summary_display.columns]
-            styled_summary = summary_display.style
+            gradient_subsets = [col for col in ['Total', 'Total+연차'] if col in summary_view.columns]
+            styled_summary = summary_view.style
             if gradient_subsets:
                 styled_summary = styled_summary.background_gradient(subset=gradient_subsets, cmap='Blues')
-            if 'N' in summary_display.columns:
+            if 'N' in summary_view.columns:
                 styled_summary = styled_summary.background_gradient(subset=['N'], cmap='Purples')
-            if 'Holiday' in summary_display.columns:
+            if 'Holiday' in summary_view.columns:
                 styled_summary = styled_summary.background_gradient(subset=['Holiday'], cmap='Oranges')
             st.dataframe(
                 styled_summary,
                 use_container_width=True, hide_index=True
             )
         except ImportError:
-            st.dataframe(summary_display, use_container_width=True, hide_index=True)
+            st.dataframe(summary_view, use_container_width=True, hide_index=True)
 
         # ── 추가 근무 가능일 (개인 hard rule 기준) ─────────────────────────
         availability = {}
@@ -4219,10 +4391,10 @@ with tab5:
         if sol_idx < len(availability_list):
             availability = availability_list[sol_idx] or {}
 
-        st.markdown('<div class="section-label">추가 근무 가능일 · 개인 hard rule 기준</div>', unsafe_allow_html=True)
+        st.markdown('<div class="section-label">추가 근무 가능일 · 개인 필수 규칙 기준</div>', unsafe_allow_html=True)
         st.caption(
             "현재 완성된 스케줄에 D/E/N을 1개 추가한다고 가정했을 때, 개인 근무불가 요청, 직전 5일 연속 규칙, "
-            "개인 rule, fixed_D/E/N, fixed_total, maximum_total, maximum_N을 모두 만족하는 후보만 표시합니다. "
+            "개인 규칙, 고정 D/E/N, 고정 총근무수, 최대 근무수, 최소/최대 N근무수를 모두 만족하는 후보만 표시합니다. "
             "이 표는 대체/증원 후보 확인용이므로 날짜별 Duty 필요 인원과 senior/junior/grade 조합 같은 그룹 조건은 계산하지 않습니다."
         )
         availability_summary_rows = []
@@ -4256,10 +4428,11 @@ with tab5:
                 "No": ni + 1,
                 "Name": doctors[ni]["name"],
                 "현재 Total": current_total,
-                "maximum_total": "" if max_total < 0 else max_total,
-                "maximum_N": "" if max_n < 0 else max_n,
+                "최대 근무수": "" if max_total < 0 else max_total,
+                "최소 N근무수": "" if min_n < 0 else min_n,
+                "최대 N근무수": "" if max_n < 0 else max_n,
                 "N 여유": "" if max_n < 0 else max_n - current_n,
-                "max까지 여유": "" if max_total < 0 else max_total - current_total,
+                "최대 근무수까지 여유": "" if max_total < 0 else max_total - current_total,
                 "가능 날짜수": available_date_count,
                 "추가 가능 날짜/shift": " · ".join(entries) if entries else "-",
             })
@@ -4294,30 +4467,35 @@ with tab5:
                     f"최종 단계 {final_stage}"
                 )
 
-            st.markdown(
-                f"<div style='font-size:0.85rem; color:var(--text-dim);'>"
-                f"** 추가배정:** {m.get('duty_extra', 0)}개 "
-                f"(최소 {m.get('duty_minimum_total', '')} → 실제 {m.get('actual_duty_total', '')}, Ideal {m.get('duty_ideal_total', '')}) "
-                f"| **Ideal 초과:** {m.get('over_ideal_total', 0)} "
-                f"| **Ideal 미충족:** {m.get('ideal_shortfall_total', 0)} "
-                f"| **배치선호 점수:** {m.get('placement_penalty', 0)} "
-                f"(Ideal×{m.get('ideal_placement_weight', 3)}, 날짜분산×{m.get('date_spread_weight', 2)}, duty분산×{m.get('duty_cell_spread_weight', 1)}) "
-                f"| **추가배정 날짜:** {m.get('days_with_extra', 0)}일 · 일최대 {m.get('max_day_extra', 0)} "
-                f"| ** 편차*가중치 합={m.get('adv')} "
-                f"| **최적 편차:** {m.get('best_adv', m.get('adv'))} "
-                f"| **허용 상한:** {m.get('allowed_adv', m.get('adv'))} "
-                f"| **balance penalty:** {m.get('balance_penalty', 'NA')} "
-                f"{_side_metric('k D/E', 'k', 'k_low', 'k_high', 'weight_de_dev', 1)}"
-                f"{_side_metric('k1 휴일', 'k1', 'k1_low', 'k1_high', 'weight_holiday_dev', 3)}"
-                f"{_side_metric('k2 총근무', 'k2', 'k2_low', 'k2_high', 'weight_total_dev', 5)}"
-                f"{_side_metric('k3 N', 'k3', 'k3_low', 'k3_high', 'weight_n_dev', 5)}"
-                f"| **k4 Grade편차:** {m.get('k4', 0)} (실제±{round(m.get('k4',0)/10,1)})×{m.get('weight_grade_dev', gr.get('weight_grade_dev', 3))} "
-                f"| **저년차 초과:** {m.get('junior_excess', 0)}×{m.get('junior_penalty_weight', gr.get('junior_penalty_weight', 1))} "
-                f"= **{m.get('junior_penalty', 0)}** "
-                f"| **초저년차 hard:** grade≤{m.get('ultra_junior_max_grade', gr.get('ultra_junior_max_grade', 1))}, "
-                f"최대 {m.get('ultra_junior_max_count', gr.get('ultra_junior_max_count', 0))}명 허용</div>",
-                unsafe_allow_html=True
+            st.info(
+                f"배정 결과: 최소 필요 {m.get('duty_minimum_total', '')}근무 → 실제 {m.get('actual_duty_total', '')}근무 "
+                f"(추가 {m.get('duty_extra', 0)}). Ideal 미충족 {m.get('ideal_shortfall_total', 0)}, Ideal 초과 {m.get('over_ideal_total', 0)}."
             )
+            with st.expander("고급 정보 · Solver 점수 보기", expanded=False):
+                st.markdown(
+                    f"<div style='font-size:0.85rem; color:var(--text-dim);'>"
+                    f"** 추가배정:** {m.get('duty_extra', 0)}개 "
+                    f"(최소 {m.get('duty_minimum_total', '')} → 실제 {m.get('actual_duty_total', '')}, Ideal {m.get('duty_ideal_total', '')}) "
+                    f"| **Ideal 초과:** {m.get('over_ideal_total', 0)} "
+                    f"| **Ideal 미충족:** {m.get('ideal_shortfall_total', 0)} "
+                    f"| **배치선호 점수:** {m.get('placement_penalty', 0)} "
+                    f"(Ideal×{m.get('ideal_placement_weight', 3)}, 날짜분산×{m.get('date_spread_weight', 2)}, duty분산×{m.get('duty_cell_spread_weight', 1)}) "
+                    f"| **추가배정 날짜:** {m.get('days_with_extra', 0)}일 · 일최대 {m.get('max_day_extra', 0)} "
+                    f"| ** 편차*가중치 합={m.get('adv')} "
+                    f"| **최적 편차:** {m.get('best_adv', m.get('adv'))} "
+                    f"| **허용 상한:** {m.get('allowed_adv', m.get('adv'))} "
+                    f"| **balance penalty:** {m.get('balance_penalty', 'NA')} "
+                    f"{_side_metric('k D/E', 'k', 'k_low', 'k_high', 'weight_de_dev', 1)}"
+                    f"{_side_metric('k1 휴일', 'k1', 'k1_low', 'k1_high', 'weight_holiday_dev', 3)}"
+                    f"{_side_metric('k2 총근무', 'k2', 'k2_low', 'k2_high', 'weight_total_dev', 5)}"
+                    f"{_side_metric('k3 N', 'k3', 'k3_low', 'k3_high', 'weight_n_dev', 5)}"
+                    f"| **k4 Grade편차:** {m.get('k4', 0)} (실제±{round(m.get('k4',0)/10,1)})×{m.get('weight_grade_dev', gr.get('weight_grade_dev', 3))} "
+                    f"| **저년차 초과:** {m.get('junior_excess', 0)}×{m.get('junior_penalty_weight', gr.get('junior_penalty_weight', 1))} "
+                    f"= **{m.get('junior_penalty', 0)}** "
+                    f"| **초저년차 필수 제한:** grade≤{m.get('ultra_junior_max_grade', gr.get('ultra_junior_max_grade', 1))}, "
+                    f"최대 {m.get('ultra_junior_max_count', gr.get('ultra_junior_max_count', 0))}명 허용</div>",
+                    unsafe_allow_html=True
+                )
 
         st.divider()
 
@@ -4371,7 +4549,7 @@ with tab5:
         # ── 통합 근무표: 표시 + 셀 선택/고정 ────────────────────────────────
         st.markdown('<div class="section-label">근무 일정표 / 셀 선택 & 고정</div>', unsafe_allow_html=True)
         st.caption(
-            "근무 요청/날짜 설정 탭의 의사 입력 순서 그대로 표시합니다. Grade는 이름 옆에 G값으로 표시하지만 Grade순 정렬은 하지 않습니다. "
+            "근무 요청/날짜 설정 탭의 간호사 입력 순서 그대로 표시합니다. Grade는 이름 옆에 G값으로 표시하지만 Grade순 정렬은 하지 않습니다. "
             "셀을 클릭(또는 드래그)해 선택한 뒤 **선택 셀 고정**을 누르면 현재 결과값이 hard request로 고정됩니다. "
             "🔒 표시는 이미 base request 또는 fixed layer로 하드코딩된 셀입니다. "
             "날짜는 `일자+요일` 형식이며, `*`는 평일 공휴일입니다. 표 높이는 인원 수에 맞춰 자동으로 늘어납니다."
@@ -4404,7 +4582,7 @@ with tab5:
             doc = doctors[ni]
             grade_val = int(doc.get("grade", DEFAULT_DOCTOR_GRADE))
             # Grade는 표시만 하고, 정렬 기준으로 사용하지 않는다.
-            # 행 순서는 근무 요청/날짜 설정 탭의 의사 입력 순서와 동일하다.
+            # 행 순서는 근무 요청/날짜 설정 탭의 간호사 입력 순서와 동일하다.
             row_label = f"{doc['name']} [G{grade_val}]"
             editor_row_order.append((ni, row_label))
             editor_rows[row_label] = []
@@ -4569,6 +4747,7 @@ with tab5:
             st.session_state["pending_result_fixed_releases"] = set()
             st.session_state["shift_req_version"] = st.session_state.get("shift_req_version", 0) + 1
             st.toast("✅ 결과 고정 변경사항이 저장되었습니다.", icon="✅")
+            request_quick_preflight_after_save()
             st.rerun()
 
         lock_col4.caption(
