@@ -8,9 +8,10 @@ from __future__ import annotations
 from typing import Any
 import pandas as pd
 import time
+import threading
 from datetime import date, timedelta
 
-SCHEDULER_API_VERSION = '2026-08-20-v12.14-total-based-balance'
+SCHEDULER_API_VERSION = '2026-08-20-v12.15-plateau-stop'
 
 try:
     from ortools.sat.python import cp_model
@@ -1144,6 +1145,17 @@ def build_and_solve(params: dict[str, Any]):
     sol_limit    = int(params["sol_limit"])
     adv_limit    = int(params["adv_limit"])
 
+    # Optional efficiency monitor. OFF by default.
+    early_stop_on_plateau = bool(params.get("early_stop_on_plateau", False))
+    plateau_seconds = max(20.0, float(params.get("plateau_seconds", 60) or 60))
+    plateau_min_runtime = max(
+        15.0,
+        min(
+            float(params.get("plateau_min_runtime", 30) or 30),
+            max(15.0, float(time_max) * 0.5),
+        ),
+    )
+
     num_doctors = len(names)
     num_shifts  = 3
     all_doctors = range(num_doctors)
@@ -2130,6 +2142,183 @@ def build_and_solve(params: dict[str, Any]):
         s.parameters.linearization_level = 0
         return s
 
+    search_progress: list[dict[str, Any]] = []
+    plateau_stop_events: list[dict[str, Any]] = []
+
+    def _solver_stop_async(solver_obj):
+        try:
+            solver_obj.stop_search()
+            return
+        except Exception:
+            pass
+        try:
+            solver_obj.StopSearch()
+        except Exception:
+            pass
+
+    def _solve_monitored(
+        solver_obj,
+        *,
+        stage: str,
+        value_exprs: dict[str, Any] | None = None,
+        monitor_enabled: bool = False,
+    ):
+        """Solve a soft-optimization stage with optional plateau auto-stop.
+
+        Plateau is declared only after a feasible solution exists and neither
+        incumbent objective nor best bound improves for plateau_seconds.
+        """
+        if not monitor_enabled:
+            return solver_obj.Solve(model)
+
+        stage_started = time.monotonic()
+        lock = threading.Lock()
+        done_event = threading.Event()
+        state = {
+            "has_solution": False,
+            "best_obj": None,
+            "best_bound": None,
+            "last_progress_time": stage_started,
+            "stopped_for_plateau": False,
+        }
+
+        class _ProgressCallback(cp_model.CpSolverSolutionCallback):
+            def on_solution_callback(self):
+                now = time.monotonic()
+                try:
+                    obj = float(self.ObjectiveValue())
+                except Exception:
+                    obj = None
+                try:
+                    bound = float(self.BestObjectiveBound())
+                except Exception:
+                    bound = None
+
+                incumbent_improved = False
+                with lock:
+                    state["has_solution"] = True
+                    if obj is not None and (
+                        state["best_obj"] is None or obj < state["best_obj"] - 1e-9
+                    ):
+                        state["best_obj"] = obj
+                        state["last_progress_time"] = now
+                        incumbent_improved = True
+                    if bound is not None and (
+                        state["best_bound"] is None or bound > state["best_bound"] + 1e-9
+                    ):
+                        state["best_bound"] = bound
+                        state["last_progress_time"] = now
+
+                # Keep the trace light: record only actual incumbent improvements.
+                if incumbent_improved:
+                    point = {
+                        "stage": stage,
+                        "seconds": round(time.monotonic() - solve_started_at, 3),
+                        "stage_seconds": round(now - stage_started, 3),
+                        "objective": obj,
+                        "best_bound": bound,
+                    }
+                    if value_exprs:
+                        for key, expr in value_exprs.items():
+                            try:
+                                point[key] = int(self.Value(expr))
+                            except Exception:
+                                point[key] = None
+                    search_progress.append(point)
+
+        callback = _ProgressCallback()
+
+        # Best-bound progress prevents premature stopping while the solver is
+        # still proving that the incumbent is close to optimal.
+        if hasattr(solver_obj, "best_bound_callback"):
+            def _best_bound_callback(bound_value):
+                now = time.monotonic()
+                try:
+                    bound = float(bound_value)
+                except Exception:
+                    return
+                with lock:
+                    if state["best_bound"] is None or bound > state["best_bound"] + 1e-9:
+                        state["best_bound"] = bound
+                        state["last_progress_time"] = now
+            try:
+                solver_obj.best_bound_callback = _best_bound_callback
+            except Exception:
+                pass
+
+        def _watchdog():
+            while not done_event.wait(0.5):
+                now = time.monotonic()
+                with lock:
+                    has_solution = bool(state["has_solution"])
+                    stagnant_for = now - float(state["last_progress_time"])
+                stage_elapsed = now - stage_started
+
+                # Never interrupt feasibility search. Stop only after a feasible
+                # incumbent exists and the optimization itself has stalled.
+                if (
+                    has_solution
+                    and stage_elapsed >= plateau_min_runtime
+                    and stagnant_for >= plateau_seconds
+                ):
+                    with lock:
+                        state["stopped_for_plateau"] = True
+                    _solver_stop_async(solver_obj)
+                    return
+
+        watchdog = threading.Thread(
+            target=_watchdog,
+            name=f"cp_sat_plateau_{stage}",
+            daemon=True,
+        )
+        watchdog.start()
+        try:
+            status_code = solver_obj.Solve(model, callback)
+        finally:
+            done_event.set()
+            watchdog.join(timeout=1.0)
+
+        if state["stopped_for_plateau"]:
+            plateau_stop_events.append({
+                "stage": stage,
+                "stage_seconds": round(time.monotonic() - stage_started, 2),
+                "plateau_seconds": plateau_seconds,
+                "best_objective": state["best_obj"],
+                "best_bound": state["best_bound"],
+            })
+
+        # Capture the final incumbent for the chart/table.
+        if state["has_solution"]:
+            try:
+                final_obj = float(solver_obj.ObjectiveValue())
+            except Exception:
+                final_obj = state["best_obj"]
+            try:
+                final_bound = float(solver_obj.BestObjectiveBound())
+            except Exception:
+                final_bound = state["best_bound"]
+            point = {
+                "stage": stage,
+                "seconds": round(time.monotonic() - solve_started_at, 3),
+                "stage_seconds": round(time.monotonic() - stage_started, 3),
+                "objective": final_obj,
+                "best_bound": final_bound,
+                "final": True,
+            }
+            if value_exprs:
+                for key, expr in value_exprs.items():
+                    try:
+                        point[key] = int(solver_obj.Value(expr))
+                    except Exception:
+                        point[key] = None
+            if not search_progress or any(
+                search_progress[-1].get(k) != point.get(k)
+                for k in ("stage", "objective", "best_bound", "k", "k1", "k2", "k3", "k4")
+            ):
+                search_progress.append(point)
+
+        return status_code
+
     def _is_solution_status(status_code) -> bool:
         return status_code in (cp_model.OPTIMAL, cp_model.FEASIBLE)
 
@@ -2231,7 +2420,11 @@ def build_and_solve(params: dict[str, Any]):
         # Leave meaningful time for phase 3 when possible.
         placement_limit = max(0.5, remaining * 0.60)
         placement_solver = _new_solver(placement_limit)
-        placement_status = placement_solver.Solve(model)
+        placement_status = _solve_monitored(
+            placement_solver,
+            stage="placement",
+            monitor_enabled=early_stop_on_plateau,
+        )
         placement_status_name = _status_name(placement_solver, placement_status)
 
         if _is_solution_status(placement_status):
@@ -2257,7 +2450,18 @@ def build_and_solve(params: dict[str, Any]):
         model.Minimize(adv)
 
         quality_solver = _new_solver(_remaining_time())
-        quality_status = quality_solver.Solve(model)
+        quality_status = _solve_monitored(
+            quality_solver,
+            stage="quality",
+            value_exprs={
+                "k": k,
+                "k1": k1,
+                "k2": k2,
+                "k3": k3,
+                "k4": k4,
+            },
+            monitor_enabled=early_stop_on_plateau,
+        )
         quality_status_name = _status_name(quality_solver, quality_status)
 
         if _is_solution_status(quality_status):
@@ -2342,6 +2546,11 @@ def build_and_solve(params: dict[str, Any]):
             "final_solution_stage": final_stage,
             "fallback_used": fallback_used,
             "quality_completed": quality_completed,
+            "early_stop_on_plateau": early_stop_on_plateau,
+            "plateau_seconds": plateau_seconds,
+            "plateau_min_runtime": plateau_min_runtime,
+            "plateau_stop_events": list(plateau_stop_events),
+            "search_progress": list(search_progress),
         }
 
     if not is_multi:

@@ -2866,7 +2866,18 @@ def build_schedule_excel_bytes(
             availability_df.to_excel(writer, sheet_name="AdditionalAvailability", index=False)
         grade_rules_to_df(st.session_state.grade_rules).to_excel(writer, sheet_name="GradeRules", index=False)
         if metrics and sol_idx < len(metrics):
-            pd.DataFrame([metrics[sol_idx]]).to_excel(writer, sheet_name="Metrics", index=False)
+            metric_row = dict(metrics[sol_idx])
+            search_progress_export = metric_row.pop("search_progress", []) or []
+            plateau_events_export = metric_row.pop("plateau_stop_events", []) or []
+            pd.DataFrame([metric_row]).to_excel(writer, sheet_name="Metrics", index=False)
+            if search_progress_export:
+                pd.DataFrame(search_progress_export).to_excel(
+                    writer, sheet_name="SearchProgress", index=False
+                )
+            if plateau_events_export:
+                pd.DataFrame(plateau_events_export).to_excel(
+                    writer, sheet_name="SearchStop", index=False
+                )
     towrite.seek(0)
     return towrite.getvalue()
 
@@ -2986,6 +2997,35 @@ with st.sidebar:
         key="time_max",
         help="37명 안팎의 복잡한 스케줄에서는 300~600초를 권장하며, UNKNOWN이 반복되면 최대 1200초까지 늘려볼 수 있습니다.",
     )
+    early_stop_on_plateau = st.checkbox(
+        "탐색 정체 시 자동 종료 (선택)",
+        value=False,
+        key="early_stop_on_plateau",
+        help=(
+            "Feasible 근무표를 찾은 뒤 더 좋은 해를 탐색할 때 사용합니다. "
+            "현재 best 점수와 best bound가 설정한 시간 동안 모두 개선되지 않으면 "
+            "현재까지의 가장 좋은 해를 반환합니다."
+        ),
+    )
+    if early_stop_on_plateau:
+        plateau_seconds = st.select_slider(
+            "개선이 없으면 종료",
+            options=[30, 45, 60, 90, 120, 180, 240, 300],
+            value=60,
+            format_func=lambda x: f"{x}초",
+            key="plateau_seconds",
+            help=(
+                "Feasible 해를 찾은 뒤 목적함수와 최적 가능 경계가 모두 이 시간 동안 "
+                "개선되지 않을 때 탐색을 조기 종료합니다."
+            ),
+        )
+        st.caption(
+            "📉 이 옵션을 켠 실행은 결과에 탐색 효율 그래프를 남깁니다. "
+            "그래프가 일찍 평평해지면 다음에는 최대 탐색시간을 줄여볼 수 있습니다."
+        )
+    else:
+        plateau_seconds = 60
+
     if solver_mode.startswith("다중"):
         sol_limit = st.number_input("최대 솔루션 수", 1, 100, 5, key="sol_limit")
         adv_limit = st.number_input("최소 편차에 추가 허용 편차", 0, 100, 0, key="adv_limit")
@@ -3324,9 +3364,13 @@ with st.sidebar:
     st.caption("by DS Choi 2026.03.19")
 
 
-def render_solver_countdown(slot, seconds: int):
+def render_solver_countdown(slot, seconds: int, *, plateau_enabled: bool = False, plateau_seconds: int = 60):
     """Browser-side countdown for the CP-SAT time budget."""
     sec = max(1, int(seconds or 1))
+    plateau_note = (
+        f" · 정체 {int(plateau_seconds)}초면 자동 종료"
+        if plateau_enabled else ""
+    )
     prop = f"--solve-remaining-{sec}"
     anim = f"solve_countdown_{sec}"
     bar_anim = f"solve_bar_{sec}"
@@ -3359,7 +3403,7 @@ def render_solver_countdown(slot, seconds: int):
         <div class="solve-running-banner">
             ⚙️ 스케줄 분석 중입니다…
             <span class="sub">
-                CP-SAT 근무표 탐색 중 · 남은 시간 약 <span class="solve-countdown-{sec}"></span> · 최대 {sec}초
+                CP-SAT 근무표 탐색 중 · 남은 시간 약 <span class="solve-countdown-{sec}"></span> · 최대 {sec}초{plateau_note}
             </span>
             <div class="solve-progress-track"><div class="solve-progress-fill solve-progress-{sec}"></div></div>
         </div>
@@ -4087,6 +4131,8 @@ if st.session_state.get("trigger_solve"):
             render_solver_countdown(
                 solve_status_slot,
                 int(st.session_state.get("time_max", 60)),
+                plateau_enabled=bool(st.session_state.get("early_stop_on_plateau", False)),
+                plateau_seconds=int(st.session_state.get("plateau_seconds", 60)),
             )
             with st.spinner("최적 스케줄을 계산 중입니다..."):
                 try:
@@ -4104,7 +4150,7 @@ if st.session_state.get("trigger_solve"):
                     scheduler_module = importlib.util.module_from_spec(spec)
                     spec.loader.exec_module(scheduler_module)
 
-                    expected_scheduler_api = '2026-08-20-v12.14-total-based-balance'
+                    expected_scheduler_api = '2026-08-20-v12.15-plateau-stop'
                     actual_scheduler_api = getattr(scheduler_module, "SCHEDULER_API_VERSION", None)
                     if actual_scheduler_api != expected_scheduler_api:
                         raise ImportError(
@@ -4151,6 +4197,12 @@ if st.session_state.get("trigger_solve"):
                         "time_max": st.session_state.time_max,
                         "sol_limit": int(st.session_state.get("sol_limit", 1)),
                         "adv_limit": int(st.session_state.get("adv_limit", 999)),
+                        "early_stop_on_plateau": bool(st.session_state.get("early_stop_on_plateau", False)),
+                        "plateau_seconds": int(st.session_state.get("plateau_seconds", 60)),
+                        "plateau_min_runtime": min(
+                            60,
+                            max(20, int(st.session_state.get("time_max", 60) * 0.15)),
+                        ),
                     }
 
                     solver_started_at = time.perf_counter()
@@ -4452,6 +4504,72 @@ with tab5:
                 f"배정 결과: 최소 필요 {m.get('duty_minimum_total', '')}근무 → 실제 {m.get('actual_duty_total', '')}근무 "
                 f"(추가 {m.get('duty_extra', 0)}). Ideal 미충족 {m.get('ideal_shortfall_total', 0)}, Ideal 초과 {m.get('over_ideal_total', 0)}."
             )
+            progress_points = m.get("search_progress", []) or []
+            if m.get("early_stop_on_plateau") and progress_points:
+                with st.expander("📉 탐색 효율 보기", expanded=False):
+                    progress_df = pd.DataFrame(progress_points)
+                    stop_events = m.get("plateau_stop_events", []) or []
+
+                    if stop_events:
+                        stop_text = " / ".join(
+                            f"{ev.get('stage')} 단계: 약 {ev.get('plateau_seconds')}초 정체 후 자동 종료"
+                            for ev in stop_events
+                        )
+                        st.success(f"자동 조기 종료 · {stop_text}")
+                    else:
+                        st.caption(
+                            "정체 기준 전에 최적화 단계가 끝났거나, 끝까지 점수/bound 개선이 이어졌습니다."
+                        )
+
+                    stage_name = (
+                        "quality"
+                        if (progress_df["stage"] == "quality").any()
+                        else "placement"
+                    )
+                    stage_df = (
+                        progress_df[progress_df["stage"] == stage_name]
+                        .copy()
+                        .sort_values("stage_seconds")
+                    )
+
+                    if not stage_df.empty:
+                        chart_df = stage_df[["stage_seconds", "objective", "best_bound"]].copy()
+                        chart_df = chart_df.rename(columns={
+                            "stage_seconds": "초",
+                            "objective": "현재 최선 점수",
+                            "best_bound": "최적 가능 경계",
+                        }).set_index("초")
+                        st.caption(
+                            ("품질 최적화" if stage_name == "quality" else "Ideal/분산 배치 최적화")
+                            + " · 낮을수록 좋은 점수입니다. 선이 오래 평평하면 추가 탐색의 이득이 작아진 상태입니다."
+                        )
+                        st.line_chart(chart_df)
+
+                        if stage_name == "quality":
+                            k_cols = [c for c in ["k", "k1", "k2", "k3", "k4"] if c in stage_df.columns]
+                            if k_cols:
+                                k_table = stage_df[["stage_seconds", "objective"] + k_cols].copy()
+                                k_table["k 단순합"] = k_table[k_cols].fillna(0).sum(axis=1)
+                                k_table = k_table.rename(columns={
+                                    "stage_seconds": "초",
+                                    "objective": "품질점수",
+                                })
+                                st.dataframe(
+                                    k_table[["초", "품질점수", "k 단순합"] + k_cols],
+                                    use_container_width=True,
+                                    hide_index=True,
+                                )
+
+                        first_t = float(stage_df["stage_seconds"].iloc[0])
+                        last_t = float(stage_df["stage_seconds"].iloc[-1])
+                        best_idx = stage_df["objective"].astype(float).idxmin()
+                        best_t = float(stage_df.loc[best_idx, "stage_seconds"])
+                        st.info(
+                            f"첫 개선 기록 {first_t:.1f}초 · 마지막 기록 {last_t:.1f}초 · "
+                            f"현재 최선 점수가 나온 시점 약 {best_t:.1f}초. "
+                            "최선 점수가 일찍 나온 뒤 오래 그대로였다면 다음 실행의 최대시간을 줄여볼 수 있습니다."
+                        )
+
             with st.expander("고급 정보 · Solver 점수 보기", expanded=False):
                 st.markdown(
                     f"<div style='font-size:0.85rem; color:var(--text-dim);'>"
