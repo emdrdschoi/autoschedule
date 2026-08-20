@@ -10,7 +10,7 @@ import pandas as pd
 import time
 from datetime import date, timedelta
 
-SCHEDULER_API_VERSION = '2026-08-20-v12.10-strong-text-contrast'
+SCHEDULER_API_VERSION = '2026-08-20-v12.14-total-based-balance'
 
 try:
     from ortools.sat.python import cp_model
@@ -1070,7 +1070,7 @@ def build_and_solve(params: dict[str, Any]):
         previous_schedule: dict {"n,h" -> actual shift}, h=0 oldest of preceding days
         previous_schedule_days: int (default 5)
         rules         : dict {str(n) -> {rule_key: value}}
-        shift_adj     : dict {str(n) -> int}
+        shift_adj     : optional hidden/legacy soft balance offset {str(n) -> int}; normally 0
         maximum_total : dict {str(n) -> -1|int}; -1 = no total maximum
         maximum_N     : dict {str(n) -> -1|int}; -1 = no Night maximum
         grades        : dict {str(n) -> int}
@@ -1098,7 +1098,7 @@ def build_and_solve(params: dict[str, Any]):
     previous_schedule_days = max(0, int(params.get("previous_schedule_days", 5)))
     previous_schedule_raw = params.get("previous_schedule", {}) or {}
     rules_raw    = {int(k): v for k, v in params["rules"].items()}
-    shift_adj    = {int(k): int(v) for k, v in params["shift_adj"].items()}
+    shift_adj    = {int(k): int(v) for k, v in (params.get("shift_adj", {}) or {}).items()}
     maximum_total_raw = params.get("maximum_total", {}) or {}
     maximum_total = {int(k): int(v) for k, v in maximum_total_raw.items()}
     minimum_n_raw = params.get("minimum_N", {}) or {}
@@ -1389,7 +1389,7 @@ def build_and_solve(params: dict[str, Any]):
             break
     if all_have_n_upper_bound and sum(n_upper_bounds) < total_s[2]:
         raise RuntimeError(
-            f"모든 의사의 N 상한 합({sum(n_upper_bounds)})이 N Duty 최소합({total_s[2]})보다 작아 "
+            f"모든 간호사의 N 상한 합({sum(n_upper_bounds)})이 N Duty 최소합({total_s[2]})보다 작아 "
             f"{total_s[2] - sum(n_upper_bounds)}개의 N 근무를 배정할 수 없습니다."
         )
 
@@ -1407,7 +1407,7 @@ def build_and_solve(params: dict[str, Any]):
             break
     if all_have_upper_bound and sum(finite_upper_bounds) < total_duty:
         raise RuntimeError(
-            f"모든 의사의 total 상한 합({sum(finite_upper_bounds)})이 Duty 총합({total_duty})보다 작아 "
+            f"모든 간호사의 total 상한 합({sum(finite_upper_bounds)})이 Duty 총합({total_duty})보다 작아 "
             f"{total_duty - sum(finite_upper_bounds)}개 근무를 배정할 수 없습니다."
         )
 
@@ -1418,7 +1418,7 @@ def build_and_solve(params: dict[str, Any]):
     # collectively smaller than the minimum staffing demand.
     if not free_total_doctors and fixed_total_sum < total_duty:
         raise RuntimeError(
-            f"모든 의사의 fixed_total 합({fixed_total_sum})이 Duty 최소합({total_duty})보다 "
+            f"모든 간호사의 fixed_total 합({fixed_total_sum})이 Duty 최소합({total_duty})보다 "
             f"{total_duty - fixed_total_sum}개 작아 최소 필요 인원을 채울 수 없습니다."
         )
 
@@ -1444,55 +1444,125 @@ def build_and_solve(params: dict[str, Any]):
                 f"모두 고정한 경우 두 값이 같아야 합니다."
             )
 
-    # Annual leave ('a') is treated as hard off like x and counted in the summary,
-    # but it no longer creates a hidden internal shift_adj effect.  If annual leave
-    # or fixed_Total should change balancing targets, app.py can write the explicit
-    # value into the visible shift_adj table via the auto-calculate button.
-    balance_shift_adj = {
-        n: shift_adj.get(n, 0)
-        for n in all_doctors
-    }
+    # ── Workload-based balance targets ─────────────────────────────────────────
+    # Nurse scheduling semantics:
+    # - x and a choose OFF dates; neither changes workload/D-E-N balance targets.
+    # - fixed_Total is the person's exact actual monthly workload and therefore the
+    #   primary basis for that person's D/E/N and holiday balance targets.
+    # - if fixed_Total is blank, a target total is derived from the remaining staffing
+    #   workload after exact fixed totals are accounted for.
+    # - shift_adj is retained only as a hidden/legacy SOFT balance offset. The app does
+    #   not auto-generate it from fixed_Total or annual leave.
 
-    free_total_adj = sum(balance_shift_adj.get(n, 0) for n in free_total_doctors)
-    # Use the smallest plausible total assignment count as the balancing target.
-    # If exact fixed totals already exceed the Duty minimum, they alone determine
-    # that target and unfixed staff are not pushed toward a negative average.
+    hidden_shift_adj = {n: int(shift_adj.get(n, 0)) for n in all_doctors}
     target_total_duty = max(total_duty, fixed_total_sum)
+    free_adj_sum = sum(hidden_shift_adj.get(n, 0) for n in free_total_doctors)
     avr_total_free = (
-        (target_total_duty - fixed_total_sum - free_total_adj) / len(free_total_doctors)
+        (target_total_duty - fixed_total_sum - free_adj_sum) / len(free_total_doctors)
         if free_total_doctors else 0.0
     )
 
-    # ── Shift별 독립 평균 계산 ────────────────────────────────────────────────
-    # D/E/N 각각: fix된 사람 제외 후 나머지 인원 기준으로 평균 계산
-    # Holiday: fix 여부 무관 전체 인원 기준 유지
-    # shift_counts: {n: {"D": -1|int, "E": -1|int, "N": -1|int}}, -1 = free
+    # Plan the shift composition of unavoidable extras toward Ideal first.
+    extra_for_balance = max(0.0, float(target_total_duty - total_duty))
+    ideal_gap_s = [0.0, 0.0, 0.0]
+    for d in all_days:
+        for s in all_shifts:
+            if ideal_duty_enabled[d][s]:
+                ideal_gap_s[s] += max(0, int(ideal_duty_requests[d][s]) - int(duty_requests[d][s]))
+    ideal_gap_total = sum(ideal_gap_s)
 
-    def _shift_avr(shift_idx: int, shift_key: str):
-        """fix 안 된 인원 기준으로 해당 shift 평균 계산."""
-        fixed_sum = sum(
-            shift_counts.get(n, {}).get(shift_key, -1)
-            for n in all_doctors
-            if shift_counts.get(n, {}).get(shift_key, -1) >= 0
-        )
-        free_ns = [
-            n for n in all_doctors
-            if shift_counts.get(n, {}).get(shift_key, -1) < 0
+    planned_shift_totals = [float(total_s[s]) for s in all_shifts]
+    ideal_fill = min(extra_for_balance, ideal_gap_total)
+    if ideal_fill > 0 and ideal_gap_total > 0:
+        for s in all_shifts:
+            planned_shift_totals[s] += ideal_fill * (ideal_gap_s[s] / ideal_gap_total)
+
+    leftover_extra = max(0.0, extra_for_balance - ideal_fill)
+    if leftover_extra > 0:
+        base_rate = [
+            (total_s[s] / total_duty) if total_duty > 0 else (1.0 / len(all_shifts))
+            for s in all_shifts
         ]
-        if not free_ns:
-            return 0.0, []
-        free_adj = sum(balance_shift_adj.get(n, 0) for n in free_ns)
-        avr = (total_s[shift_idx] - fixed_sum - free_adj * s_rate[shift_idx]) / len(free_ns)
-        return avr, free_ns
+        for s in all_shifts:
+            planned_shift_totals[s] += leftover_extra * base_rate[s]
 
-    avr_d, free_d_doctors = _shift_avr(0, "D")
-    avr_e, free_e_doctors = _shift_avr(1, "E")
-    avr_n, free_n_doctors = _shift_avr(2, "N")
+    planned_shift_sum = sum(planned_shift_totals)
+    s_rate = [
+        (planned_shift_totals[s] / planned_shift_sum)
+        if planned_shift_sum > 0 else (1.0 / len(all_shifts))
+        for s in all_shifts
+    ]
+    hol_rate = total_holiday_demand / total_duty if total_duty else 0.0
 
-    # Total 평균: 세 shift 평균 합 (인원별로 자기가 free인 shift 평균의 합)
-    # Holiday 평균: 전체 인원 기준 유지
-    adj_sum = sum(balance_shift_adj.get(n, 0) for n in all_doctors)
-    avr_holiday = (total_holiday_demand - adj_sum * hol_rate) / num_doctors
+    def _required_total_lower_bound(n: int) -> float:
+        sc = shift_counts.get(n, {})
+        fixed_d = int(sc.get("D", -1))
+        fixed_e = int(sc.get("E", -1))
+        fixed_n = int(sc.get("N", -1))
+        min_n = int(minimum_n.get(n, -1))
+        required_n = fixed_n if fixed_n >= 0 else (min_n if min_n >= 0 else 0)
+        return float((fixed_d if fixed_d >= 0 else 0) + (fixed_e if fixed_e >= 0 else 0) + required_n)
+
+    balance_total_target = {}
+    for n in all_doctors:
+        if n in fixed_total_by_doc:
+            raw_target = float(fixed_total_by_doc[n] + hidden_shift_adj.get(n, 0))
+        else:
+            raw_target = float(avr_total_free + hidden_shift_adj.get(n, 0))
+        raw_target = max(raw_target, _required_total_lower_bound(n), 0.0)
+        max_total = int(maximum_total.get(n, -1))
+        if max_total >= 0:
+            raw_target = min(raw_target, float(max_total))
+        balance_total_target[n] = raw_target
+
+    def _weighted_split(amount: float, indices: list[int]) -> dict[int, float]:
+        if not indices:
+            return {}
+        amount = max(0.0, float(amount))
+        wsum = sum(max(0.0, s_rate[s]) for s in indices)
+        if wsum <= 0:
+            return {s: amount / len(indices) for s in indices}
+        return {s: amount * max(0.0, s_rate[s]) / wsum for s in indices}
+
+    def _person_shift_balance_targets(n: int) -> list[float]:
+        sc = shift_counts.get(n, {})
+        total_target = float(balance_total_target[n])
+        targets = [None, None, None]
+        free_shifts = []
+        fixed_sum = 0.0
+        for s, sk in enumerate(("D", "E", "N")):
+            fv = int(sc.get(sk, -1))
+            if fv >= 0:
+                targets[s] = float(fv)
+                fixed_sum += float(fv)
+            else:
+                free_shifts.append(s)
+
+        residual = max(0.0, total_target - fixed_sum)
+        initial = _weighted_split(residual, free_shifts)
+        for s in free_shifts:
+            targets[s] = initial.get(s, 0.0)
+
+        if 2 in free_shifts:
+            n_target = float(targets[2] or 0.0)
+            min_n = int(minimum_n.get(n, -1))
+            max_n = int(maximum_n.get(n, -1))
+            if min_n >= 0:
+                n_target = max(n_target, float(min_n))
+            if max_n >= 0:
+                n_target = min(n_target, float(max_n))
+            targets[2] = n_target
+            free_de = [s for s in (0, 1) if s in free_shifts]
+            if free_de:
+                de_amount = max(0.0, total_target - fixed_sum - n_target)
+                de_split = _weighted_split(de_amount, free_de)
+                for s in free_de:
+                    targets[s] = de_split.get(s, 0.0)
+
+        return [float(x or 0.0) for x in targets]
+
+    person_shift_targets = {n: _person_shift_balance_targets(n) for n in all_doctors}
+    person_holiday_target = {n: max(0.0, balance_total_target[n] * hol_rate) for n in all_doctors}
 
     # ── Build model ───────────────────────────────────────────────────────────
     model = cp_model.CpModel()
@@ -1859,7 +1929,6 @@ def build_and_solve(params: dict[str, Any]):
     model.Add(k3 == k3_low + k3_high)
 
     for n in all_doctors:
-        adj     = balance_shift_adj.get(n, 0)
         sc      = shift_counts.get(n, {})
         fixed_d = sc.get("D", -1)
         fixed_e = sc.get("E", -1)
@@ -1867,6 +1936,9 @@ def build_and_solve(params: dict[str, Any]):
         fixed_total = sc.get("Total", -1)
         is_total_fixed = fixed_total >= 0
         is_fully_fixed = (fixed_d >= 0 and fixed_e >= 0 and fixed_n >= 0)
+        shift_target = person_shift_targets[n]
+        total_target = balance_total_target[n]
+        holiday_target = person_holiday_target[n]
 
         num_s = [sum(shifts[(n,d,s)] for d in all_days) for s in all_shifts]
         num_total = sum(num_s)
@@ -1907,43 +1979,34 @@ def build_and_solve(params: dict[str, Any]):
         model.Add(dev_N[0]   <= k3_low);     model.Add(dev_N[1]   <= k3_high)
 
         if is_fully_fixed:
-            # 전체 fix → deviation 전부 0, 평준화 제외 (holiday만 유지)
             for dv in [dev_de, dev_tot, dev_N]:
                 model.Add(dv[0] == 0); model.Add(dv[1] == 0)
-            # holiday는 fix 여부 무관 전체 인원 기준
-            model.Add(int(avr_holiday + adj * hol_rate) - dev_hol[0] <= hol_worked)
-            model.Add(hol_worked <= _max_avr(avr_holiday + adj * hol_rate) + dev_hol[1])
+            model.Add(int(holiday_target) - dev_hol[0] <= hol_worked)
+            model.Add(hol_worked <= _max_avr(holiday_target) + dev_hol[1])
         else:
-            # D — 각 shift별 독립 평균 (avr_d/avr_e/avr_n)
-            if fixed_d >= 0:
-                model.Add(dev_de[0] == 0); model.Add(dev_de[1] == 0)
-            else:
-                model.Add(int(avr_d + adj * s_rate[0]) - dev_de[0] <= num_s[0])
-                model.Add(num_s[0] <= _max_avr(avr_d + adj * s_rate[0]) + dev_de[1])
-
-            # E (dev_de 공유)
+            if fixed_d < 0:
+                model.Add(int(shift_target[0]) - dev_de[0] <= num_s[0])
+                model.Add(num_s[0] <= _max_avr(shift_target[0]) + dev_de[1])
             if fixed_e < 0:
-                model.Add(int(avr_e + adj * s_rate[1]) - dev_de[0] <= num_s[1])
-                model.Add(num_s[1] <= _max_avr(avr_e + adj * s_rate[1]) + dev_de[1])
+                model.Add(int(shift_target[1]) - dev_de[0] <= num_s[1])
+                model.Add(num_s[1] <= _max_avr(shift_target[1]) + dev_de[1])
+            if fixed_d >= 0 and fixed_e >= 0:
+                model.Add(dev_de[0] == 0); model.Add(dev_de[1] == 0)
 
-            # N
             if fixed_n >= 0:
                 model.Add(dev_N[0] == 0); model.Add(dev_N[1] == 0)
             else:
-                model.Add(int(avr_n + adj * s_rate[2]) - dev_N[0] <= num_s[2])
-                model.Add(num_s[2] <= _max_avr(avr_n + adj * s_rate[2]) + dev_N[1])
+                model.Add(int(shift_target[2]) - dev_N[0] <= num_s[2])
+                model.Add(num_s[2] <= _max_avr(shift_target[2]) + dev_N[1])
 
-            # Total — fixed_total이 있으면 hard count이므로 total deviation에서 제외.
-            # fixed_total이 없는 사람끼리 남은 총근무수를 평준화한다.
             if is_total_fixed:
                 model.Add(dev_tot[0] == 0); model.Add(dev_tot[1] == 0)
             else:
-                model.Add(int(avr_total_free + adj) - dev_tot[0] <= num_total)
-                model.Add(num_total <= _max_avr(avr_total_free + adj) + dev_tot[1])
+                model.Add(int(total_target) - dev_tot[0] <= num_total)
+                model.Add(num_total <= _max_avr(total_target) + dev_tot[1])
 
-            # Holiday — fix 무관 전체 인원 기준
-            model.Add(int(avr_holiday + adj * hol_rate) - dev_hol[0] <= hol_worked)
-            model.Add(hol_worked <= _max_avr(avr_holiday + adj * hol_rate) + dev_hol[1])
+            model.Add(int(holiday_target) - dev_hol[0] <= hol_worked)
+            model.Add(hol_worked <= _max_avr(holiday_target) + dev_hol[1])
 
 
     # ── Objective ─────────────────────────────────────────────────────────────
@@ -2223,6 +2286,9 @@ def build_and_solve(params: dict[str, Any]):
             "duty_ideal_E": total_ideal_s[1],
             "duty_ideal_N": total_ideal_s[2],
             "actual_duty_total": total_duty + (value_fn(duty_extra_total) if duty_extra_vars else 0),
+            "balance_planned_D": round(planned_shift_totals[0], 2),
+            "balance_planned_E": round(planned_shift_totals[1], 2),
+            "balance_planned_N": round(planned_shift_totals[2], 2),
             "ideal_shortfall_total": value_fn(ideal_shortfall_total) if ideal_shortfall_vars else 0,
             "over_ideal_total": value_fn(over_ideal_total) if over_ideal_vars else 0,
             "max_day_extra": value_fn(max_day_extra),
