@@ -10,7 +10,7 @@ import pandas as pd
 import time
 from datetime import date, timedelta
 
-SCHEDULER_API_VERSION = '2026-08-20-v12.9-preflight-on-demand'
+SCHEDULER_API_VERSION = '2026-08-20-v12.10-strong-text-contrast'
 
 try:
     from ortools.sat.python import cp_model

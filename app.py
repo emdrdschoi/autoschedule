@@ -91,10 +91,17 @@ div[data-testid="stNumberInput"]:has(input[aria-label^="Ideal "]) button {
     font-size: 0.82rem;
     line-height: 1.55;
 }
-.friendly-note strong { color: #ffffff; }
+.friendly-note strong {
+    color: #ff6b6b;
+    font-weight: 800;
+    text-shadow: 0 1px 1px rgba(0,0,0,0.35);
+}
 .ideal-note {
     background: rgba(240, 160, 64, 0.10);
     border-color: rgba(240, 160, 64, 0.45);
+}
+.ideal-note strong {
+    color: #ff5a4f;
 }
 .rule-label-help {
     cursor: help;
@@ -4127,7 +4134,7 @@ if st.session_state.get("trigger_solve"):
                     scheduler_module = importlib.util.module_from_spec(spec)
                     spec.loader.exec_module(scheduler_module)
 
-                    expected_scheduler_api = '2026-08-20-v12.9-preflight-on-demand'
+                    expected_scheduler_api = '2026-08-20-v12.10-strong-text-contrast'
                     actual_scheduler_api = getattr(scheduler_module, "SCHEDULER_API_VERSION", None)
                     if actual_scheduler_api != expected_scheduler_api:
                         raise ImportError(
