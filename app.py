@@ -6,6 +6,7 @@ from pathlib import Path
 import calendar
 import json
 import hashlib
+import time
     
 st.set_page_config(
     page_title="스케줄 최적화",
@@ -38,6 +39,35 @@ html, body, [class*="css"] {
     font-family: var(--sans);
     background-color: var(--bg);
     color: var(--text);
+}
+
+/* Solver running banner: fixed at the TOP of the viewport so it remains
+   visible even when the user clicked the Solve button while scrolled down. */
+.solve-running-banner {
+    position: fixed;
+    top: 0.55rem;
+    left: 50%;
+    transform: translateX(-50%);
+    z-index: 999999;
+    min-width: min(680px, 86vw);
+    max-width: 90vw;
+    background: #151b2b;
+    border: 1px solid var(--accent);
+    border-radius: 8px;
+    box-shadow: 0 8px 28px rgba(0,0,0,0.35);
+    color: var(--text);
+    padding: 0.72rem 1rem;
+    text-align: center;
+    font-family: var(--sans);
+    font-size: 0.9rem;
+    font-weight: 600;
+}
+.solve-running-banner .sub {
+    display: block;
+    color: var(--text-dim);
+    font-size: 0.72rem;
+    font-weight: 400;
+    margin-top: 0.15rem;
 }
 
 /* Header */
@@ -1654,6 +1684,7 @@ def _hard_preflight_params(combined_req: dict | None = None) -> dict:
         "rules": {str(k): v for k, v in st.session_state.get("rules", {}).items()},
         "shift_counts": {str(k): v for k, v in st.session_state.get("shift_counts", {}).items()},
         "maximum_total": {str(k): v for k, v in st.session_state.get("maximum_total", {}).items()},
+        "minimum_N": {str(k): v for k, v in st.session_state.get("minimum_N", {}).items()},
         "maximum_N": {str(k): v for k, v in st.session_state.get("maximum_N", {}).items()},
     }
 
@@ -1842,8 +1873,14 @@ def get_preflight_hard_rule_check(force: bool = False) -> dict:
         and cached.get("signature") == signature
         and isinstance(cached.get("conflicts"), pd.DataFrame)
     ):
-        return cached
+        # Return a copy so the cached record continues to describe when the
+        # expensive check was actually computed.
+        out = dict(cached)
+        out["cache_hit"] = True
+        out["access_duration_seconds"] = 0.0
+        return out
 
+    started = time.perf_counter()
     exact_df, exact_error = _run_exact_hard_conflict_diagnostics(combined_req)
     basic_df = _basic_preflight_conflicts(params)
 
@@ -1860,11 +1897,15 @@ def get_preflight_hard_rule_check(force: bool = False) -> dict:
             columns=["상태", "이름", "날짜", "충돌 규칙", "설명", "관련 일정", "수정 제안"]
         )
 
+    elapsed = time.perf_counter() - started
     result = {
         "signature": signature,
         "conflicts": conflicts,
         "error": exact_error,
         "checked_at": datetime.now().strftime("%H:%M:%S"),
+        "duration_seconds": elapsed,
+        "cache_hit": False,
+        "access_duration_seconds": elapsed,
     }
     st.session_state["_hard_preflight_cache"] = result
     return result
@@ -1880,6 +1921,12 @@ def render_preflight_hard_rule_status():
         result = get_preflight_hard_rule_check(force=False)
         conflicts = result.get("conflicts", pd.DataFrame())
         error = str(result.get("error", "") or "")
+        st.session_state["_preflight_render_recomputed"] = not bool(result.get("cache_hit", False))
+        st.session_state["_preflight_render_elapsed"] = (
+            float(result.get("duration_seconds", 0.0))
+            if not result.get("cache_hit", False)
+            else 0.0
+        )
 
         if error:
             st.warning(
@@ -2834,7 +2881,15 @@ with st.sidebar:
     st.divider()
     st.markdown('<div class="section-label">🔧 솔버 설정</div>', unsafe_allow_html=True)
     solver_mode = st.selectbox("모드", ["최적해 1개 (main)", "다중 솔루션 탐색 (main_alt)"], key="solver_mode")
-    time_max = st.slider("최대 탐색 시간 (초)", 10, 2400, 60, key="time_max")
+    time_max = st.slider(
+        "최대 탐색 시간 (초)",
+        min_value=10,
+        max_value=1200,   # 최대 20분
+        value=60,         # 기존 기본값 유지
+        step=10,
+        key="time_max",
+        help="37명 안팎의 복잡한 스케줄에서는 300~600초를 권장하며, UNKNOWN이 반복되면 최대 1200초까지 늘려볼 수 있습니다.",
+    )
     if solver_mode.startswith("다중"):
         sol_limit = st.number_input("최대 솔루션 수", 1, 100, 5, key="sol_limit")
         adv_limit = st.number_input("최소 편차에 추가 허용 편차", 0, 100, 0, key="adv_limit")
@@ -3162,6 +3217,22 @@ with st.sidebar:
 
 # ── MAIN AREA ────────────────────────────────────────────────────────────────
 st.markdown('<div class="main-header"><h1>🏥 SHIFT SCHEDULER</h1><p>의료진 근무표 최적화 시스템 · OR-Tools CP-SAT, by DSCHOI </p></div>', unsafe_allow_html=True)
+
+# Capture this rerun before any expensive preflight/UI work.  The status banner is
+# fixed to the top of the viewport, so it is visible even if the page is scrolled down.
+solve_requested_this_run = bool(st.session_state.get("trigger_solve"))
+solve_rerun_started_at = time.perf_counter() if solve_requested_this_run else None
+solve_status_slot = st.empty()
+if solve_requested_this_run:
+    solve_status_slot.markdown(
+        """
+        <div class="solve-running-banner">
+            ⏳ 스케줄 분석 중입니다…
+            <span class="sub">0차 Hard rule 사전검사 확인 중</span>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
 
 normalize_doctors()
 normalize_grade_rules()
@@ -3737,12 +3808,16 @@ if st.session_state.get("trigger_solve"):
         sync_live_total_summary_inputs(num_days)
         fixed_total_info = get_fixed_total_summary()
         normalize_maximum_total()
+        normalize_minimum_n()
         normalize_maximum_n()
         precheck_error = ""
 
-        # Mandatory 0th check: exact hard-coded conflicts are evaluated BEFORE the
-        # full roster CP-SAT model. A proven contradiction blocks the expensive solve.
-        preflight = get_preflight_hard_rule_check(force=True)
+        # Mandatory 0th check. Reuse the exact preflight result already computed for
+        # the current SAVED hard-input signature. Only changed hard inputs trigger a
+        # recalculation; clicking Solve itself must NOT run 37 personal CP-SAT checks again.
+        preflight_call_started = time.perf_counter()
+        preflight = get_preflight_hard_rule_check(force=False)
+        preflight_call_elapsed = time.perf_counter() - preflight_call_started
         preflight_conflicts = preflight.get("conflicts", pd.DataFrame())
         if isinstance(preflight_conflicts, pd.DataFrame) and not preflight_conflicts.empty:
             first = preflight_conflicts.iloc[0]
@@ -3854,6 +3929,7 @@ if st.session_state.get("trigger_solve"):
             )
 
         if precheck_error:
+            solve_status_slot.empty()
             st.session_state.solved = False
             st.session_state.solutions = []
             st.session_state.summaries = []
@@ -3864,6 +3940,15 @@ if st.session_state.get("trigger_solve"):
             st.error(precheck_error)
             st.info("📋 위의 0차 Hard rule 사전검사 표에서 확정 충돌을 먼저 수정하세요. 이후 필요하면 결과 탭의 상세 진단모드를 사용할 수 있습니다.")
         else:
+            solve_status_slot.markdown(
+                """
+                <div class="solve-running-banner">
+                    ⚙️ 스케줄 분석 중입니다…
+                    <span class="sub">CP-SAT 근무표 탐색 중 · 설정한 최대 탐색시간은 이 단계에 적용됩니다</span>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
             with st.spinner("최적 스케줄을 계산 중입니다..."):
                 try:
                     # Always load the scheduler.py that sits next to THIS app.py.
@@ -3880,7 +3965,7 @@ if st.session_state.get("trigger_solve"):
                     scheduler_module = importlib.util.module_from_spec(spec)
                     spec.loader.exec_module(scheduler_module)
 
-                    expected_scheduler_api = '2026-08-19-v12.5-minimum-n'
+                    expected_scheduler_api = '2026-08-19-v12.7-fast-preflight-top-status'
                     actual_scheduler_api = getattr(scheduler_module, "SCHEDULER_API_VERSION", None)
                     if actual_scheduler_api != expected_scheduler_api:
                         raise ImportError(
@@ -3925,13 +4010,28 @@ if st.session_state.get("trigger_solve"):
                         "adv_limit": int(st.session_state.get("adv_limit", 999)),
                     }
 
+                    solver_started_at = time.perf_counter()
                     solutions, summaries, metrics = build_and_solve(params)
+                    solver_elapsed = time.perf_counter() - solver_started_at
+
+                    solve_status_slot.markdown(
+                        """
+                        <div class="solve-running-banner">
+                            ✅ Feasible/최적화 결과를 찾았습니다
+                            <span class="sub">결과표 · AdditionalAvailability 후처리 중</span>
+                        </div>
+                        """,
+                        unsafe_allow_html=True,
+                    )
+
+                    post_started_at = time.perf_counter()
                     st.session_state.solutions = solutions
                     st.session_state.summaries = summaries
                     st.session_state.metrics = metrics
                     st.session_state.additional_availability = [
                         evaluate_additional_availability(params, sol_item) for sol_item in solutions
                     ]
+                    post_elapsed = time.perf_counter() - post_started_at
                     st.session_state.last_solve_params = params
                     st.session_state.sol_idx = 0
                     st.session_state.solved = True
@@ -3939,8 +4039,25 @@ if st.session_state.get("trigger_solve"):
                     st.session_state["solve_failure_message"] = ""
                     st.session_state["diagnostic_results"] = None
                     st.session_state.pop("prepared_excel_export", None)
+
+                    preflight_rerun_elapsed = float(st.session_state.get("_preflight_render_elapsed", 0.0))
+                    total_elapsed = (
+                        time.perf_counter() - solve_rerun_started_at
+                        if solve_rerun_started_at is not None
+                        else solver_elapsed + post_elapsed
+                    )
+                    st.session_state["last_solve_timing"] = {
+                        "preflight_seconds": preflight_rerun_elapsed,
+                        "preflight_cache_hit": not bool(st.session_state.get("_preflight_render_recomputed", False)),
+                        "solve_preflight_access_seconds": preflight_call_elapsed,
+                        "solver_seconds": solver_elapsed,
+                        "postprocess_seconds": post_elapsed,
+                        "total_seconds": total_elapsed,
+                    }
+                    solve_status_slot.empty()
                     st.toast(f"✅ {len(solutions)}개의 솔루션을 찾았습니다!", icon="✅")
                 except RuntimeError as e:
+                    solve_status_slot.empty()
                     msg = str(e)
                     st.session_state.solved = False
                     st.session_state.solutions = []
@@ -3956,6 +4073,7 @@ if st.session_state.get("trigger_solve"):
                     else:
                         st.toast(f"❌ Solver 오류: {msg}", icon="❌")
                 except Exception as e:
+                    solve_status_slot.empty()
                     st.session_state.solved = False
                     st.session_state.solutions = []
                     st.session_state.summaries = []
@@ -4002,6 +4120,21 @@ with tab5:
 
         sol = solutions[sol_idx]
         summary = summaries[sol_idx]
+
+        timing = st.session_state.get("last_solve_timing")
+        if isinstance(timing, dict):
+            preflight_text = (
+                f"{timing.get('preflight_seconds', 0.0):.1f}초"
+                if float(timing.get("preflight_seconds", 0.0)) > 0.01
+                else "cache 재사용"
+            )
+            st.caption(
+                "⏱ 실행시간 · "
+                f"사전검사 {preflight_text} · "
+                f"CP-SAT {float(timing.get('solver_seconds', 0.0)):.1f}초 · "
+                f"후처리 {float(timing.get('postprocess_seconds', 0.0)):.1f}초 · "
+                f"전체 {float(timing.get('total_seconds', 0.0)):.1f}초"
+            )
 
         # 화면/Excel 표시 순서: 의사 입력 순서 그대로 유지
         # Grade는 표시하되, Grade 값으로 재정렬하지 않는다.
