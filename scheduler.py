@@ -11,7 +11,7 @@ import time
 import threading
 from datetime import date, timedelta
 
-SCHEDULER_API_VERSION = '2026-08-20-v12.15-plateau-stop'
+SCHEDULER_API_VERSION = '2026-08-21-v12.16-de-refinement'
 
 try:
     from ortools.sat.python import cp_model
@@ -1940,6 +1940,19 @@ def build_and_solve(params: dict[str, Any]):
     model.Add(k2 == k2_low + k2_high)
     model.Add(k3 == k3_low + k3_high)
 
+    # Secondary D/E fairness measure.
+    #
+    # Existing k_DE is an envelope: once the worst lower/upper D/E deviation is
+    # already determined, several other nurses can move around inside that same
+    # envelope without making k worse.  That can create 9D/3E vs 3D/11E style
+    # outliers even when a more even solution exists with exactly the same k.
+    #
+    # We therefore keep k as the existing first-level quality measure, and track
+    # the SUM of every nurse's D and E deviation from their own workload-scaled
+    # target interval as a later lexicographic refinement objective.
+    individual_de_dev_terms = []
+    individual_de_dev_by_doc = {}
+
     for n in all_doctors:
         sc      = shift_counts.get(n, {})
         fixed_d = sc.get("D", -1)
@@ -1955,6 +1968,32 @@ def build_and_solve(params: dict[str, Any]):
         num_s = [sum(shifts[(n,d,s)] for d in all_days) for s in all_shifts]
         num_total = sum(num_s)
         hol_worked = sum(shifts[(n,d,s)] for d in holiday for s in all_shifts)
+
+        # Individual D/E deviation from this nurse's own workload-scaled target.
+        # A fractional target such as D=6.4 treats 6~7 as the zero-penalty interval.
+        # User-fixed D or E is excluded because it is an explicit exact instruction.
+        person_de_terms = []
+        for s, fixed_val, shift_label in (
+            (0, fixed_d, "D"),
+            (1, fixed_e, "E"),
+        ):
+            if fixed_val >= 0:
+                continue
+            target_low = int(shift_target[s])
+            target_high = _max_avr(shift_target[s])
+            below = model.NewIntVar(0, max_balance_dev, f"ind_{shift_label}_below_{n}")
+            above = model.NewIntVar(0, max_balance_dev, f"ind_{shift_label}_above_{n}")
+            model.Add(below >= target_low - num_s[s])
+            model.Add(above >= num_s[s] - target_high)
+            person_de_terms.extend([below, above])
+            individual_de_dev_terms.extend([below, above])
+
+        if person_de_terms:
+            person_de_total = model.NewIntVar(
+                0, max_balance_dev * len(person_de_terms), f"ind_DE_total_{n}"
+            )
+            model.Add(person_de_total == sum(person_de_terms))
+            individual_de_dev_by_doc[n] = person_de_total
 
         # ── 고정 개수 hard constraint ─────────────────────────────────────────
         if fixed_d >= 0: model.Add(num_s[0] == fixed_d)
@@ -2020,6 +2059,19 @@ def build_and_solve(params: dict[str, Any]):
             model.Add(int(holiday_target) - dev_hol[0] <= hol_worked)
             model.Add(hol_worked <= _max_avr(holiday_target) + dev_hol[1])
 
+
+    # Total individual D/E deviation is NOT mixed into the existing Quality score.
+    # It is optimized only after the existing quality objective is fixed, so it
+    # cannot worsen the current k/k1/k2/k3/k4 + junior/grade priority.
+    if individual_de_dev_terms:
+        individual_de_dev_total = model.NewIntVar(
+            0,
+            max_balance_dev * len(individual_de_dev_terms),
+            "individual_DE_deviation_total",
+        )
+        model.Add(individual_de_dev_total == sum(individual_de_dev_terms))
+    else:
+        individual_de_dev_total = 0
 
     # ── Objective ─────────────────────────────────────────────────────────────
     junior_excess_total = sum(junior_excess_vars) if junior_excess_vars else 0
@@ -2313,7 +2365,7 @@ def build_and_solve(params: dict[str, Any]):
                         point[key] = None
             if not search_progress or any(
                 search_progress[-1].get(k) != point.get(k)
-                for k in ("stage", "objective", "best_bound", "k", "k1", "k2", "k3", "k4")
+                for k in ("stage", "objective", "best_bound", "de_individual", "k", "k1", "k2", "k3", "k4")
             ):
                 search_progress.append(point)
 
@@ -2439,17 +2491,26 @@ def build_and_solve(params: dict[str, Any]):
             # We keep the already feasible phase-1 schedule.
             fallback_used = True
 
-    # ── Phase 3: individual/grade/junior quality ────────────────────────────
+    # ── Phase 3: existing individual/grade/junior quality ──────────────────
+    # Preserve the existing objective first.  Leave some of the remaining budget
+    # for a lexicographic D/E refinement step below.
     quality_solver = None
     quality_status = None
     quality_status_name = "SKIPPED"
     quality_completed = False
+    best_quality_adv = None
 
     if placement_completed and _remaining_time() >= 0.50:
         _clear_objective()
         model.Minimize(adv)
 
-        quality_solver = _new_solver(_remaining_time())
+        quality_remaining = _remaining_time()
+        quality_limit = (
+            max(0.5, quality_remaining * 0.70)
+            if individual_de_dev_terms and quality_remaining >= 1.50
+            else quality_remaining
+        )
+        quality_solver = _new_solver(quality_limit)
         quality_status = _solve_monitored(
             quality_solver,
             stage="quality",
@@ -2465,16 +2526,65 @@ def build_and_solve(params: dict[str, Any]):
         quality_status_name = _status_name(quality_solver, quality_status)
 
         if _is_solution_status(quality_status):
+            best_quality_adv = quality_solver.Value(adv)
             final_solver = quality_solver
             final_stage = "quality"
             quality_completed = True
             _apply_shift_hint(quality_solver)
         else:
             # Keep phase-2 feasible result. UNKNOWN here only means quality
-            # optimization did not finish/find a solution in its remaining time.
+            # optimization did not finish/find a solution in its allotted slice.
             fallback_used = True
 
-    # Even if phase 2/3 timed out, final_solver is guaranteed feasible because
+    # ── Phase 4: individual D/E deviation SUM refinement ────────────────────
+    # IMPORTANT: adv is fixed to the best Phase-3 value first.  Therefore this
+    # phase can only choose a more even D/E solution among schedules with the same
+    # existing quality score; it cannot sacrifice k/N/holiday/grade/junior quality.
+    de_refine_solver = None
+    de_refine_status = None
+    de_refine_status_name = "SKIPPED"
+    de_refinement_completed = False
+    best_individual_de_dev = (
+        final_solver.Value(individual_de_dev_total)
+        if individual_de_dev_terms else 0
+    )
+
+    if (
+        quality_completed
+        and individual_de_dev_terms
+        and _remaining_time() >= 0.50
+    ):
+        model.Add(adv == int(best_quality_adv))
+        _clear_objective()
+        model.Minimize(individual_de_dev_total)
+
+        de_refine_solver = _new_solver(_remaining_time())
+        de_refine_status = _solve_monitored(
+            de_refine_solver,
+            stage="de_refine",
+            value_exprs={
+                "de_individual": individual_de_dev_total,
+                "k": k,
+                "k1": k1,
+                "k2": k2,
+                "k3": k3,
+                "k4": k4,
+            },
+            monitor_enabled=early_stop_on_plateau,
+        )
+        de_refine_status_name = _status_name(de_refine_solver, de_refine_status)
+
+        if _is_solution_status(de_refine_status):
+            best_individual_de_dev = de_refine_solver.Value(individual_de_dev_total)
+            final_solver = de_refine_solver
+            final_stage = "de_refine"
+            de_refinement_completed = True
+            _apply_shift_hint(de_refine_solver)
+        else:
+            # Keep the Phase-3 quality solution.
+            fallback_used = True
+
+    # Even if phase 2/3/4 times out, final_solver is guaranteed feasible because
     # phase 1 only reaches this point with FEASIBLE/OPTIMAL.
     best_adv = final_solver.Value(adv)
     allowed_adv = best_adv + adv_limit if is_multi else best_adv
@@ -2533,6 +2643,12 @@ def build_and_solve(params: dict[str, Any]):
             "weight_n_dev": weight_n_dev,
             "weight_grade_dev": weight_grade_dev,
             "balance_penalty": value_fn(balance_penalty),
+            "individual_de_deviation_total": (
+                value_fn(individual_de_dev_total) if individual_de_dev_terms else 0
+            ),
+            "best_individual_de_deviation": best_individual_de_dev,
+            "de_refinement_status": de_refine_status_name,
+            "de_refinement_completed": de_refinement_completed,
             "best_adv": best_adv,
             "allowed_adv": allowed_adv,
             "adv_extra_allowed": adv_limit if is_multi else 0,

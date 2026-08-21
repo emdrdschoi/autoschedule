@@ -4150,7 +4150,7 @@ if st.session_state.get("trigger_solve"):
                     scheduler_module = importlib.util.module_from_spec(spec)
                     spec.loader.exec_module(scheduler_module)
 
-                    expected_scheduler_api = '2026-08-20-v12.15-plateau-stop'
+                    expected_scheduler_api = '2026-08-21-v12.16-de-refinement'
                     actual_scheduler_api = getattr(scheduler_module, "SCHEDULER_API_VERSION", None)
                     if actual_scheduler_api != expected_scheduler_api:
                         raise ImportError(
@@ -4504,6 +4504,11 @@ with tab5:
                 f"배정 결과: 최소 필요 {m.get('duty_minimum_total', '')}근무 → 실제 {m.get('actual_duty_total', '')}근무 "
                 f"(추가 {m.get('duty_extra', 0)}). Ideal 미충족 {m.get('ideal_shortfall_total', 0)}, Ideal 초과 {m.get('over_ideal_total', 0)}."
             )
+            if m.get("de_refinement_completed"):
+                st.caption(
+                    "D/E 미세조정 완료 · 기존 Solver 품질점수는 그대로 유지하면서 "
+                    f"개인별 D/E 목표 편차 총합을 {m.get('individual_de_deviation_total', 0)}까지 줄였습니다."
+                )
             progress_points = m.get("search_progress", []) or []
             if m.get("early_stop_on_plateau") and progress_points:
                 with st.expander("📉 탐색 효율 보기", expanded=False):
@@ -4521,11 +4526,12 @@ with tab5:
                             "정체 기준 전에 최적화 단계가 끝났거나, 끝까지 점수/bound 개선이 이어졌습니다."
                         )
 
-                    stage_name = (
-                        "quality"
-                        if (progress_df["stage"] == "quality").any()
-                        else "placement"
-                    )
+                    if (progress_df["stage"] == "de_refine").any():
+                        stage_name = "de_refine"
+                    elif (progress_df["stage"] == "quality").any():
+                        stage_name = "quality"
+                    else:
+                        stage_name = "placement"
                     stage_df = (
                         progress_df[progress_df["stage"] == stage_name]
                         .copy()
@@ -4539,23 +4545,48 @@ with tab5:
                             "objective": "현재 최선 점수",
                             "best_bound": "최적 가능 경계",
                         }).set_index("초")
+                        stage_label = {
+                            "de_refine": "개인 D/E 편차 미세조정",
+                            "quality": "품질 최적화",
+                            "placement": "Ideal/분산 배치 최적화",
+                        }.get(stage_name, stage_name)
                         st.caption(
-                            ("품질 최적화" if stage_name == "quality" else "Ideal/분산 배치 최적화")
+                            stage_label
                             + " · 낮을수록 좋은 점수입니다. 선이 오래 평평하면 추가 탐색의 이득이 작아진 상태입니다."
                         )
                         st.line_chart(chart_df)
 
-                        if stage_name == "quality":
+                        if stage_name in ("quality", "de_refine"):
                             k_cols = [c for c in ["k", "k1", "k2", "k3", "k4"] if c in stage_df.columns]
-                            if k_cols:
-                                k_table = stage_df[["stage_seconds", "objective"] + k_cols].copy()
-                                k_table["k 단순합"] = k_table[k_cols].fillna(0).sum(axis=1)
-                                k_table = k_table.rename(columns={
+                            extra_cols = ["de_individual"] if "de_individual" in stage_df.columns else []
+                            if k_cols or extra_cols:
+                                cols = ["stage_seconds", "objective"] + extra_cols + k_cols
+                                detail_table = stage_df[cols].copy()
+                                if k_cols:
+                                    detail_table["k 단순합"] = detail_table[k_cols].fillna(0).sum(axis=1)
+                                rename_map = {
                                     "stage_seconds": "초",
-                                    "objective": "품질점수",
-                                })
+                                    "objective": (
+                                        "개인 D/E 편차 총합"
+                                        if stage_name == "de_refine"
+                                        else "품질점수"
+                                    ),
+                                    "de_individual": "개인 D/E 편차 총합",
+                                }
+                                detail_table = detail_table.rename(columns=rename_map)
+                                show_cols = ["초"]
+                                score_col = (
+                                    "개인 D/E 편차 총합"
+                                    if stage_name == "de_refine"
+                                    else "품질점수"
+                                )
+                                if score_col in detail_table.columns:
+                                    show_cols.append(score_col)
+                                if "k 단순합" in detail_table.columns:
+                                    show_cols.append("k 단순합")
+                                show_cols += [c for c in k_cols if c in detail_table.columns]
                                 st.dataframe(
-                                    k_table[["초", "품질점수", "k 단순합"] + k_cols],
+                                    detail_table.loc[:, list(dict.fromkeys(show_cols))],
                                     use_container_width=True,
                                     hide_index=True,
                                 )
@@ -4584,6 +4615,8 @@ with tab5:
                     f"| **최적 편차:** {m.get('best_adv', m.get('adv'))} "
                     f"| **허용 상한:** {m.get('allowed_adv', m.get('adv'))} "
                     f"| **balance penalty:** {m.get('balance_penalty', 'NA')} "
+                    f"| **개인 D/E 편차 총합:** {m.get('individual_de_deviation_total', 0)} "
+                    f"| **D/E 미세조정:** {m.get('de_refinement_status', 'SKIPPED')} "
                     f"{_side_metric('k D/E', 'k', 'k_low', 'k_high', 'weight_de_dev', 1)}"
                     f"{_side_metric('k1 휴일', 'k1', 'k1_low', 'k1_high', 'weight_holiday_dev', 3)}"
                     f"{_side_metric('k2 총근무', 'k2', 'k2_low', 'k2_high', 'weight_total_dev', 5)}"
