@@ -4150,7 +4150,7 @@ if st.session_state.get("trigger_solve"):
                     scheduler_module = importlib.util.module_from_spec(spec)
                     spec.loader.exec_module(scheduler_module)
 
-                    expected_scheduler_api = '2026-08-21-v12.16-de-refinement'
+                    expected_scheduler_api = '2026-08-21-v12.17-de-chart-fix'
                     actual_scheduler_api = getattr(scheduler_module, "SCHEDULER_API_VERSION", None)
                     if actual_scheduler_api != expected_scheduler_api:
                         raise ImportError(
@@ -4558,12 +4558,25 @@ with tab5:
 
                         if stage_name in ("quality", "de_refine"):
                             k_cols = [c for c in ["k", "k1", "k2", "k3", "k4"] if c in stage_df.columns]
-                            extra_cols = ["de_individual"] if "de_individual" in stage_df.columns else []
-                            if k_cols or extra_cols:
+
+                            # de_refine 단계에서는 objective 자체가 이미
+                            # individual_de_dev_total(개인 D/E 편차 총합)입니다.
+                            # 따라서 de_individual을 같은 표시명으로 한 번 더 넣으면
+                            # pandas/pyarrow에 중복 column name이 생깁니다.
+                            if stage_name == "de_refine":
+                                extra_cols = []
+                            else:
+                                extra_cols = ["de_individual"] if "de_individual" in stage_df.columns else []
+
+                            if k_cols or extra_cols or stage_name == "de_refine":
                                 cols = ["stage_seconds", "objective"] + extra_cols + k_cols
-                                detail_table = stage_df[cols].copy()
+                                # 원본 컬럼 단계에서도 중복을 방지합니다.
+                                cols = list(dict.fromkeys(cols))
+                                detail_table = stage_df.loc[:, cols].copy()
+
                                 if k_cols:
                                     detail_table["k 단순합"] = detail_table[k_cols].fillna(0).sum(axis=1)
+
                                 rename_map = {
                                     "stage_seconds": "초",
                                     "objective": (
@@ -4571,9 +4584,16 @@ with tab5:
                                         if stage_name == "de_refine"
                                         else "품질점수"
                                     ),
-                                    "de_individual": "개인 D/E 편차 총합",
                                 }
+                                if "de_individual" in detail_table.columns:
+                                    rename_map["de_individual"] = "개인 D/E 편차 총합"
+
                                 detail_table = detail_table.rename(columns=rename_map)
+
+                                # 마지막 안전장치: 향후 표시명 변경 시에도 pyarrow가
+                                # duplicate column 오류로 결과 화면 전체를 중단하지 않도록 합니다.
+                                detail_table = detail_table.loc[:, ~detail_table.columns.duplicated()].copy()
+
                                 show_cols = ["초"]
                                 score_col = (
                                     "개인 D/E 편차 총합"
@@ -4585,8 +4605,13 @@ with tab5:
                                 if "k 단순합" in detail_table.columns:
                                     show_cols.append("k 단순합")
                                 show_cols += [c for c in k_cols if c in detail_table.columns]
+                                show_cols = [
+                                    c for c in dict.fromkeys(show_cols)
+                                    if c in detail_table.columns
+                                ]
+
                                 st.dataframe(
-                                    detail_table.loc[:, list(dict.fromkeys(show_cols))],
+                                    detail_table.loc[:, show_cols],
                                     use_container_width=True,
                                     hide_index=True,
                                 )

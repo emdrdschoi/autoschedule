@@ -11,7 +11,7 @@ import time
 import threading
 from datetime import date, timedelta
 
-SCHEDULER_API_VERSION = '2026-08-21-v12.16-de-refinement'
+SCHEDULER_API_VERSION = '2026-08-21-v12.17-de-chart-fix'
 
 try:
     from ortools.sat.python import cp_model
