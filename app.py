@@ -2870,6 +2870,7 @@ def build_schedule_excel_bytes(
             search_progress_export = metric_row.pop("search_progress", []) or []
             plateau_events_export = metric_row.pop("plateau_stop_events", []) or []
             pd.DataFrame([metric_row]).to_excel(writer, sheet_name="Metrics", index=False)
+            stage_timeline_export = metric_row.pop("stage_timeline", []) or []
             if search_progress_export:
                 pd.DataFrame(search_progress_export).to_excel(
                     writer, sheet_name="SearchProgress", index=False
@@ -2877,6 +2878,10 @@ def build_schedule_excel_bytes(
             if plateau_events_export:
                 pd.DataFrame(plateau_events_export).to_excel(
                     writer, sheet_name="SearchStop", index=False
+                )
+            if stage_timeline_export:
+                pd.DataFrame(stage_timeline_export).to_excel(
+                    writer, sheet_name="SearchStages", index=False
                 )
     towrite.seek(0)
     return towrite.getvalue()
@@ -4150,7 +4155,7 @@ if st.session_state.get("trigger_solve"):
                     scheduler_module = importlib.util.module_from_spec(spec)
                     spec.loader.exec_module(scheduler_module)
 
-                    expected_scheduler_api = '2026-08-21-v12.17-de-chart-fix'
+                    expected_scheduler_api = '2026-08-21-v12.19-search-diagnostics'
                     actual_scheduler_api = getattr(scheduler_module, "SCHEDULER_API_VERSION", None)
                     if actual_scheduler_api != expected_scheduler_api:
                         raise ImportError(
@@ -4506,127 +4511,268 @@ with tab5:
             )
             if m.get("de_refinement_completed"):
                 st.caption(
-                    "D/E 미세조정 완료 · 기존 Solver 품질점수는 그대로 유지하면서 "
-                    f"개인별 D/E 목표 편차 총합을 {m.get('individual_de_deviation_total', 0)}까지 줄였습니다."
+                    "D/E 미세조정 완료 · 기존 Solver 품질을 악화시키지 않는 범위에서 "
+                    f"최종 실제 D/E 목표 편차 총합을 {m.get('actual_de_deviation_total', m.get('individual_de_deviation_total', 0))}까지 줄였습니다."
                 )
             progress_points = m.get("search_progress", []) or []
+            stage_timeline = m.get("stage_timeline", []) or []
+
+            if stage_timeline:
+                with st.expander("⏱ 탐색 단계별 시간 보기", expanded=False):
+                    timeline_df = pd.DataFrame(stage_timeline)
+                    label_map = {
+                        "feasibility": "1. Feasibility",
+                        "extra": "1. Extra 최소화",
+                        "placement": "2. Ideal/분산",
+                        "quality": "3. 기존 Quality",
+                        "de_refine": "4. D/E 미세조정",
+                    }
+                    reason_map = {
+                        "optimal_or_complete": "단계 완료/OPTIMAL",
+                        "time_limit": "할당시간 종료",
+                        "plateau": "정체 감지 조기종료",
+                    }
+
+                    timeline_view = timeline_df.copy()
+                    timeline_view["단계"] = timeline_view["stage"].map(label_map).fillna(timeline_view["stage"])
+                    timeline_view["시작(전체초)"] = pd.to_numeric(
+                        timeline_view.get("start_seconds"), errors="coerce"
+                    ).round(1)
+                    timeline_view["종료(전체초)"] = pd.to_numeric(
+                        timeline_view.get("end_seconds"), errors="coerce"
+                    ).round(1)
+                    timeline_view["사용시간(초)"] = pd.to_numeric(
+                        timeline_view.get("duration_seconds"), errors="coerce"
+                    ).round(1)
+                    timeline_view["종료 이유"] = timeline_view.get("stop_reason", "").map(
+                        reason_map
+                    ).fillna(timeline_view.get("stop_reason", ""))
+                    timeline_view["상태"] = timeline_view.get("status", "")
+                    if "final_objective" in timeline_view.columns:
+                        timeline_view["마지막 점수"] = pd.to_numeric(
+                            timeline_view["final_objective"], errors="coerce"
+                        )
+                    if "final_best_bound" in timeline_view.columns:
+                        timeline_view["마지막 bound"] = pd.to_numeric(
+                            timeline_view["final_best_bound"], errors="coerce"
+                        )
+                    if "final_gap_pct" in timeline_view.columns:
+                        timeline_view["남은 gap(%)"] = pd.to_numeric(
+                            timeline_view["final_gap_pct"], errors="coerce"
+                        ).round(2)
+
+                    visible_cols = [
+                        c for c in [
+                            "단계", "시작(전체초)", "종료(전체초)", "사용시간(초)",
+                            "상태", "종료 이유", "마지막 점수", "마지막 bound", "남은 gap(%)"
+                        ]
+                        if c in timeline_view.columns
+                    ]
+                    st.dataframe(
+                        timeline_view[visible_cols],
+                        use_container_width=True,
+                        hide_index=True,
+                    )
+
+                    if not timeline_view.empty:
+                        total_solver_elapsed = float(
+                            pd.to_numeric(
+                                timeline_df["end_seconds"], errors="coerce"
+                            ).max()
+                        )
+                        longest_idx = pd.to_numeric(
+                            timeline_df["duration_seconds"], errors="coerce"
+                        ).idxmax()
+                        longest_stage = label_map.get(
+                            timeline_df.loc[longest_idx, "stage"],
+                            timeline_df.loc[longest_idx, "stage"],
+                        )
+                        longest_sec = float(
+                            timeline_df.loc[longest_idx, "duration_seconds"]
+                        )
+                        st.info(
+                            f"CP-SAT 단계 기록 기준 총 약 {total_solver_elapsed:.1f}초. "
+                            f"가장 오래 걸린 단계는 **{longest_stage} ({longest_sec:.1f}초)** 입니다. "
+                            "다음 실행시간을 줄일 때는 마지막 단계만 보지 말고 이 표에서 시간을 가장 많이 쓰는 단계를 먼저 확인하세요."
+                        )
+
             if m.get("early_stop_on_plateau") and progress_points:
-                with st.expander("📉 탐색 효율 보기", expanded=False):
+                with st.expander("📉 탐색 효율 · Plateau 확인", expanded=False):
                     progress_df = pd.DataFrame(progress_points)
                     stop_events = m.get("plateau_stop_events", []) or []
 
                     if stop_events:
                         stop_text = " / ".join(
-                            f"{ev.get('stage')} 단계: 약 {ev.get('plateau_seconds')}초 정체 후 자동 종료"
+                            f"{ev.get('stage')} 단계: 전체 {ev.get('end_seconds', '?')}초 시점, "
+                            f"{ev.get('plateau_seconds')}초 정체 후 자동 종료"
                             for ev in stop_events
                         )
                         st.success(f"자동 조기 종료 · {stop_text}")
                     else:
                         st.caption(
-                            "정체 기준 전에 최적화 단계가 끝났거나, 끝까지 점수/bound 개선이 이어졌습니다."
+                            "이번 실행에서는 plateau 조기 종료가 발생하지 않았습니다. "
+                            "OPTIMAL/단계 완료 또는 할당시간 종료로 다음 단계로 넘어갔습니다."
                         )
 
-                    if (progress_df["stage"] == "de_refine").any():
-                        stage_name = "de_refine"
-                    elif (progress_df["stage"] == "quality").any():
-                        stage_name = "quality"
-                    else:
-                        stage_name = "placement"
+                    available_stages = [
+                        s for s in ["placement", "quality", "de_refine"]
+                        if (progress_df["stage"] == s).any()
+                    ]
+                    stage_label_map = {
+                        "placement": "2. Ideal/분산 배치",
+                        "quality": "3. 기존 Quality",
+                        "de_refine": "4. 개인 D/E 미세조정",
+                    }
+
+                    default_stage = (
+                        "de_refine"
+                        if "de_refine" in available_stages
+                        else available_stages[-1]
+                    )
+                    stage_name = st.selectbox(
+                        "그래프로 볼 단계",
+                        options=available_stages,
+                        index=available_stages.index(default_stage),
+                        format_func=lambda s: stage_label_map.get(s, s),
+                        key=f"search_progress_stage_{sol_idx}",
+                    )
+
                     stage_df = (
                         progress_df[progress_df["stage"] == stage_name]
                         .copy()
-                        .sort_values("stage_seconds")
+                        .sort_values("seconds")
                     )
 
                     if not stage_df.empty:
-                        chart_df = stage_df[["stage_seconds", "objective", "best_bound"]].copy()
+                        stage_tl = None
+                        if stage_timeline:
+                            for item in stage_timeline:
+                                if item.get("stage") == stage_name:
+                                    stage_tl = item
+                                    break
+
+                        if stage_tl:
+                            st.caption(
+                                f"{stage_label_map.get(stage_name, stage_name)} · "
+                                f"전체 {float(stage_tl.get('start_seconds', 0)):.1f}초에 시작 → "
+                                f"{float(stage_tl.get('end_seconds', 0)):.1f}초에 종료 "
+                                f"(단계 {float(stage_tl.get('duration_seconds', 0)):.1f}초) · "
+                                f"종료: {stage_tl.get('stop_reason', '')}"
+                            )
+
+                        # Full CP-SAT elapsed time on x-axis.
+                        chart_df = stage_df[["seconds", "objective", "best_bound"]].copy()
                         chart_df = chart_df.rename(columns={
-                            "stage_seconds": "초",
+                            "seconds": "전체 경과시간(초)",
                             "objective": "현재 최선 점수",
                             "best_bound": "최적 가능 경계",
-                        }).set_index("초")
-                        stage_label = {
-                            "de_refine": "개인 D/E 편차 미세조정",
-                            "quality": "품질 최적화",
-                            "placement": "Ideal/분산 배치 최적화",
-                        }.get(stage_name, stage_name)
-                        st.caption(
-                            stage_label
-                            + " · 낮을수록 좋은 점수입니다. 선이 오래 평평하면 추가 탐색의 이득이 작아진 상태입니다."
-                        )
+                        }).set_index("전체 경과시간(초)")
                         st.line_chart(chart_df)
 
-                        if stage_name in ("quality", "de_refine"):
-                            k_cols = [c for c in ["k", "k1", "k2", "k3", "k4"] if c in stage_df.columns]
+                        incumbent_rows = stage_df[
+                            stage_df.get("event", "").astype(str).eq("incumbent")
+                        ]
+                        bound_rows = stage_df[
+                            stage_df.get("event", "").astype(str).eq("bound")
+                        ]
 
-                            # de_refine 단계에서는 objective 자체가 이미
-                            # individual_de_dev_total(개인 D/E 편차 총합)입니다.
-                            # 따라서 de_individual을 같은 표시명으로 한 번 더 넣으면
-                            # pandas/pyarrow에 중복 column name이 생깁니다.
-                            if stage_name == "de_refine":
-                                extra_cols = []
-                            else:
-                                extra_cols = ["de_individual"] if "de_individual" in stage_df.columns else []
+                        if not incumbent_rows.empty:
+                            last_inc_total = float(incumbent_rows["seconds"].iloc[-1])
+                            last_inc_local = float(incumbent_rows["stage_seconds"].iloc[-1])
+                        else:
+                            last_inc_total = None
+                            last_inc_local = None
 
-                            if k_cols or extra_cols or stage_name == "de_refine":
-                                cols = ["stage_seconds", "objective"] + extra_cols + k_cols
-                                # 원본 컬럼 단계에서도 중복을 방지합니다.
-                                cols = list(dict.fromkeys(cols))
-                                detail_table = stage_df.loc[:, cols].copy()
+                        if not bound_rows.empty:
+                            last_bound_total = float(bound_rows["seconds"].iloc[-1])
+                            last_bound_local = float(bound_rows["stage_seconds"].iloc[-1])
+                        else:
+                            last_bound_total = None
+                            last_bound_local = None
 
-                                if k_cols:
-                                    detail_table["k 단순합"] = detail_table[k_cols].fillna(0).sum(axis=1)
+                        diag_bits = []
+                        if last_inc_total is not None:
+                            diag_bits.append(
+                                f"마지막 해 개선: 단계 {last_inc_local:.1f}초 / 전체 {last_inc_total:.1f}초"
+                            )
+                        if last_bound_total is not None:
+                            diag_bits.append(
+                                f"마지막 bound 개선: 단계 {last_bound_local:.1f}초 / 전체 {last_bound_total:.1f}초"
+                            )
+                        if diag_bits:
+                            st.info(" · ".join(diag_bits))
 
-                                rename_map = {
-                                    "stage_seconds": "초",
-                                    "objective": (
-                                        "개인 D/E 편차 총합"
-                                        if stage_name == "de_refine"
-                                        else "품질점수"
-                                    ),
-                                }
-                                if "de_individual" in detail_table.columns:
-                                    rename_map["de_individual"] = "개인 D/E 편차 총합"
-
-                                detail_table = detail_table.rename(columns=rename_map)
-
-                                # 마지막 안전장치: 향후 표시명 변경 시에도 pyarrow가
-                                # duplicate column 오류로 결과 화면 전체를 중단하지 않도록 합니다.
-                                detail_table = detail_table.loc[:, ~detail_table.columns.duplicated()].copy()
-
-                                show_cols = ["초"]
-                                score_col = (
-                                    "개인 D/E 편차 총합"
-                                    if stage_name == "de_refine"
-                                    else "품질점수"
-                                )
-                                if score_col in detail_table.columns:
-                                    show_cols.append(score_col)
-                                if "k 단순합" in detail_table.columns:
-                                    show_cols.append("k 단순합")
-                                show_cols += [c for c in k_cols if c in detail_table.columns]
-                                show_cols = [
-                                    c for c in dict.fromkeys(show_cols)
-                                    if c in detail_table.columns
-                                ]
-
-                                st.dataframe(
-                                    detail_table.loc[:, show_cols],
-                                    use_container_width=True,
-                                    hide_index=True,
-                                )
-
-                        first_t = float(stage_df["stage_seconds"].iloc[0])
-                        last_t = float(stage_df["stage_seconds"].iloc[-1])
-                        best_idx = stage_df["objective"].astype(float).idxmin()
-                        best_t = float(stage_df.loc[best_idx, "stage_seconds"])
-                        st.info(
-                            f"첫 개선 기록 {first_t:.1f}초 · 마지막 기록 {last_t:.1f}초 · "
-                            f"현재 최선 점수가 나온 시점 약 {best_t:.1f}초. "
-                            "최선 점수가 일찍 나온 뒤 오래 그대로였다면 다음 실행의 최대시간을 줄여볼 수 있습니다."
+                        # Detailed trace, including bound-only events.
+                        detail_cols = [
+                            c for c in [
+                                "seconds", "stage_seconds", "event",
+                                "objective", "best_bound",
+                                "de_individual", "k", "k1", "k2", "k3", "k4"
+                            ]
+                            if c in stage_df.columns
+                        ]
+                        detail_table = stage_df[detail_cols].copy()
+                        rename_map = {
+                            "seconds": "전체 경과초",
+                            "stage_seconds": "단계 내 초",
+                            "event": "변화",
+                            "objective": (
+                                "개인 D/E 편차 총합"
+                                if stage_name == "de_refine"
+                                else "현재 최선 점수"
+                            ),
+                            "best_bound": "best bound",
+                            "de_individual": "개인 D/E 편차 총합",
+                        }
+                        detail_table = detail_table.rename(columns=rename_map)
+                        detail_table = detail_table.loc[
+                            :, ~detail_table.columns.duplicated()
+                        ].copy()
+                        st.dataframe(
+                            detail_table,
+                            use_container_width=True,
+                            hide_index=True,
                         )
 
+                        # Practical interpretation for next-run time choice.
+                        if stage_tl:
+                            reason = str(stage_tl.get("stop_reason", ""))
+                            gap_pct = stage_tl.get("final_gap_pct", None)
+                            duration = float(stage_tl.get("duration_seconds", 0) or 0)
+
+                            if reason == "plateau":
+                                st.success(
+                                    f"이 단계는 {duration:.1f}초 사용 후 plateau로 끝났습니다. "
+                                    "비슷한 입력에서는 현재 최대 탐색시간을 더 늘려도 이 단계의 추가 이득은 크지 않을 가능성이 있습니다."
+                                )
+                            elif reason == "optimal_or_complete":
+                                st.success(
+                                    f"이 단계는 {duration:.1f}초 안에 완료/OPTIMAL 상태로 끝났습니다. "
+                                    "이 단계 때문에 전체 최대시간을 더 늘릴 필요는 크지 않습니다."
+                                )
+                            elif reason == "time_limit":
+                                if gap_pct is not None and pd.notna(gap_pct):
+                                    st.warning(
+                                        f"이 단계는 할당시간을 다 사용했습니다. 종료 시 objective-bound gap이 약 {float(gap_pct):.2f}%였습니다. "
+                                        "마지막까지 incumbent 또는 bound가 움직였다면 더 긴 시간이 실제로 도움이 될 수 있습니다."
+                                    )
+                                else:
+                                    st.warning(
+                                        "이 단계는 할당시간을 다 사용했습니다. "
+                                        "그래프의 마지막 개선 시점을 보고 다음 실행시간을 늘릴지 판단하세요."
+                                    )
+
             with st.expander("고급 정보 · Solver 점수 보기", expanded=False):
+                actual_k = m.get("actual_k", m.get("k", 0))
+                actual_k1 = m.get("actual_k1", m.get("k1", 0))
+                actual_k2 = m.get("actual_k2", m.get("k2", 0))
+                actual_k3 = m.get("actual_k3", m.get("k3", 0))
+                actual_k4 = m.get("actual_k4", m.get("k4", 0))
+                actual_junior_excess = m.get("actual_junior_excess", m.get("junior_excess", 0))
+                actual_junior_penalty = m.get("actual_junior_penalty", m.get("junior_penalty", 0))
+                actual_balance_penalty = m.get("actual_balance_penalty", m.get("balance_penalty", "NA"))
+                actual_adv = m.get("actual_adv", m.get("adv"))
+
                 st.markdown(
                     f"<div style='font-size:0.85rem; color:var(--text-dim);'>"
                     f"** 추가배정:** {m.get('duty_extra', 0)}개 "
@@ -4636,23 +4782,27 @@ with tab5:
                     f"| **배치선호 점수:** {m.get('placement_penalty', 0)} "
                     f"(Ideal×{m.get('ideal_placement_weight', 3)}, 날짜분산×{m.get('date_spread_weight', 2)}, duty분산×{m.get('duty_cell_spread_weight', 1)}) "
                     f"| **추가배정 날짜:** {m.get('days_with_extra', 0)}일 · 일최대 {m.get('max_day_extra', 0)} "
-                    f"| ** 편차*가중치 합={m.get('adv')} "
-                    f"| **최적 편차:** {m.get('best_adv', m.get('adv'))} "
-                    f"| **허용 상한:** {m.get('allowed_adv', m.get('adv'))} "
-                    f"| **balance penalty:** {m.get('balance_penalty', 'NA')} "
-                    f"| **개인 D/E 편차 총합:** {m.get('individual_de_deviation_total', 0)} "
+                    f"| **최종 실제 편차*가중치 합:** {actual_adv} "
+                    f"| **Quality 단계 내부 점수:** {m.get('adv')} "
+                    f"| **최종 실제 balance penalty:** {actual_balance_penalty} "
+                    f"| **개인 D/E 편차 총합:** {m.get('actual_de_deviation_total', m.get('individual_de_deviation_total', 0))} "
                     f"| **D/E 미세조정:** {m.get('de_refinement_status', 'SKIPPED')} "
-                    f"{_side_metric('k D/E', 'k', 'k_low', 'k_high', 'weight_de_dev', 1)}"
-                    f"{_side_metric('k1 휴일', 'k1', 'k1_low', 'k1_high', 'weight_holiday_dev', 3)}"
-                    f"{_side_metric('k2 총근무', 'k2', 'k2_low', 'k2_high', 'weight_total_dev', 5)}"
-                    f"{_side_metric('k3 N', 'k3', 'k3_low', 'k3_high', 'weight_n_dev', 5)}"
-                    f"| **k4 Grade편차:** {m.get('k4', 0)} (실제±{round(m.get('k4',0)/10,1)})×{m.get('weight_grade_dev', gr.get('weight_grade_dev', 3))} "
-                    f"| **저년차 초과:** {m.get('junior_excess', 0)}×{m.get('junior_penalty_weight', gr.get('junior_penalty_weight', 1))} "
-                    f"= **{m.get('junior_penalty', 0)}** "
+                    f"| **실제 D/E 편차:** ↓{m.get('actual_k_low', m.get('k_low', 0))}+↑{m.get('actual_k_high', m.get('k_high', 0))}={actual_k}×{m.get('weight_de_dev', gr.get('weight_de_dev', 1))} "
+                    f"| **실제 휴일 편차:** ↓{m.get('actual_k1_low', m.get('k1_low', 0))}+↑{m.get('actual_k1_high', m.get('k1_high', 0))}={actual_k1}×{m.get('weight_holiday_dev', gr.get('weight_holiday_dev', 3))} "
+                    f"| **실제 총근무 편차:** ↓{m.get('actual_k2_low', m.get('k2_low', 0))}+↑{m.get('actual_k2_high', m.get('k2_high', 0))}={actual_k2}×{m.get('weight_total_dev', gr.get('weight_total_dev', 5))} "
+                    f"| **실제 N 편차:** ↓{m.get('actual_k3_low', m.get('k3_low', 0))}+↑{m.get('actual_k3_high', m.get('k3_high', 0))}={actual_k3}×{m.get('weight_n_dev', gr.get('weight_n_dev', 5))} "
+                    f"| **실제 Grade편차:** {actual_k4} (±{round(actual_k4/10,1)})×{m.get('weight_grade_dev', gr.get('weight_grade_dev', 3))} "
+                    f"| **실제 저년차 초과:** {actual_junior_excess}×{m.get('junior_penalty_weight', gr.get('junior_penalty_weight', 1))} "
+                    f"= **{actual_junior_penalty}** "
                     f"| **초저년차 필수 제한:** grade≤{m.get('ultra_junior_max_grade', gr.get('ultra_junior_max_grade', 1))}, "
                     f"최대 {m.get('ultra_junior_max_count', gr.get('ultra_junior_max_count', 0))}명 허용</div>",
                     unsafe_allow_html=True
                 )
+                if m.get("de_refinement_completed"):
+                    st.caption(
+                        "※ `Quality 단계 내부 점수`의 k 계열은 이전 최적화 단계에서 사용한 보조변수 값입니다. "
+                        "마지막 D/E 미세조정 후의 상태를 판단할 때는 위의 **최종 실제 편차** 값을 보세요."
+                    )
 
         st.divider()
 

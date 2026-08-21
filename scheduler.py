@@ -11,7 +11,7 @@ import time
 import threading
 from datetime import date, timedelta
 
-SCHEDULER_API_VERSION = '2026-08-21-v12.17-de-chart-fix'
+SCHEDULER_API_VERSION = '2026-08-21-v12.19-search-diagnostics'
 
 try:
     from ortools.sat.python import cp_model
@@ -1953,6 +1953,12 @@ def build_and_solve(params: dict[str, Any]):
     individual_de_dev_terms = []
     individual_de_dev_by_doc = {}
 
+    # Keep expressions so final displayed metrics can be recomputed directly from
+    # the selected assignment rather than from soft auxiliary slack variables.
+    person_shift_count_exprs = {}
+    person_total_exprs = {}
+    person_holiday_exprs = {}
+
     for n in all_doctors:
         sc      = shift_counts.get(n, {})
         fixed_d = sc.get("D", -1)
@@ -1968,6 +1974,10 @@ def build_and_solve(params: dict[str, Any]):
         num_s = [sum(shifts[(n,d,s)] for d in all_days) for s in all_shifts]
         num_total = sum(num_s)
         hol_worked = sum(shifts[(n,d,s)] for d in holiday for s in all_shifts)
+
+        person_shift_count_exprs[n] = num_s
+        person_total_exprs[n] = num_total
+        person_holiday_exprs[n] = hol_worked
 
         # Individual D/E deviation from this nurse's own workload-scaled target.
         # A fractional target such as D=6.4 treats 6~7 as the zero-penalty interval.
@@ -2196,6 +2206,7 @@ def build_and_solve(params: dict[str, Any]):
 
     search_progress: list[dict[str, Any]] = []
     plateau_stop_events: list[dict[str, Any]] = []
+    stage_timeline: list[dict[str, Any]] = []
 
     def _solver_stop_async(solver_obj):
         try:
@@ -2215,24 +2226,99 @@ def build_and_solve(params: dict[str, Any]):
         value_exprs: dict[str, Any] | None = None,
         monitor_enabled: bool = False,
     ):
-        """Solve a soft-optimization stage with optional plateau auto-stop.
+        """Solve one stage and record exact total-time diagnostics.
 
-        Plateau is declared only after a feasible solution exists and neither
-        incumbent objective nor best bound improves for plateau_seconds.
+        When monitor_enabled=True, optional plateau stopping is based on BOTH:
+        - incumbent objective improvement, and
+        - best-bound improvement (when supported by this OR-Tools version).
+
+        Progress rows include incumbent improvements AND throttled bound-only
+        improvements, so the graph does not look falsely flat while CP-SAT is
+        still proving a better bound.
         """
-        if not monitor_enabled:
-            return solver_obj.Solve(model)
-
         stage_started = time.monotonic()
+        stage_start_total = stage_started - solve_started_at
+
+        # Low-overhead path: still record stage duration/status, but no callbacks.
+        if not monitor_enabled:
+            status_code = solver_obj.Solve(model)
+            stage_end = time.monotonic()
+            try:
+                final_obj = float(solver_obj.ObjectiveValue())
+            except Exception:
+                final_obj = None
+            try:
+                final_bound = float(solver_obj.BestObjectiveBound())
+            except Exception:
+                final_bound = None
+            status_name = _status_name(solver_obj, status_code)
+            stage_timeline.append({
+                "stage": stage,
+                "start_seconds": round(stage_start_total, 3),
+                "end_seconds": round(stage_end - solve_started_at, 3),
+                "duration_seconds": round(stage_end - stage_started, 3),
+                "status": status_name,
+                "stop_reason": (
+                    "optimal_or_complete"
+                    if status_code == cp_model.OPTIMAL
+                    else "time_or_solver_stop"
+                    if status_code == cp_model.FEASIBLE
+                    else status_name.lower()
+                ),
+                "final_objective": final_obj,
+                "final_best_bound": final_bound,
+                "bound_monitor_available": False,
+            })
+            return status_code
+
         lock = threading.Lock()
         done_event = threading.Event()
+        bound_monitor_available = hasattr(solver_obj, "best_bound_callback")
         state = {
             "has_solution": False,
             "best_obj": None,
             "best_bound": None,
-            "last_progress_time": stage_started,
+            "last_incumbent_time": None,
+            "last_bound_time": None,
+            "last_progress_record_time": stage_started,
             "stopped_for_plateau": False,
         }
+
+        def _append_progress(
+            *,
+            event: str,
+            now: float,
+            obj,
+            bound,
+            callback_obj=None,
+            force: bool = False,
+        ):
+            """Append a compact trace row.
+
+            Bound-only events are throttled to at most ~1 row/sec to avoid
+            large logs on long runs.
+            """
+            with lock:
+                last_record = float(state["last_progress_record_time"])
+                if not force and event == "bound" and (now - last_record) < 1.0:
+                    return
+                state["last_progress_record_time"] = now
+
+            point = {
+                "stage": stage,
+                "event": event,
+                "seconds": round(now - solve_started_at, 3),
+                "stage_seconds": round(now - stage_started, 3),
+                "objective": obj,
+                "best_bound": bound,
+            }
+            if callback_obj is not None and value_exprs:
+                for key, expr in value_exprs.items():
+                    try:
+                        point[key] = int(callback_obj.Value(expr))
+                    except Exception:
+                        point[key] = None
+            search_progress.append(point)
 
         class _ProgressCallback(cp_model.CpSolverSolutionCallback):
             def on_solution_callback(self):
@@ -2247,71 +2333,109 @@ def build_and_solve(params: dict[str, Any]):
                     bound = None
 
                 incumbent_improved = False
+                bound_improved = False
                 with lock:
                     state["has_solution"] = True
+
                     if obj is not None and (
                         state["best_obj"] is None or obj < state["best_obj"] - 1e-9
                     ):
                         state["best_obj"] = obj
-                        state["last_progress_time"] = now
+                        state["last_incumbent_time"] = now
                         incumbent_improved = True
+
                     if bound is not None and (
                         state["best_bound"] is None or bound > state["best_bound"] + 1e-9
                     ):
                         state["best_bound"] = bound
-                        state["last_progress_time"] = now
+                        state["last_bound_time"] = now
+                        bound_improved = True
 
-                # Keep the trace light: record only actual incumbent improvements.
                 if incumbent_improved:
-                    point = {
-                        "stage": stage,
-                        "seconds": round(time.monotonic() - solve_started_at, 3),
-                        "stage_seconds": round(now - stage_started, 3),
-                        "objective": obj,
-                        "best_bound": bound,
-                    }
-                    if value_exprs:
-                        for key, expr in value_exprs.items():
-                            try:
-                                point[key] = int(self.Value(expr))
-                            except Exception:
-                                point[key] = None
-                    search_progress.append(point)
+                    _append_progress(
+                        event="incumbent",
+                        now=now,
+                        obj=obj,
+                        bound=bound,
+                        callback_obj=self,
+                        force=True,
+                    )
+                elif bound_improved:
+                    _append_progress(
+                        event="bound",
+                        now=now,
+                        obj=state["best_obj"],
+                        bound=bound,
+                        callback_obj=None,
+                    )
 
         callback = _ProgressCallback()
 
-        # Best-bound progress prevents premature stopping while the solver is
-        # still proving that the incumbent is close to optimal.
-        if hasattr(solver_obj, "best_bound_callback"):
+        if bound_monitor_available:
             def _best_bound_callback(bound_value):
                 now = time.monotonic()
                 try:
                     bound = float(bound_value)
                 except Exception:
                     return
+
+                improved = False
                 with lock:
-                    if state["best_bound"] is None or bound > state["best_bound"] + 1e-9:
+                    if (
+                        state["best_bound"] is None
+                        or bound > state["best_bound"] + 1e-9
+                    ):
                         state["best_bound"] = bound
-                        state["last_progress_time"] = now
+                        state["last_bound_time"] = now
+                        improved = True
+                    current_obj = state["best_obj"]
+
+                if improved:
+                    _append_progress(
+                        event="bound",
+                        now=now,
+                        obj=current_obj,
+                        bound=bound,
+                        callback_obj=None,
+                    )
+
             try:
                 solver_obj.best_bound_callback = _best_bound_callback
             except Exception:
-                pass
+                bound_monitor_available = False
 
         def _watchdog():
             while not done_event.wait(0.5):
                 now = time.monotonic()
                 with lock:
                     has_solution = bool(state["has_solution"])
-                    stagnant_for = now - float(state["last_progress_time"])
-                stage_elapsed = now - stage_started
+                    last_inc = state["last_incumbent_time"]
+                    last_bound = state["last_bound_time"]
 
-                # Never interrupt feasibility search. Stop only after a feasible
-                # incumbent exists and the optimization itself has stalled.
+                if not has_solution:
+                    continue
+
+                stage_elapsed = now - stage_started
+                incumbent_stale = (
+                    last_inc is not None
+                    and (now - float(last_inc)) >= plateau_seconds
+                )
+
+                if bound_monitor_available:
+                    # If no bound event has been observed yet, do not call it a
+                    # two-signal plateau. Be conservative and keep searching.
+                    bound_stale = (
+                        last_bound is not None
+                        and (now - float(last_bound)) >= plateau_seconds
+                    )
+                else:
+                    # Older OR-Tools: degrade gracefully to incumbent-only plateau.
+                    bound_stale = True
+
                 if (
-                    has_solution
-                    and stage_elapsed >= plateau_min_runtime
-                    and stagnant_for >= plateau_seconds
+                    stage_elapsed >= plateau_min_runtime
+                    and incumbent_stale
+                    and bound_stale
                 ):
                     with lock:
                         state["stopped_for_plateau"] = True
@@ -2330,44 +2454,75 @@ def build_and_solve(params: dict[str, Any]):
             done_event.set()
             watchdog.join(timeout=1.0)
 
+        stage_end = time.monotonic()
+
+        try:
+            final_obj = float(solver_obj.ObjectiveValue())
+        except Exception:
+            final_obj = state["best_obj"]
+        try:
+            final_bound = float(solver_obj.BestObjectiveBound())
+        except Exception:
+            final_bound = state["best_bound"]
+
+        if state["has_solution"]:
+            _append_progress(
+                event="final",
+                now=stage_end,
+                obj=final_obj,
+                bound=final_bound,
+                callback_obj=None,
+                force=True,
+            )
+
+        status_name = _status_name(solver_obj, status_code)
+
         if state["stopped_for_plateau"]:
+            stop_reason = "plateau"
             plateau_stop_events.append({
                 "stage": stage,
-                "stage_seconds": round(time.monotonic() - stage_started, 2),
+                "start_seconds": round(stage_start_total, 2),
+                "end_seconds": round(stage_end - solve_started_at, 2),
+                "stage_seconds": round(stage_end - stage_started, 2),
                 "plateau_seconds": plateau_seconds,
                 "best_objective": state["best_obj"],
                 "best_bound": state["best_bound"],
+                "bound_monitor_available": bound_monitor_available,
             })
+        elif status_code == cp_model.OPTIMAL:
+            stop_reason = "optimal_or_complete"
+        elif status_code == cp_model.FEASIBLE:
+            stop_reason = "time_limit"
+        else:
+            stop_reason = status_name.lower()
 
-        # Capture the final incumbent for the chart/table.
-        if state["has_solution"]:
+        gap_abs = None
+        gap_pct = None
+        if final_obj is not None and final_bound is not None:
             try:
-                final_obj = float(solver_obj.ObjectiveValue())
+                gap_abs = max(0.0, float(final_obj) - float(final_bound))
+                gap_pct = (
+                    0.0
+                    if gap_abs == 0
+                    else 100.0 * gap_abs / max(1.0, abs(float(final_obj)))
+                )
             except Exception:
-                final_obj = state["best_obj"]
-            try:
-                final_bound = float(solver_obj.BestObjectiveBound())
-            except Exception:
-                final_bound = state["best_bound"]
-            point = {
-                "stage": stage,
-                "seconds": round(time.monotonic() - solve_started_at, 3),
-                "stage_seconds": round(time.monotonic() - stage_started, 3),
-                "objective": final_obj,
-                "best_bound": final_bound,
-                "final": True,
-            }
-            if value_exprs:
-                for key, expr in value_exprs.items():
-                    try:
-                        point[key] = int(solver_obj.Value(expr))
-                    except Exception:
-                        point[key] = None
-            if not search_progress or any(
-                search_progress[-1].get(k) != point.get(k)
-                for k in ("stage", "objective", "best_bound", "de_individual", "k", "k1", "k2", "k3", "k4")
-            ):
-                search_progress.append(point)
+                gap_abs = None
+                gap_pct = None
+
+        stage_timeline.append({
+            "stage": stage,
+            "start_seconds": round(stage_start_total, 3),
+            "end_seconds": round(stage_end - solve_started_at, 3),
+            "duration_seconds": round(stage_end - stage_started, 3),
+            "status": status_name,
+            "stop_reason": stop_reason,
+            "final_objective": final_obj,
+            "final_best_bound": final_bound,
+            "final_gap": gap_abs,
+            "final_gap_pct": gap_pct,
+            "bound_monitor_available": bound_monitor_available,
+        })
 
         return status_code
 
@@ -2432,7 +2587,11 @@ def build_and_solve(params: dict[str, Any]):
     phase1_fraction = 0.50 if all_totals_fixed else 0.40
     phase1_limit = max(1.0, min(_remaining_time(), total_time_budget * phase1_fraction))
     phase1_solver = _new_solver(phase1_limit)
-    phase1_status = phase1_solver.Solve(model)
+    phase1_status = _solve_monitored(
+        phase1_solver,
+        stage=("feasibility" if all_totals_fixed else "extra"),
+        monitor_enabled=False,
+    )
 
     if not _is_solution_status(phase1_status):
         _raise_primary_failure(phase1_label, phase1_solver, phase1_status)
@@ -2538,8 +2697,8 @@ def build_and_solve(params: dict[str, Any]):
 
     # ── Phase 4: individual D/E deviation SUM refinement ────────────────────
     # IMPORTANT: adv is fixed to the best Phase-3 value first.  Therefore this
-    # phase can only choose a more even D/E solution among schedules with the same
-    # existing quality score; it cannot sacrifice k/N/holiday/grade/junior quality.
+    # phase can only choose a more even D/E solution without worsening the existing
+    # quality score; it cannot sacrifice k/N/holiday/grade/junior quality.
     de_refine_solver = None
     de_refine_status = None
     de_refine_status_name = "SKIPPED"
@@ -2554,7 +2713,9 @@ def build_and_solve(params: dict[str, Any]):
         and individual_de_dev_terms
         and _remaining_time() >= 0.50
     ):
-        model.Add(adv == int(best_quality_adv))
+        # Do not worsen the incumbent Quality score, but allow the D/E refinement
+        # to discover a schedule whose true quality is even better.
+        model.Add(adv <= int(best_quality_adv))
         _clear_objective()
         model.Minimize(individual_de_dev_total)
 
@@ -2589,7 +2750,132 @@ def build_and_solve(params: dict[str, Any]):
     best_adv = final_solver.Value(adv)
     allowed_adv = best_adv + adv_limit if is_multi else best_adv
 
+    def _actual_final_quality(value_fn):
+        """Recompute final quality components from the actual assignment.
+
+        Soft auxiliary variables (k/dev/excess) are guaranteed to be tight while
+        their own objective is being minimized, but a later lexicographic phase can
+        leave them with harmless slack.  User-facing final metrics should therefore
+        be derived from the schedule itself.
+        """
+        de_low = de_high = 0
+        hol_low = hol_high = 0
+        total_low = total_high = 0
+        n_low = n_high = 0
+        de_sum = 0
+
+        for n in all_doctors:
+            sc = shift_counts.get(n, {})
+            counts = [
+                int(value_fn(person_shift_count_exprs[n][s]))
+                for s in all_shifts
+            ]
+
+            # D/E: fixed D or E is an explicit instruction and is excluded from
+            # fairness deviation, matching the model semantics.
+            for s, sk in ((0, "D"), (1, "E")):
+                if int(sc.get(sk, -1)) >= 0:
+                    continue
+                low_target = int(person_shift_targets[n][s])
+                high_target = _max_avr(person_shift_targets[n][s])
+                low_dev = max(0, low_target - counts[s])
+                high_dev = max(0, counts[s] - high_target)
+                de_low = max(de_low, low_dev)
+                de_high = max(de_high, high_dev)
+                de_sum += low_dev + high_dev
+
+            # N
+            if int(sc.get("N", -1)) < 0:
+                low_target = int(person_shift_targets[n][2])
+                high_target = _max_avr(person_shift_targets[n][2])
+                n_low = max(n_low, max(0, low_target - counts[2]))
+                n_high = max(n_high, max(0, counts[2] - high_target))
+
+            # Total
+            if int(sc.get("Total", -1)) < 0:
+                actual_total = int(value_fn(person_total_exprs[n]))
+                low_target = int(balance_total_target[n])
+                high_target = _max_avr(balance_total_target[n])
+                total_low = max(total_low, max(0, low_target - actual_total))
+                total_high = max(total_high, max(0, actual_total - high_target))
+
+            # Holiday
+            actual_holiday = int(value_fn(person_holiday_exprs[n]))
+            low_target = int(person_holiday_target[n])
+            high_target = _max_avr(person_holiday_target[n])
+            hol_low = max(hol_low, max(0, low_target - actual_holiday))
+            hol_high = max(hol_high, max(0, actual_holiday - high_target))
+
+        # Grade maximum deviation from actual duty composition.
+        actual_k4 = 0
+        if weight_grade_dev > 0 and num_doctors > 0:
+            for d in all_days:
+                for s in all_shifts:
+                    if duty_requests[d][s] <= 0:
+                        continue
+                    actual_count = int(value_fn(duty_count_vars[(d, s)]))
+                    grade_sum_10 = sum(
+                        int(value_fn(shifts[(n, d, s)])) * grades.get(n, 2) * 10
+                        for n in all_doctors
+                    )
+                    actual_k4 = max(
+                        actual_k4,
+                        abs(grade_sum_10 - avr_grade_10 * actual_count),
+                    )
+
+        # Junior excess from actual duty composition.
+        actual_junior_excess = 0
+        if junior_penalty_weight > 0 and junior_doctors:
+            for d in all_days:
+                for s in all_shifts:
+                    if duty_requests[d][s] <= 0:
+                        continue
+                    junior_count = sum(
+                        int(value_fn(shifts[(n, d, s)]))
+                        for n in junior_doctors
+                    )
+                    actual_junior_excess += max(
+                        0, junior_count - junior_soft_max_count
+                    )
+
+        actual_k = de_low + de_high
+        actual_k1 = hol_low + hol_high
+        actual_k2 = total_low + total_high
+        actual_k3 = n_low + n_high
+
+        actual_balance_penalty = (
+            actual_k * weight_de_dev
+            + actual_k1 * weight_holiday_dev
+            + actual_k2 * weight_total_dev
+            + actual_k3 * weight_n_dev
+            + actual_k4 * weight_grade_dev
+        )
+        actual_junior_penalty = actual_junior_excess * junior_penalty_weight
+        actual_adv = actual_balance_penalty + actual_junior_penalty
+
+        return {
+            "actual_k": actual_k,
+            "actual_k_low": de_low,
+            "actual_k_high": de_high,
+            "actual_k1": actual_k1,
+            "actual_k1_low": hol_low,
+            "actual_k1_high": hol_high,
+            "actual_k2": actual_k2,
+            "actual_k2_low": total_low,
+            "actual_k2_high": total_high,
+            "actual_k3": actual_k3,
+            "actual_k3_low": n_low,
+            "actual_k3_high": n_high,
+            "actual_k4": actual_k4,
+            "actual_de_deviation_total": de_sum,
+            "actual_junior_excess": actual_junior_excess,
+            "actual_junior_penalty": actual_junior_penalty,
+            "actual_balance_penalty": actual_balance_penalty,
+            "actual_adv": actual_adv,
+        }
+
     def _metric_dict(value_fn):
+        actual_quality = _actual_final_quality(value_fn)
         return {
             "adv": value_fn(adv),
             "duty_extra": value_fn(duty_extra_total) if duty_extra_vars else 0,
@@ -2667,6 +2953,8 @@ def build_and_solve(params: dict[str, Any]):
             "plateau_min_runtime": plateau_min_runtime,
             "plateau_stop_events": list(plateau_stop_events),
             "search_progress": list(search_progress),
+            "stage_timeline": list(stage_timeline),
+            **actual_quality,
         }
 
     if not is_multi:
