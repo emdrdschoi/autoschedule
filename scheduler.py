@@ -11,7 +11,7 @@ import time
 import threading
 from datetime import date, timedelta
 
-SCHEDULER_API_VERSION = '2026-08-21-v12.19-search-diagnostics'
+SCHEDULER_API_VERSION = '2026-08-28-v12.21-dynamic-teams'
 
 try:
     from ortools.sat.python import cp_model
@@ -1075,6 +1075,7 @@ def build_and_solve(params: dict[str, Any]):
         maximum_total : dict {str(n) -> -1|int}; -1 = no total maximum
         maximum_N     : dict {str(n) -> -1|int}; -1 = no Night maximum
         grades        : dict {str(n) -> int}
+        teams         : optional dict {str(n) -> nonnegative int}; 0=unused/unassigned
         grade_rules   : dict with senior/junior policy
         solver_mode   : str
         time_max      : int
@@ -1115,6 +1116,14 @@ def build_and_solve(params: dict[str, Any]):
             sc.setdefault(sk, -1)
         shift_counts[int(k)] = sc
     grades       = {int(k): int(v) for k, v in params.get("grades", {}).items()}
+    teams_raw = params.get("teams", {}) or {}
+    teams = {}
+    for k, v in teams_raw.items():
+        try:
+            team_val = int(v)
+        except (TypeError, ValueError):
+            team_val = 0
+        teams[int(k)] = team_val if team_val > 0 else 0
     grade_rules_raw = params.get("grade_rules", {}) or {}
     default_grade_rules = {
         "senior_min_grade": 2,
@@ -1199,6 +1208,19 @@ def build_and_solve(params: dict[str, Any]):
     ultra_junior_doctors = [n for n in all_doctors if grades.get(n, 2) <= ultra_junior_max_grade]
     non_ultra_junior_doctors = [n for n in all_doctors if n not in ultra_junior_doctors]
 
+    # Optional ward multi-team mode.
+    # It is OFF unless at least two distinct positive Team IDs have members,
+    # so legacy/ER schedules are unchanged.
+    for n in all_doctors:
+        teams.setdefault(n, 0)
+    active_team_ids = sorted({teams.get(n, 0) for n in all_doctors if teams.get(n, 0) > 0})
+    team_doctors = {
+        team_id: [n for n in all_doctors if teams.get(n, 0) == team_id]
+        for team_id in active_team_ids
+    }
+    team_count = len(active_team_ids)
+    team_mode_enabled = team_count >= 2
+
     day_names_list = [_get_day_label(start_date, d) for d in all_days]
 
     # duty_requests[d][s] are HARD minimums.
@@ -1256,6 +1278,27 @@ def build_and_solve(params: dict[str, Any]):
                         f"한 duty에 최대 {ultra_junior_max_count}명까지만 허용되도록 설정되어 있습니다. "
                         f"현재 조건에서는 이 duty에 최대 {max_possible_staff}명까지만 배정 가능합니다."
                     )
+
+    # Validate optional multi-team hard rule at the global pool level.
+    # If there are T active teams and Minimal=m:
+    # each active team contributes at least floor(m/T); remainder is unrestricted alpha.
+    # e.g. T=3: m=3 -> 1/1/1, m=4 -> 1/1/1 + alpha, m=6 -> 2/2/2.
+    if team_mode_enabled:
+        for d in all_days:
+            for s in all_shifts:
+                requested_min = int(duty_requests[d][s])
+                team_min = requested_min // team_count
+                if team_min <= 0:
+                    continue
+                for team_id in active_team_ids:
+                    members = team_doctors[team_id]
+                    if len(members) < team_min:
+                        raise RuntimeError(
+                            f"Team hard rule 불가능: day {d+1}, shift {['D','E','N'][s]} "
+                            f"Minimal={requested_min}, 활성 Team={team_count}개이므로 "
+                            f"{team_id}팀 최소 {team_min}명이 필요하지만 "
+                            f"{team_id}팀 전체 인원은 {len(members)}명입니다."
+                        )
 
     # shift_requests[n][d][s] = 1 if doctor n cannot work shift s on day d
     shift_requests  = [[[0]*3 for _ in all_days] for _ in all_doctors]
@@ -1848,6 +1891,30 @@ def build_and_solve(params: dict[str, Any]):
         duty_concentration_vars.append(conc)
     duty_concentration_total = sum(duty_concentration_vars) if duty_concentration_vars else 0
 
+    # ── Optional ward dynamic multi-Team hard coverage ─────────────────────
+    # Uses Minimal staffing, not Ideal/actual overstaffing.
+    # Let T = number of active teams:
+    #   each active Team >= floor(Minimal / T)
+    #   remainder ("alpha") can be from any Team or unassigned staff.
+    #
+    # Examples:
+    #   T=3, Minimal 3 -> 1/1/1
+    #   T=3, Minimal 4 -> 1/1/1 + alpha
+    #   T=3, Minimal 6 -> 2/2/2
+    #   T=4, Minimal 4 -> 1/1/1/1
+    #   T=4, Minimal 5 -> 1/1/1/1 + alpha
+    # If fewer than two teams are active, this entire rule is disabled.
+    if team_mode_enabled:
+        for d in all_days:
+            for s in all_shifts:
+                requested_min = int(duty_requests[d][s])
+                team_min = requested_min // team_count
+                if requested_min > 0 and team_min > 0:
+                    for team_id in active_team_ids:
+                        model.Add(
+                            sum(shifts[(n, d, s)] for n in team_doctors[team_id]) >= team_min
+                        )
+
     # Grade hard rule: each active duty must include enough senior doctors.
     if senior_min_count > 0:
         for d in all_days:
@@ -2178,6 +2245,7 @@ def build_and_solve(params: dict[str, Any]):
             rows.append({
                 'Name': names[n],
                 'Grade': grades.get(n, 2),
+                'Team': (f"{teams.get(n, 0)}팀" if teams.get(n, 0) > 0 else '미지정'),
                 'Senior': 'Y' if grades.get(n, 2) >= senior_min_grade else '',
                 'Junior': 'Y' if grades.get(n, 2) <= junior_max_grade else '',
                 '초저년차': 'Y' if grades.get(n, 2) <= ultra_junior_max_grade else '',
@@ -2916,6 +2984,14 @@ def build_and_solve(params: dict[str, Any]):
             "k4": value_fn(k4),
             "junior_excess": value_fn(junior_excess_total) if junior_excess_vars else 0,
             "junior_penalty": value_fn(junior_penalty) if junior_excess_vars else 0,
+            "team_mode_enabled": bool(team_mode_enabled),
+            "active_team_ids": list(active_team_ids),
+            "team_count": int(team_count),
+            "team_counts": {str(team_id): len(team_doctors[team_id]) for team_id in active_team_ids},
+            "team_rule": (
+                f"each active team >= floor(Minimal/{team_count})"
+                if team_mode_enabled else "disabled"
+            ),
             "senior_min_grade": senior_min_grade,
             "senior_min_count": senior_min_count,
             "junior_max_grade": junior_max_grade,

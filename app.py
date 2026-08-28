@@ -457,6 +457,14 @@ DEFAULT_DOCTOR_GRADE = 2
 GRADE_MIN_VALUE = 1
 GRADE_MAX_VALUE = 10
 
+# 병동 팀제. 0은 미사용/미지정이며 사람이 배정된 팀이 2개 이상일 때만
+# scheduler의 팀별 최소 배치 hard rule이 활성화됩니다.
+TEAM_MIN_VALUE = 0
+# UI에서 충분히 넉넉하게 1~10팀까지 지원.
+# 실제 계산은 '사람이 한 명 이상 배정된 팀'을 자동으로 활성 팀으로 인식합니다.
+TEAM_MAX_VALUE = 10
+TEAM_LABELS = {0: "미지정", **{i: f"{i}팀" for i in range(1, TEAM_MAX_VALUE + 1)}}
+
 def bounded_int(value, default: int, min_value: int, max_value: int) -> int:
     """Convert to int and keep Streamlit number_input values inside allowed bounds."""
     try:
@@ -536,6 +544,10 @@ def normalize_doctors():
             doc["grade"] = DEFAULT_DOCTOR_GRADE
         else:
             doc["grade"] = bounded_int(doc.get("grade", DEFAULT_DOCTOR_GRADE), DEFAULT_DOCTOR_GRADE, GRADE_MIN_VALUE, GRADE_MAX_VALUE)
+        if "team" not in doc or pd.isna(doc.get("team")):
+            doc["team"] = 0
+        else:
+            doc["team"] = bounded_int(doc.get("team", 0), 0, TEAM_MIN_VALUE, TEAM_MAX_VALUE)
         if "shift_adj" not in doc or pd.isna(doc.get("shift_adj")):
             doc["shift_adj"] = 0
         else:
@@ -1737,6 +1749,17 @@ def _hard_preflight_params(combined_req: dict | None = None) -> dict:
         "maximum_total": {str(k): v for k, v in st.session_state.get("maximum_total", {}).items()},
         "minimum_N": {str(k): v for k, v in st.session_state.get("minimum_N", {}).items()},
         "maximum_N": {str(k): v for k, v in st.session_state.get("maximum_N", {}).items()},
+        "grades": {
+            str(i): int(d.get("grade", DEFAULT_DOCTOR_GRADE))
+            for i, d in enumerate(st.session_state.get("doctors", []))
+        },
+        "teams": {
+            str(i): int(d.get("team", 0))
+            for i, d in enumerate(st.session_state.get("doctors", []))
+        },
+        "grade_rules": {
+            str(k): int(v) for k, v in st.session_state.get("grade_rules", {}).items()
+        },
     }
 
 
@@ -1905,6 +1928,274 @@ def _basic_preflight_conflicts(params: dict) -> pd.DataFrame:
     return pd.DataFrame(rows, columns=columns)
 
 
+
+def _roster_preflight_conflicts(params: dict) -> pd.DataFrame:
+    """Provable whole-roster hard conflicts with concrete names/dates.
+
+    Unlike the one-person exact CP-SAT check, this focuses on interactions between
+    people: date/Duty candidate shortages, Grade composition, optional multi-Team
+    coverage, and Team fixed/maximum-total capacity.
+
+    It intentionally uses only hard facts. Sequence rules are not used here to
+    exclude an otherwise-available nurse, so a row reported as "확정 충돌" does
+    not depend on a rough N-rest/consecutive-work approximation.
+    """
+    names = list(params.get("doctors", []))
+    n_docs = len(names)
+    n_days = max(0, int(params.get("num_days", 0)))
+    start = date.fromisoformat(str(params.get("start_date")))
+    day_types = {int(k): v for k, v in (params.get("day_types", {}) or {}).items()}
+    duty = {int(k): list(v) for k, v in (params.get("duty_requests", {}) or {}).items()}
+    requests = params.get("shift_requests", {}) or {}
+    rules = {int(k): (v or {}) for k, v in (params.get("rules", {}) or {}).items()}
+    shift_counts = {int(k): (v or {}) for k, v in (params.get("shift_counts", {}) or {}).items()}
+    maximum_total = {int(k): int(v) for k, v in (params.get("maximum_total", {}) or {}).items()}
+    grades = {int(k): int(v) for k, v in (params.get("grades", {}) or {}).items()}
+    teams = {int(k): int(v) for k, v in (params.get("teams", {}) or {}).items()}
+    gr = params.get("grade_rules", {}) or {}
+
+    senior_grade = int(gr.get("senior_min_grade", DEFAULT_GRADE_RULES["senior_min_grade"]))
+    senior_need = int(gr.get("senior_min_count", DEFAULT_GRADE_RULES["senior_min_count"]))
+    ultra_grade = int(gr.get("ultra_junior_max_grade", DEFAULT_GRADE_RULES["ultra_junior_max_grade"]))
+    ultra_max = int(gr.get("ultra_junior_max_count", DEFAULT_GRADE_RULES["ultra_junior_max_count"]))
+
+    active_team_ids = sorted({
+        int(teams.get(n, 0))
+        for n in range(n_docs)
+        if int(teams.get(n, 0)) > 0
+    })
+    team_members = {
+        team_id: [n for n in range(n_docs) if int(teams.get(n, 0)) == team_id]
+        for team_id in active_team_ids
+    }
+    team_count = len(active_team_ids)
+    team_mode = team_count >= 2
+
+    rows = []
+    seen = set()
+    shift_keys = ["D", "E", "N"]
+
+    def add(name, date_txt, rule, explanation, related="", suggestion=""):
+        key = (name, date_txt, rule, explanation)
+        if key in seen:
+            return
+        seen.add(key)
+        rows.append({
+            "상태": "확정 충돌",
+            "이름": name,
+            "날짜": date_txt,
+            "충돌 규칙": rule,
+            "설명": explanation,
+            "관련 일정": related,
+            "수정 제안": suggestion,
+        })
+
+    def req_text(n, d):
+        return str(requests.get(f"{n},{d}", "") or "").strip()
+
+    # Current hard-fixed counts let us detect when an exact personal count is
+    # already completely consumed by uppercase requests elsewhere in the month.
+    forced_shift_counts = {n: [0, 0, 0] for n in range(n_docs)}
+    forced_total_counts = {n: 0 for n in range(n_docs)}
+    for n in range(n_docs):
+        for dd in range(n_days):
+            t = req_text(n, dd)
+            flags = [("D" in t), ("E" in t), ("N" in t)]
+            for ss in range(3):
+                forced_shift_counts[n][ss] += int(flags[ss])
+                forced_total_counts[n] += int(flags[ss])
+
+    def same_day_can_add(n, d, target_s):
+        """Request + same-day/count hard facts only; no sequence approximation."""
+        text = req_text(n, d)
+        low = text.lower()
+        if "a" in low:
+            return False, "연차(a)"
+        if "x" in low or "den" in low:
+            return False, "전체 OFF/x"
+        target = shift_keys[target_s]
+        if target.lower() in low and target not in text:
+            return False, f"{target} 불가"
+
+        must = [("D" in text), ("E" in text), ("N" in text)]
+
+        # Exact/maximum count can make an otherwise-empty cell definitely unavailable.
+        sc = shift_counts.get(n, {})
+        try:
+            fixed_target = int(sc.get(target, -1))
+        except (TypeError, ValueError):
+            fixed_target = -1
+        try:
+            fixed_total = int(sc.get("Total", -1))
+        except (TypeError, ValueError):
+            fixed_total = -1
+        max_total = int(maximum_total.get(n, -1))
+
+        if fixed_target == 0:
+            return False, f"fixed_{target}=0"
+        if fixed_total == 0:
+            return False, "fixed_Total=0"
+        if max_total == 0:
+            return False, "maximum_total=0"
+
+        # If this cell is not already hard-fixed to target and the exact target/total
+        # count is fully consumed by uppercase requests elsewhere, target is impossible.
+        if not must[target_s]:
+            if fixed_target >= 0 and forced_shift_counts[n][target_s] >= fixed_target:
+                return False, f"fixed_{target}={fixed_target} 이미 소진"
+            if fixed_total >= 0 and forced_total_counts[n] >= fixed_total:
+                return False, f"fixed_Total={fixed_total} 이미 소진"
+            if max_total >= 0 and forced_total_counts[n] >= max_total:
+                return False, f"maximum_total={max_total} 이미 소진"
+
+        trial = must[:]
+        trial[target_s] = True
+        cnt = sum(trial)
+        r0 = int(rules.get(n, {}).get("rule_max_shifts_per_day", DEFAULT_RULES["rule_max_shifts_per_day"]))
+        is_holiday = day_types.get(d, "평일") in ("토", "일", "공")
+
+        if r0 == 1 and cnt > 1:
+            fixed = "".join(k for k, flag in zip(shift_keys, must) if flag)
+            return False, f"다른 duty 고정({fixed})"
+        if r0 in (2, 4):
+            if trial[0] and trial[2] and not trial[1]:
+                return False, "D+N 조합 불가"
+            if all(trial):
+                return False, "D/E/N 3개 동시 불가"
+            if r0 == 4 and not is_holiday and cnt > 1:
+                return False, "평일 1근무 제한"
+        if r0 in (3, 5):
+            if trial[0] and trial[2] and not trial[1]:
+                return False, "D+N은 E 동반 필요"
+            if r0 == 5 and not is_holiday and cnt > 1:
+                return False, "평일 1근무 제한"
+        return True, "가능"
+
+    for d in range(n_days):
+        date_obj = start + timedelta(days=d)
+        date_txt = f"{date_obj.strftime('%m/%d')}({get_day_label(start, d)})"
+        needs = list(duty.get(d, [0, 0, 0]))
+        if len(needs) < 3:
+            needs = (needs + [0, 0, 0])[:3]
+
+        for s, shift_key in enumerate(shift_keys):
+            required = int(needs[s])
+            if required <= 0:
+                continue
+
+            candidates = []
+            excluded = []
+            for n in range(n_docs):
+                ok, reason = same_day_can_add(n, d, s)
+                if ok:
+                    candidates.append(n)
+                else:
+                    excluded.append((n, reason))
+
+            if len(candidates) < required:
+                excluded_txt = ", ".join(
+                    f"{names[n]}({reason})" for n, reason in excluded[:12]
+                )
+                if len(excluded) > 12:
+                    excluded_txt += f" 외 {len(excluded)-12}명"
+                add(
+                    "전체", date_txt, f"{shift_key} 후보 부족",
+                    f"{shift_key} Minimal={required}명인데 hard 요청을 반영한 즉시 가능 후보는 {len(candidates)}명뿐입니다.",
+                    related=f"제외: {excluded_txt}",
+                    suggestion=(
+                        "표시된 간호사의 a/x/소문자 불가요청 또는 같은 날 대문자 고정근무를 확인하세요. "
+                        "필요하면 Minimal도 함께 확인하세요."
+                    ),
+                )
+
+            # Senior hard composition: enough senior candidates must exist.
+            if senior_need > 0:
+                senior_candidates = [n for n in candidates if int(grades.get(n, DEFAULT_DOCTOR_GRADE)) >= senior_grade]
+                if len(senior_candidates) < senior_need:
+                    add(
+                        "전체", date_txt, f"{shift_key} 고년차 후보 부족",
+                        f"각 Duty에 Grade≥{senior_grade} 간호사 {senior_need}명이 필요하지만 가능한 고년차 후보는 {len(senior_candidates)}명입니다.",
+                        related="가능 고년차: " + (", ".join(names[n] for n in senior_candidates) or "없음"),
+                        suggestion="해당 날짜의 고년차 OFF/연차/불가요청 또는 Grade/고년차 최소인원 규칙을 확인하세요.",
+                    )
+
+            # Ultra-junior hard cap can reduce maximum selectable staffing.
+            if ultra_max > 0:
+                non_ultra = [n for n in candidates if int(grades.get(n, DEFAULT_DOCTOR_GRADE)) > ultra_grade]
+                ultra = [n for n in candidates if int(grades.get(n, DEFAULT_DOCTOR_GRADE)) <= ultra_grade]
+                selectable = len(non_ultra) + min(len(ultra), ultra_max)
+                if selectable < required:
+                    add(
+                        "전체", date_txt, f"{shift_key} 초저년차 제한 병목",
+                        f"Minimal={required}명이지만 Grade≤{ultra_grade}는 최대 {ultra_max}명만 허용되어 현재 후보로는 최대 {selectable}명만 배치할 수 있습니다.",
+                        related=f"비초저년차 후보 {len(non_ultra)}명, 초저년차 후보 {len(ultra)}명",
+                        suggestion="해당 날짜 OFF 요청, 초저년차 기준/최대인원 또는 Minimal을 확인하세요.",
+                    )
+
+            # Optional multi-team hard coverage.
+            if team_mode:
+                team_need = required // team_count
+                if team_need > 0:
+                    for team_no in active_team_ids:
+                        members = team_members[team_no]
+                        tc = [n for n in candidates if n in members]
+                        if len(tc) < team_need:
+                            excluded_team = []
+                            for n in members:
+                                if n not in tc:
+                                    _ok, reason = same_day_can_add(n, d, s)
+                                    excluded_team.append(f"{names[n]}({reason})")
+                            add(
+                                f"{team_no}팀", date_txt, f"{shift_key} Team 최소인원 부족",
+                                f"{shift_key} Minimal={required}, 활성 Team={team_count}개이므로 "
+                                f"{team_no}팀에서 최소 floor({required}/{team_count})={team_need}명이 필요한데 "
+                                f"가능한 후보는 {len(tc)}명입니다.",
+                                related=(
+                                    f"{team_no}팀 전체 {len(members)}명; 가능한 후보: "
+                                    + (", ".join(names[n] for n in tc) or "없음")
+                                    + ("; 제외: " + ", ".join(excluded_team) if excluded_team else "")
+                                ),
+                                suggestion=f"{team_no}팀의 OFF/연차/불가요청 또는 Team 지정, 해당 Duty Minimal을 확인하세요.",
+                            )
+
+    # Monthly Team capacity vs required Team coverage.
+    if team_mode:
+        monthly_team_need = sum(
+            int((duty.get(d, [0,0,0]) + [0,0,0])[:3][s]) // team_count
+            for d in range(n_days) for s in range(3)
+            if int((duty.get(d, [0,0,0]) + [0,0,0])[:3][s]) > 0
+        )
+        for team_no in active_team_ids:
+            members = team_members[team_no]
+            upper = []
+            all_bounded = True
+            for n in members:
+                sc = shift_counts.get(n, {})
+                try:
+                    ft = int(sc.get("Total", -1))
+                except (TypeError, ValueError):
+                    ft = -1
+                mt = int(maximum_total.get(n, -1))
+                if ft >= 0:
+                    upper.append(ft)
+                elif mt >= 0:
+                    upper.append(mt)
+                else:
+                    all_bounded = False
+                    break
+            if all_bounded and sum(upper) < monthly_team_need:
+                add(
+                    f"{team_no}팀", "월 전체", "Team 전체 근무가능수 부족",
+                    f"{team_no}팀이 월간 반드시 담당해야 하는 최소 Team 몫은 {monthly_team_need}근무인데, "
+                    f"팀원 fixed_Total/maximum_total 상한 합은 {sum(upper)}근무입니다.",
+                    related=f"{team_no}팀 인원: " + ", ".join(names[n] for n in members),
+                    suggestion=f"{team_no}팀 fixed_Total/maximum_total 또는 Team 배정/Minimal을 조정하세요.",
+                )
+
+    columns = ["상태", "이름", "날짜", "충돌 규칙", "설명", "관련 일정", "수정 제안"]
+    return pd.DataFrame(rows, columns=columns)
+
+
 def get_preflight_hard_rule_check(force: bool = False) -> dict:
     """Always-available 0th hard-rule check, cached until saved hard inputs change."""
     normalize_doctors()
@@ -1934,8 +2225,9 @@ def get_preflight_hard_rule_check(force: bool = False) -> dict:
     started = time.perf_counter()
     exact_df, exact_error = _run_exact_hard_conflict_diagnostics(combined_req)
     basic_df = _basic_preflight_conflicts(params)
+    roster_df = _roster_preflight_conflicts(params)
 
-    frames = [df for df in (basic_df, exact_df) if isinstance(df, pd.DataFrame) and not df.empty]
+    frames = [df for df in (basic_df, exact_df, roster_df) if isinstance(df, pd.DataFrame) and not df.empty]
     if frames:
         conflicts = pd.concat(frames, ignore_index=True)
         # basic and exact checks intentionally overlap on some simple conflicts.
@@ -1986,16 +2278,19 @@ def render_quick_preflight_after_save():
     combined_req = refresh_combined_shift_requests()
     params = _hard_preflight_params(combined_req)
     basic_df = _basic_preflight_conflicts(params)
+    roster_df = _roster_preflight_conflicts(params)
+    quick_frames = [df for df in (basic_df, roster_df) if isinstance(df, pd.DataFrame) and not df.empty]
+    quick_df = pd.concat(quick_frames, ignore_index=True).drop_duplicates() if quick_frames else pd.DataFrame()
 
-    if isinstance(basic_df, pd.DataFrame) and not basic_df.empty:
+    if isinstance(quick_df, pd.DataFrame) and not quick_df.empty:
         st.error(
-            f"저장된 설정에서 바로 확인되는 필수 규칙 충돌이 **{len(basic_df)}건** 있습니다."
+            f"저장된 설정에서 바로 확인되는 필수 규칙 충돌이 **{len(quick_df)}건** 있습니다."
         )
         show_cols = [
             c for c in ["이름", "날짜", "충돌 규칙", "설명", "수정 제안"]
-            if c in basic_df.columns
+            if c in quick_df.columns
         ]
-        st.dataframe(basic_df[show_cols], use_container_width=True, hide_index=True)
+        st.dataframe(quick_df[show_cols], use_container_width=True, hide_index=True)
     else:
         st.toast(
             "✅ 저장 완료 · 기본 필수 규칙 확인 완료 "
@@ -2045,8 +2340,9 @@ def render_preflight_hard_rule_status():
             st.success("확정 필수 규칙 충돌이 발견되지 않았습니다. ✅")
             st.caption(
                 "개인별 고정 총근무수 달성 가능성, 최소/최대 N근무수, 최대 근무수, "
-                "직전 5일, N 휴식/간격, 필수 D/E/N, 근무불가/연차를 확인했습니다. "
-                "이 검사를 통과해도 전체 인력 조합에서 추가 병목이 생길 수 있습니다."
+                "직전 5일, N 휴식/간격, 필수 D/E/N, 근무불가/연차뿐 아니라 "
+                "날짜·Duty별 즉시 후보수, Grade 구성, 활성 Team별 최소인원과 팀별 전체 근무상한도 확인했습니다. "
+                "이 검사를 통과해도 여러 날짜의 sequence rule이 얽힌 조합 병목은 남을 수 있습니다."
             )
 
 
@@ -2460,6 +2756,14 @@ def run_hard_rule_diagnostics() -> dict:
     num_days = int(st.session_state.num_days)
     start_date = st.session_state.start_date
     grades = {ni: int(doc.get("grade", DEFAULT_DOCTOR_GRADE)) for ni, doc in enumerate(doctors)}
+    teams = {ni: int(doc.get("team", 0)) for ni, doc in enumerate(doctors)}
+    active_team_ids = sorted({teams.get(ni, 0) for ni in range(n_docs) if teams.get(ni, 0) > 0})
+    team_members = {
+        team_id: [ni for ni in range(n_docs) if teams.get(ni, 0) == team_id]
+        for team_id in active_team_ids
+    }
+    team_count = len(active_team_ids)
+    team_mode = team_count >= 2
     gr = st.session_state.grade_rules
 
     # 1차: 날짜/Duty별 후보 부족 진단
@@ -2487,6 +2791,17 @@ def run_hard_rule_diagnostics() -> dict:
                     excluded_reasons[reason or "기타"] = excluded_reasons.get(reason or "기타", 0) + 1
 
             hard_messages = _diagnostic_local_grade_messages(candidates, need, grades, gr)
+
+            if team_mode:
+                team_need = need // team_count
+                if team_need > 0:
+                    for team_no in active_team_ids:
+                        possible = sum(1 for n in candidates if teams.get(n, 0) == team_no)
+                        if possible < team_need:
+                            hard_messages.append(
+                                f"{team_no}팀 부족: Minimal={need}, 활성 Team={team_count}개 → "
+                                f"{team_no}팀 최소 {team_need}명 필요, 후보 {possible}명"
+                            )
             # DutyRequests are minimum staffing; hard-fixed count may exceed `need`.
 
             if hard_messages:
@@ -2754,6 +3069,7 @@ def build_schedule_excel_bytes(
             "No": int(ni) + 1,
             "Name": doc["name"],
             "Grade": int(doc.get("grade", DEFAULT_DOCTOR_GRADE)),
+            "Team": TEAM_LABELS.get(int(doc.get("team", 0)), "미지정"),
         }
         combined_req = refresh_combined_shift_requests()
         for di, col in enumerate(date_cols):
@@ -2790,6 +3106,7 @@ def build_schedule_excel_bytes(
         row = {
             "이름": doc["name"],
             "grade": int(doc.get("grade", DEFAULT_DOCTOR_GRADE)),
+            "team": int(doc.get("team", 0)),
             "shift_adj": st.session_state.shift_adj.get(ni, 0),
             "maximum_total": fixed_count_excel_value(st.session_state.maximum_total.get(ni, -1)),
             "minimum_N": fixed_count_excel_value(st.session_state.minimum_N.get(ni, -1)),
@@ -2943,16 +3260,29 @@ with st.sidebar:
 
     with st.form("add_doctor_form", clear_on_submit=True):
         new_name = st.text_input("이름 추가", placeholder="홍길동", key="new_doc_name")
+        ac1, ac2 = st.columns(2)
+        new_grade = ac1.number_input(
+            "Grade", min_value=GRADE_MIN_VALUE, max_value=GRADE_MAX_VALUE,
+            value=DEFAULT_DOCTOR_GRADE, step=1, key="new_doc_grade",
+            help="경력/숙련도. Grade 인력구성 규칙에 사용합니다."
+        )
+        new_team_label = ac2.selectbox(
+            "Team", options=[TEAM_LABELS[x] for x in range(TEAM_MIN_VALUE, TEAM_MAX_VALUE + 1)],
+            index=0, key="new_doc_team",
+            help="병동 팀제를 쓰지 않으면 미지정으로 두세요."
+        )
         submitted = st.form_submit_button("추가")
         if submitted:
             name = new_name.strip()
             if name and name not in [d["name"] for d in st.session_state.doctors]:
                 n = len(st.session_state.doctors)
+                team_value = next(k for k, v in TEAM_LABELS.items() if v == new_team_label)
                 st.session_state.doctors.append({
                     "name": name,
                     "shift_adj": 0,
                     "shift_adj_auto": False,
-                    "grade": DEFAULT_DOCTOR_GRADE,
+                    "grade": int(new_grade),
+                    "team": int(team_value),
                 })
                 st.session_state.rules[n] = DEFAULT_RULES.copy()
                 st.session_state.shift_adj[n] = 0
@@ -2965,23 +3295,41 @@ with st.sidebar:
     if st.session_state.doctors:
         for i, doc in enumerate(st.session_state.doctors):
             if st.session_state.get("editing_doctor") == i:
-                # Edit mode
-                col1, col2, col3 = st.columns([3, 1, 1])
-                new_name = col1.text_input("새 이름", value=doc['name'], key=f"edit_name_{i}")
-                if col2.button("확인", key=f"confirm_edit_{i}"):
+                # Edit mode — Excel 없이 이름/Grade/Team을 모두 수정 가능.
+                ec1, ec2, ec3 = st.columns([2.2, 1, 1.2])
+                new_name = ec1.text_input("이름", value=doc['name'], key=f"edit_name_{i}")
+                new_grade = ec2.number_input(
+                    "Grade", min_value=GRADE_MIN_VALUE, max_value=GRADE_MAX_VALUE,
+                    value=bounded_int(doc.get("grade", DEFAULT_DOCTOR_GRADE), DEFAULT_DOCTOR_GRADE, GRADE_MIN_VALUE, GRADE_MAX_VALUE),
+                    step=1, key=f"edit_grade_{i}"
+                )
+                current_team = bounded_int(doc.get("team", 0), 0, TEAM_MIN_VALUE, TEAM_MAX_VALUE)
+                team_options = list(range(TEAM_MIN_VALUE, TEAM_MAX_VALUE + 1))
+                new_team = ec3.selectbox(
+                    "Team", options=team_options, index=team_options.index(current_team),
+                    format_func=lambda x: TEAM_LABELS[x], key=f"edit_team_{i}"
+                )
+                bc1, bc2 = st.columns(2)
+                if bc1.button("확인", key=f"confirm_edit_{i}", use_container_width=True):
                     if new_name.strip() and new_name.strip() not in [d["name"] for j, d in enumerate(st.session_state.doctors) if j != i]:
                         st.session_state.doctors[i]["name"] = new_name.strip()
+                        st.session_state.doctors[i]["grade"] = int(new_grade)
+                        st.session_state.doctors[i]["team"] = int(new_team)
+                        st.session_state["grade_version"] = int(st.session_state.get("grade_version", 0)) + 1
                         st.session_state["editing_doctor"] = None
+                        request_quick_preflight_after_save()
                         st.rerun()
                     else:
                         st.error("이름이 비어있거나 중복됩니다.")
-                if col3.button("취소", key=f"cancel_edit_{i}"):
+                if bc2.button("취소", key=f"cancel_edit_{i}", use_container_width=True):
                     st.session_state["editing_doctor"] = None
                     st.rerun()
             else:
                 # Normal mode
                 col1, col2, col3 = st.columns([3, 1, 1])
-                col1.caption(f"{doc['name']}")
+                team_val = bounded_int(doc.get("team", 0), 0, TEAM_MIN_VALUE, TEAM_MAX_VALUE)
+                team_txt = TEAM_LABELS.get(team_val, "미지정")
+                col1.caption(f"{doc['name']} · G{int(doc.get('grade', DEFAULT_DOCTOR_GRADE))} · {team_txt}")
                 if col2.button("수정", key=f"edit_{i}"):
                     st.session_state["editing_doctor"] = i
                     st.rerun()
@@ -3154,6 +3502,7 @@ with st.sidebar:
                         if not name or name.lower() in {'nan', 'none'}:
                             continue
                         grade = safe_int(row_get_any(row, ['grade', 'Grade'], DEFAULT_DOCTOR_GRADE), DEFAULT_DOCTOR_GRADE, GRADE_MIN_VALUE, GRADE_MAX_VALUE)
+                        team = safe_int(row_get_any(row, ['team', 'Team', '팀'], 0), 0, TEAM_MIN_VALUE, TEAM_MAX_VALUE)
                         adj = safe_int(row_get_any(row, ['shift_adj', 'Shift_adj', '근무 조정값', 'adjustment'], 0), 0, -60, 60)
                         auto_raw = row_get_any(row, ['shift_adj_auto', '근무조정 자동', 'auto_shift_adj'], None)
                         if auto_raw is None or (isinstance(auto_raw, float) and pd.isna(auto_raw)):
@@ -3167,11 +3516,12 @@ with st.sidebar:
                             "shift_adj": adj,
                             "shift_adj_auto": adj_auto,
                             "grade": grade,
+                            "team": team,
                         })
                 else:
                     fallback_names = derive_doctor_names_from_old_config(df_rules, df_shift, df_fixed_shift, df_previous)
                     new_doctors = [
-                        {"name": name, "shift_adj": 0, "shift_adj_auto": False, "grade": DEFAULT_DOCTOR_GRADE}
+                        {"name": name, "shift_adj": 0, "shift_adj_auto": False, "grade": DEFAULT_DOCTOR_GRADE, "team": 0}
                         for name in fallback_names
                     ]
 
@@ -3844,7 +4194,14 @@ with tab3:
 
         st.divider()
         st.markdown('<div class="section-label">개인별 Grade & 근무 규칙 설정</div>', unsafe_allow_html=True)
-        st.caption("7명씩 나누어 표시합니다. 여기서는 Grade와 근무 패턴만 설정합니다. 총근무수와 N근무 범위는 위의 월 근무수 표에서 설정합니다.")
+        st.caption("7명씩 나누어 표시합니다. 여기서는 Grade·Team과 근무 패턴을 설정합니다. 총근무수와 N근무 범위는 위의 월 근무수 표에서 설정합니다.")
+        st.info(
+            "🏥 **병동 Team 규칙(선택)**: 사람이 배정된 Team이 2개 이상이면 자동 활성화됩니다. "
+            "활성 Team 수를 T라고 할 때 각 날짜·Duty에서 각 Team 최소인원은 floor(Minimal ÷ T)입니다. "
+            "예: 3팀제에서 Minimal 3→각 팀≥1, Minimal 4→각 팀≥1+추가 1명 자유, Minimal 6→각 팀≥2. "
+            "4팀제에서는 Minimal 4→각 팀≥1, Minimal 5→각 팀≥1+추가 1명 자유, Minimal 8→각 팀≥2. "
+            "Minimal<T이면 특정 Team을 임의로 강제하지 않습니다. Team을 모두 미지정하면 기존 방식 그대로입니다."
+        )
 
         doc_names = [d["name"] for d in doctors]
         DOC_CHUNK = 7
@@ -3890,6 +4247,24 @@ with tab3:
                     value=cur_grade, label_visibility="collapsed", key=f"doc_grade_{ni}_v{grade_ver}"
                 )
                 doctors[ni]["grade"] = int(new_grade)
+
+            # Team — 0=미지정. 사람이 배정된 팀이 2개 이상이면 동적 팀제 hard rule 활성화.
+            team_cols = st.columns([2] + [1] * chunk_size)
+            team_cols[0].markdown(
+                "<span class='rule-label-help' title='병동 팀제를 사용할 때 팀 번호를 지정합니다. 미지정이면 팀제 계산에 포함되지 않습니다.' style='font-size:0.75rem'>Team ⓘ</span>",
+                unsafe_allow_html=True
+            )
+            for ci, ni in enumerate(range(chunk_start, chunk_end)):
+                current_team = bounded_int(doctors[ni].get("team", 0), 0, TEAM_MIN_VALUE, TEAM_MAX_VALUE)
+                team_options = list(range(TEAM_MIN_VALUE, TEAM_MAX_VALUE + 1))
+                selected_team = team_cols[ci+1].selectbox(
+                    f"team_{ni}", options=team_options,
+                    index=team_options.index(current_team),
+                    format_func=lambda x: TEAM_LABELS[x],
+                    label_visibility="collapsed",
+                    key=f"doc_team_{ni}_v{st.session_state.get('grade_version', 0)}"
+                )
+                doctors[ni]["team"] = int(selected_team)
 
             # 월 총근무수 / 최소·최대 N / 고정 D/E/N은 위의 "월 근무수 설정" 표에서만 편집합니다.
             # 같은 값을 두 군데에서 수정하면 혼란스러우므로 개인 규칙 표에서는 중복 표시하지 않습니다.
@@ -4155,7 +4530,7 @@ if st.session_state.get("trigger_solve"):
                     scheduler_module = importlib.util.module_from_spec(spec)
                     spec.loader.exec_module(scheduler_module)
 
-                    expected_scheduler_api = '2026-08-21-v12.19-search-diagnostics'
+                    expected_scheduler_api = '2026-08-28-v12.21-dynamic-teams'
                     actual_scheduler_api = getattr(scheduler_module, "SCHEDULER_API_VERSION", None)
                     if actual_scheduler_api != expected_scheduler_api:
                         raise ImportError(
@@ -4197,6 +4572,7 @@ if st.session_state.get("trigger_solve"):
                         "minimum_N": {str(k): v for k, v in st.session_state.minimum_N.items()},
                         "maximum_N": {str(k): v for k, v in st.session_state.maximum_N.items()},
                         "grades": {str(i): int(d.get("grade", DEFAULT_DOCTOR_GRADE)) for i, d in enumerate(doctors)},
+                        "teams": {str(i): int(d.get("team", 0)) for i, d in enumerate(doctors)},
                         "grade_rules": {k: int(v) for k, v in st.session_state.grade_rules.items()},
                         "solver_mode": st.session_state.solver_mode,
                         "time_max": st.session_state.time_max,
@@ -4274,6 +4650,15 @@ if st.session_state.get("trigger_solve"):
                         st.toast("⚠️ 제한 시간 내 feasible 해를 찾지 못했습니다. 불가능 판정은 아닙니다.", icon="⚠️")
                     elif msg.upper().startswith("INFEASIBLE:"):
                         st.toast("❌ hard constraint상 해가 없다고 판정되었습니다.", icon="❌")
+                        # V12.20: 사용자가 다시 버튼을 누르지 않아도 원인 후보를 즉시 좁힙니다.
+                        try:
+                            sync_live_total_summary_inputs(num_days)
+                            st.session_state["diagnostic_results"] = run_hard_bottleneck_diagnostics()
+                        except Exception as diag_exc:
+                            st.session_state["diagnostic_results"] = {
+                                "diagnostic_error": str(diag_exc),
+                                "summary": {},
+                            }
                     else:
                         st.toast(f"❌ Solver 오류: {msg}", icon="❌")
                 except Exception as e:
@@ -4306,8 +4691,11 @@ with tab5:
                 st.error("스케줄 생성이 완료되지 않았습니다.")
             if failure_msg:
                 st.caption(failure_msg)
-            st.info("진단모드는 자동으로 실행하지 않습니다. 아래 버튼을 누르면 먼저 hard coding 간 확정 충돌을 찾고, 이어서 1차/2차 병목 후보를 계산합니다.")
-            if st.button("🧪 진단모드 실행", key="btn_run_diagnostics"):
+            if st.session_state.get("diagnostic_results") is not None:
+                st.info("🧪 INFEASIBLE 판정과 함께 원인 진단을 자동 실행했습니다. 아래 표에서 날짜·간호사·규칙별 병목을 확인하세요.")
+            else:
+                st.info("아래 진단을 실행하면 hard coding 간 확정 충돌과 날짜/Duty·구간별 병목 후보를 계산합니다.")
+            if st.button("🧪 진단 다시 실행", key="btn_run_diagnostics"):
                 sync_live_total_summary_inputs(num_days)
                 st.session_state["diagnostic_results"] = run_hard_bottleneck_diagnostics()
                 st.rerun()
@@ -4345,11 +4733,15 @@ with tab5:
         # 즉 근무 요청/날짜 설정 탭에서 보이는 간호사 순서와 결과표/Excel 순서가 동일하다.
         display_order = list(range(len(doctors)))
         name_to_grade = {doc["name"]: int(doc.get("grade", DEFAULT_DOCTOR_GRADE)) for doc in doctors}
+        name_to_team = {doc["name"]: TEAM_LABELS.get(int(doc.get("team", 0)), "미지정") for doc in doctors}
         name_to_display_order = {doctors[ni]["name"]: order for order, ni in enumerate(display_order)}
 
         summary_display = summary.copy()
         if "Grade" not in summary_display.columns:
             summary_display.insert(1, "Grade", summary_display["Name"].map(name_to_grade).fillna(DEFAULT_DOCTOR_GRADE).astype(int))
+        if "Team" not in summary_display.columns:
+            team_insert_at = list(summary_display.columns).index("Grade") + 1 if "Grade" in summary_display.columns else 2
+            summary_display.insert(team_insert_at, "Team", summary_display["Name"].map(name_to_team).fillna("미지정"))
         # Summary도 Name 정렬이 아니라 근무 요청/날짜 설정 탭의 입력 순서 그대로 표시한다.
         # 맨 왼쪽 No는 사용자가 입력/Excel에서 보는 간호사 순서(1-based index)이다.
         summary_display["_display_order"] = summary_display["Name"].map(name_to_display_order).fillna(9999).astype(int)
