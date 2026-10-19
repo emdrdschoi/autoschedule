@@ -62,7 +62,7 @@ def _parse_actual_shift(cell: str):
 
 
 def _build_personal_hard_model(params: dict[str, Any], n: int, *, total_target: int | None = None,
-                               objective: str | None = None):
+                               objective: str | None = None, window: tuple[int, int] | None = None):
     """Build a one-person CP-SAT model that mirrors the scheduler's personal hard rules.
 
     This is used only by diagnostic mode.  It deliberately excludes group-level staffing/
@@ -281,7 +281,10 @@ def _build_personal_hard_model(params: dict[str, Any], n: int, *, total_target: 
     if total_target is not None:
         model.Add(num_total == int(total_target))
 
-    if objective == "max":
+    if window is not None:
+        begin, end = window
+        model.Maximize(sum(shifts[(d, s)] for d in range(begin, end) for s in all_shifts))
+    elif objective == "max":
         model.Maximize(num_total)
     elif objective == "min":
         model.Minimize(num_total)
@@ -868,6 +871,86 @@ def diagnose_hard_conflicts(params: dict[str, Any]) -> pd.DataFrame:
         return pd.DataFrame(columns=columns)
     out = pd.DataFrame(rows, columns=columns)
     return out.sort_values(["이름", "날짜", "충돌 규칙"], kind="stable").reset_index(drop=True)
+
+
+def diagnose_window_capacity(params: dict[str, Any], *, time_limit: float = 30.0) -> dict:
+    """Find a proven interval shortage using exact personal monthly schedules.
+
+    Sum of independent personal maxima is an upper bound on roster capacity,
+    not a jointly achievable staffing level. Only OPTIMAL solves are used;
+    a timeout or lack of a shortage never implies roster feasibility.
+    Stop at the first proof to keep failure diagnostics responsive.
+    """
+    result = {"windows": [], "people": [], "checked": 0, "incomplete": False,
+              "personal_infeasible": [], "error": ""}
+    if not ORTOOLS_AVAILABLE:
+        result["error"] = "정확 구간 진단에 필요한 ortools가 없습니다."
+        return result
+    deadline = time.monotonic() + max(0.0, time_limit)
+    days = int(params.get("num_days", 0))
+    start = date.fromisoformat(str(params["start_date"]))
+    counts = {int(k): v for k, v in params.get("shift_counts", {}).items()}
+    duty = {int(k): v for k, v in params.get("duty_requests", {}).items()}
+    requests = params.get("shift_requests", {})
+    lengths = sorted({v for v in (1, 2, 3, 5, 7, days) if 0 < v <= days})
+    for begin in range(days):
+        for length in lengths:
+            end = begin + length
+            if end > days:
+                continue
+            need = sum(sum(duty.get(d, [0, 0, 0])) for d in range(begin, end))
+            if need <= 0:
+                continue
+            label = f"{start + timedelta(days=begin):%m/%d}~{start + timedelta(days=end-1):%m/%d}"
+            people = []
+            for n, name in enumerate(params.get("doctors", [])):
+                if time.monotonic() >= deadline:
+                    result["incomplete"] = True
+                    return result
+                target = int(counts.get(n, {}).get("Total", -1))
+                model, _, _, _ = _build_personal_hard_model(
+                    params, n, total_target=target if target >= 0 else None,
+                    window=(begin, end),
+                )
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    result["incomplete"] = True
+                    return result
+                solver = cp_model.CpSolver()
+                solver.parameters.max_time_in_seconds = min(1.0, remaining)
+                solver.parameters.num_search_workers = 1
+                status = solver.Solve(model)
+                if status == cp_model.INFEASIBLE:
+                    result["personal_infeasible"].append(name)
+                    return result
+                if status != cp_model.OPTIMAL:
+                    result["incomplete"] = True
+                    break
+                # Include requests just outside the interval: sliding-week limits
+                # may be constrained by a later fixed D/E/N as well as history.
+                nearby = []
+                for d in range(max(0, begin - 6), min(days, end + 6)):
+                    cell = str(requests.get(f"{n},{d}", "") or "").strip()
+                    if cell:
+                        nearby.append(f"{start + timedelta(days=d):%m/%d} {cell}")
+                people.append({
+                    "구간": label, "이름": name,
+                    "개인 최대 근무수": int(round(solver.ObjectiveValue())),
+                    "고정 총근무수": target if target >= 0 else "자동",
+                    "구간 주변 요청": ", ".join(nearby) or "없음",
+                    "적용 조건·직전 근무": _personal_diagnostic_limit_summary(params, n),
+                })
+            else:
+                result["checked"] += 1
+                capacity = sum(row["개인 최대 근무수"] for row in people)
+                if capacity < need:
+                    result["windows"].append({
+                        "구간": label, "필요 근무수": need,
+                        "개인 최대 합계(상한)": capacity, "최소 부족": need - capacity,
+                    })
+                    result["people"] = people
+                    return result
+    return result
 
 
 def evaluate_additional_availability(params: dict[str, Any], sol: dict[tuple[int, int], str]):

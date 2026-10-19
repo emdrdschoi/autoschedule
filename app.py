@@ -2361,6 +2361,16 @@ def run_hard_bottleneck_diagnostics() -> dict:
     sync_live_total_summary_inputs(st.session_state.num_days)
     combined_req = refresh_combined_shift_requests()
     exact_conflicts_df, exact_conflicts_error = _run_exact_hard_conflict_diagnostics(combined_req)
+    try:
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            "autoscheduler_window_diagnostics", Path(__file__).resolve().with_name("scheduler.py")
+        )
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        exact_capacity = module.diagnose_window_capacity(_hard_preflight_params(combined_req))
+    except Exception as exc:
+        exact_capacity = {"error": f"정확 구간 진단 중 오류: {exc}"}
 
     doctors_local = st.session_state.get("doctors", [])
     n_docs = len(doctors_local)
@@ -2563,6 +2573,7 @@ def run_hard_bottleneck_diagnostics() -> dict:
     fixed_df = pd.DataFrame(fixed_rows)
     window_df = pd.DataFrame(window_rows)
     return {
+        "exact_capacity": exact_capacity,
         "exact_conflicts_df": exact_conflicts_df,
         "exact_conflicts_error": exact_conflicts_error,
         "duty_df": duty_df,
@@ -2584,6 +2595,42 @@ def render_hard_bottleneck_diagnostics(results: dict):
     st.markdown('<div class="section-label">🧪 진단모드 결과</div>', unsafe_allow_html=True)
     st.caption(results.get("note", ""))
     st.caption(f"생성 시각: {results.get('generated_at', '')}")
+
+    capacity = results.get("exact_capacity", {})
+    if capacity:
+        st.markdown("**정확 구간 진단 · 필요한 근무를 모두 채울 수 있나요?**")
+        st.caption(
+            "직전 근무표, N 후 휴무·간격, 연속 7일 상한, 월 고정근무수와 구간 밖 고정 요청까지 반영해 "
+            "각 사람의 구간 내 최대 근무수를 계산합니다. 첫 확정 부족 구간을 찾으면 분석을 마칩니다."
+        )
+        if capacity.get("error"):
+            st.warning(capacity["error"])
+        elif capacity.get("personal_infeasible"):
+            st.warning("개인 조건 자체가 불가능합니다: " + ", ".join(capacity["personal_infeasible"]) + ". 아래 개인 충돌 진단을 확인하세요.")
+        elif capacity.get("windows"):
+            row = capacity["windows"][0]
+            st.error(
+                f"{row['구간']}: {row['필요 근무수']}근무가 필요하지만 개인별 최대를 모두 더해도 "
+                f"{row['개인 최대 합계(상한)']}근무뿐입니다. 최소 {row['최소 부족']}근무가 부족하므로 "
+                "현재 설정으로는 해가 없습니다. 탐색시간을 늘려도 해결되지 않습니다."
+            )
+            st.dataframe(pd.DataFrame(capacity["windows"]), use_container_width=True, hide_index=True)
+            st.dataframe(pd.DataFrame(capacity["people"]), use_container_width=True, hide_index=True)
+            st.caption(
+                "개인 최대는 각자 따로 계산한 정확한 값이며, 합계는 전체 배치 가능량의 상한입니다. "
+                "표의 조건은 계산에 적용된 입력으로, 각각이 단독 원인이라는 뜻은 아닙니다."
+            )
+            st.info(
+                "수정 검토: 해당 구간과 주변의 x/OFF 요청, 고정 D/E/N, 직전 근무표와 7일 상한을 확인하세요. "
+                "실제 조정 가능한 조건을 바꾼 뒤 다시 생성해야 전체 월간 해가 가능한지 확인할 수 있습니다."
+            )
+        else:
+            st.info(
+                f"{capacity.get('checked', 0)}개 구간을 정확 계산했지만 확정 부족을 찾지 못했습니다. "
+                "이는 전체 근무표가 가능하다는 뜻은 아닙니다."
+            )
+        if capacity.get("incomplete"):
+            st.caption("진단 시간제한으로 일부 구간은 검사하지 못했습니다. 미완료 계산을 해 없음의 근거로 사용하지 않습니다.")
 
     exact_df = results.get("exact_conflicts_df", pd.DataFrame())
     exact_error = results.get("exact_conflicts_error", "")
