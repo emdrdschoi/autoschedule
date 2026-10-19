@@ -62,7 +62,8 @@ def _parse_actual_shift(cell: str):
 
 
 def _build_personal_hard_model(params: dict[str, Any], n: int, *, total_target: int | None = None,
-                               objective: str | None = None, window: tuple[int, int] | None = None):
+                               objective: str | None = None, window: tuple[int, int] | None = None,
+                               shared_model=None):
     """Build a one-person CP-SAT model that mirrors the scheduler's personal hard rules.
 
     This is used only by diagnostic mode.  It deliberately excludes group-level staffing/
@@ -104,7 +105,7 @@ def _build_personal_hard_model(params: dict[str, Any], n: int, *, total_target: 
         except (TypeError, ValueError):
             return int(default)
 
-    model = cp_model.CpModel()
+    model = shared_model if shared_model is not None else cp_model.CpModel()
     all_days = range(num_days)
     all_shifts = range(3)
     shifts = {(d, s): model.NewBoolVar(f"diag_s_{n}_{d}_{s}") for d in all_days for s in all_shifts}
@@ -950,6 +951,204 @@ def diagnose_window_capacity(params: dict[str, Any], *, time_limit: float = 30.0
                     })
                     result["people"] = people
                     return result
+    return result
+
+
+def diagnose_linked_conflicts(params: dict[str, Any], *, time_limit: float = 30.0) -> dict:
+    """Prove a staffing-chain bottleneck, retaining full-month personal rules.
+
+    Find the earliest infeasible staffing prefix, then maximize covered demand
+    on its last day. This is a relaxation of the full roster (grade/team rules
+    are excluded), so only INFEASIBLE/OPTIMAL results establish a conflict.
+    A witness is explicitly distinguished from assignments forced in all
+    schedules satisfying the preceding staffing prefix.
+    """
+    result = {"status": "UNKNOWN", "incomplete": False, "facts": [], "explanations": [],
+              "schedule": [], "conditions": [], "error": ""}
+    if not ORTOOLS_AVAILABLE:
+        result["error"] = "연쇄 충돌 진단에 필요한 ortools가 없습니다."
+        return result
+    deadline = time.monotonic() + max(0.0, time_limit)
+    names = list(params.get("doctors", []))
+    days = int(params.get("num_days", 0))
+    start = date.fromisoformat(str(params["start_date"]))
+    counts = {int(k): v for k, v in params.get("shift_counts", {}).items()}
+    duty = {int(k): v for k, v in params.get("duty_requests", {}).items()}
+    base = cp_model.CpModel()
+    for n in range(len(names)):
+        if time.monotonic() >= deadline:
+            result["incomplete"] = True
+            return result
+        target = int(counts.get(n, {}).get("Total", -1))
+        _build_personal_hard_model(params, n, total_target=target if target >= 0 else None,
+                                   shared_model=base)
+    indices = {v.name: i for i, v in enumerate(base.Proto().variables)}
+
+    def shift(model, n, d, s):
+        return model.GetBoolVarFromProtoIndex(indices[f"diag_s_{n}_{d}_{s}"])
+
+    def prefix_model(end):
+        model = base.Clone()
+        for d in range(end):
+            for s in range(3):
+                need = int(duty.get(d, [0, 0, 0])[s])
+                if need > 0:
+                    model.Add(sum(shift(model, n, d, s) for n in range(len(names))) >= need)
+        return model
+
+    def solve(model, limit=5.0):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return None, cp_model.UNKNOWN
+        solver = cp_model.CpSolver()
+        solver.parameters.max_time_in_seconds = min(limit, remaining)
+        solver.parameters.num_search_workers = 1
+        return solver, solver.Solve(model)
+
+    # Verify the full personal/staffing combination first; this diagnostic does
+    # not claim to explain grade/team-only failures or an inconclusive solve.
+    _, status = solve(prefix_model(days))
+    if status in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+        result["status"] = "NO_CONFLICT_FOUND"
+        return result
+    if status != cp_model.INFEASIBLE:
+        result["incomplete"] = True
+        return result
+    _, status = solve(base)
+    if status == cp_model.INFEASIBLE:
+        result["status"] = "PERSONAL_INFEASIBLE"
+        return result
+    if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+        result["incomplete"] = True
+        return result
+    low, high = 0, days
+    while high - low > 1:
+        mid = (low + high) // 2
+        _, status = solve(prefix_model(mid))
+        if status == cp_model.INFEASIBLE:
+            high = mid
+        elif status in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+            low = mid
+        else:
+            result["incomplete"] = True
+            return result
+
+    day = high - 1
+    prefix = prefix_model(day)
+    model = prefix.Clone()
+    covered = []
+    for s in range(3):
+        need = int(duty.get(day, [0, 0, 0])[s])
+        v = model.NewIntVar(0, max(0, need), f"linked_covered_{s}")
+        model.AddMinEquality(v, [sum(shift(model, n, day, s) for n in range(len(names))), max(0, need)])
+        covered.append(v)
+    model.Maximize(sum(covered))
+    solver, status = solve(model)
+    if status != cp_model.OPTIMAL:
+        result["incomplete"] = True
+        return result
+    capacity = int(round(solver.ObjectiveValue()))
+    need = sum(duty.get(day, [0, 0, 0]))
+    if capacity >= need:
+        result["error"] = "연쇄 충돌 진단 결과가 일관되지 않습니다."
+        return result
+    result.update(status="PROVEN_SHORTAGE", day=day,
+                  date=f"{start + timedelta(days=day):%m/%d}",
+                  preceding=f"{start:%m/%d}~{start + timedelta(days=day-1):%m/%d}" if day else "없음",
+                  required=need, capacity=capacity, shortage=need-capacity)
+
+    # Show a short example of the chain, not a falsely universal assignment.
+    begin = max(0, day - 6)
+    requests = params.get("shift_requests", {})
+    for n, name in enumerate(names):
+        row = {"이름": name}
+        for d in range(begin, day + 1):
+            row[f"{start + timedelta(days=d):%m/%d}"] = "".join(
+                "DEN"[s] for s in range(3) if solver.Value(shift(model, n, d, s))
+            ) or "OFF"
+        result["schedule"].append(row)
+        nearby = [f"{start + timedelta(days=d):%m/%d} {requests[f'{n},{d}']}"
+                  for d in range(max(0, begin - 6), min(days, day + 7))
+                  if requests.get(f"{n},{d}")]
+        result["conditions"].append({
+            "이름": name, "관련 요청": ", ".join(nearby) or "없음",
+            "적용 조건·직전 근무": _personal_diagnostic_limit_summary(params, n),
+        })
+
+    # Prove forced WORK/OFF by testing the opposite, without imposing the
+    # last-day objective. Thus these facts hold across *all* preceding-prefix
+    # schedules, not just the displayed best partial assignment.
+    for d in range(begin, day + 1):
+        for n, name in enumerate(names):
+            if time.monotonic() >= deadline:
+                result["incomplete"] = True
+                break
+            witness_work = any(solver.Value(shift(model, n, d, s)) for s in range(3))
+            trial = prefix.Clone()
+            total = sum(shift(trial, n, d, s) for s in range(3))
+            trial.Add(total == 0) if witness_work else trial.Add(total >= 1)
+            _, probe_status = solve(trial, limit=0.3)
+            if probe_status == cp_model.INFEASIBLE:
+                result["facts"].append({
+                    "날짜": f"{start + timedelta(days=d):%m/%d}", "이름": name,
+                    "피할 수 없는 배치": "반드시 근무 (종류는 미정)" if witness_work else "반드시 OFF",
+                })
+            elif probe_status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+                result["incomplete"] = True
+
+    # Explain saturated sliding weeks using only historical work, uppercase
+    # requests, and universally proven WORK facts (never arbitrary witness work).
+    rules = {int(k): v for k, v in params.get("rules", {}).items()}
+    history = params.get("previous_schedule", {})
+    history_days = int(params.get("previous_schedule_days", 5))
+    facts = {(row["이름"], row["날짜"]): row["피할 수 없는 배치"] for row in result["facts"]}
+    for n, name in enumerate(names):
+        weekly = int(rules.get(n, {}).get("rule_max_shifts_per_week", 5))
+        for d in range(begin, day + 1):
+            label = f"{start + timedelta(days=d):%m/%d}"
+            if weekly <= 0 or facts.get((name, label)) != "반드시 OFF":
+                continue
+            for first in range(max(-history_days, d - 6), min(d, days - 7) + 1):
+                known = []
+                count = 0
+                for t in range(first, first + 7):
+                    if t == d:
+                        continue
+                    stamp = f"{start + timedelta(days=t):%m/%d}"
+                    if t < 0:
+                        flags = _parse_actual_shift(history.get(f"{n},{t + history_days}", ""))
+                    else:
+                        flags = _parse_shift_wish(str(requests.get(f"{n},{t}", "") or ""))
+                    number = sum(flags)
+                    text = "".join(s for s, on in zip("DEN", flags) if on)
+                    if not number and facts.get((name, stamp), "").startswith("반드시 근무"):
+                        number, text = 1, "근무 필수"
+                    if number:
+                        count += number
+                        known.append(f"{stamp} {text}")
+                if count >= weekly:
+                    result["explanations"].append({
+                        "구분": "확정 근거", "이름": name, "날짜": label,
+                        "설명": f"{start + timedelta(days=first):%m/%d}~{start + timedelta(days=first+6):%m/%d} "
+                                f"7일 구간에 이미 최소 {count}근무가 필요하고 상한은 {weekly}입니다. "
+                                f"따라서 {label}에는 추가 근무가 불가능합니다. 근거: " + ", ".join(known),
+                    })
+                    break
+
+        # Explain N-rest in the displayed witness; this does not assert that
+        # this particular person must be the one receiving those nights.
+        n_max = int(rules.get(n, {}).get("rule_n_block_max", 2))
+        rest = int(rules.get(n, {}).get("rule_n_rest", 2))
+        if rest > 0 and n_max > 0 and day >= n_max and all(
+            solver.Value(shift(model, n, d, 2)) for d in range(day-n_max, day)
+        ):
+            result["explanations"].append({
+                "구분": "예시 배치의 연결", "이름": name, "날짜": result["date"],
+                "설명": f"아래 예시에서는 {start + timedelta(days=day-n_max):%m/%d}부터 "
+                        f"N {n_max}연속입니다. N 최대 {n_max}연속 및 종료 후 {rest}일 휴무 때문에 "
+                        f"{result['date']}는 OFF입니다. 이 사람이 반드시 N 담당이라는 뜻은 아니며, "
+                        "담당자를 바꿔도 위 최대 충족 수를 넘을 수 없다는 것은 별도로 증명했습니다.",
+            })
     return result
 
 

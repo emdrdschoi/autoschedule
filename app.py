@@ -2361,6 +2361,7 @@ def run_hard_bottleneck_diagnostics() -> dict:
     sync_live_total_summary_inputs(st.session_state.num_days)
     combined_req = refresh_combined_shift_requests()
     exact_conflicts_df, exact_conflicts_error = _run_exact_hard_conflict_diagnostics(combined_req)
+    linked_conflicts = {}
     try:
         import importlib.util
         spec = importlib.util.spec_from_file_location(
@@ -2369,6 +2370,8 @@ def run_hard_bottleneck_diagnostics() -> dict:
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
         exact_capacity = module.diagnose_window_capacity(_hard_preflight_params(combined_req))
+        if not exact_capacity.get("windows") and exact_conflicts_df.empty:
+            linked_conflicts = module.diagnose_linked_conflicts(_hard_preflight_params(combined_req))
     except Exception as exc:
         exact_capacity = {"error": f"정확 구간 진단 중 오류: {exc}"}
 
@@ -2573,6 +2576,7 @@ def run_hard_bottleneck_diagnostics() -> dict:
     fixed_df = pd.DataFrame(fixed_rows)
     window_df = pd.DataFrame(window_rows)
     return {
+        "linked_conflicts": linked_conflicts,
         "exact_capacity": exact_capacity,
         "exact_conflicts_df": exact_conflicts_df,
         "exact_conflicts_error": exact_conflicts_error,
@@ -2631,6 +2635,46 @@ def render_hard_bottleneck_diagnostics(results: dict):
             )
         if capacity.get("incomplete"):
             st.caption("진단 시간제한으로 일부 구간은 검사하지 못했습니다. 미완료 계산을 해 없음의 근거로 사용하지 않습니다.")
+
+    linked = results.get("linked_conflicts", {})
+    if linked:
+        st.markdown("**연쇄 충돌 진단 · 앞 날짜를 채우면 뒤 날짜가 막히나요?**")
+        st.caption(
+            "사람별 가능량을 더하는 대신 모든 사람의 D/E/N 배치를 함께 계산합니다. "
+            "월 전체 개인 규칙과 요청을 유지한 채, 앞 날짜의 최소 인원을 채운 뒤 처음 막히는 날짜를 찾습니다."
+        )
+        if linked.get("error"):
+            st.warning(linked["error"])
+        elif linked.get("status") == "PROVEN_SHORTAGE":
+            preceding = linked["preceding"]
+            lead = f"{preceding}의 최소 인원을 모두 채우면, " if preceding != "없음" else "현재 개인 조건에서는 "
+            st.error(
+                f"{lead}{linked['date']}의 D/E/N 필요 {linked['required']}근무 중 최대 "
+                f"{linked['capacity']}근무만 충족할 수 있습니다. 최소 {linked['shortage']}근무가 부족합니다."
+            )
+            st.caption("최대 충족 수는 Duty별 최소 인원까지 센 값입니다. 다른 Duty에 초과 배치해도 부족한 Duty를 대신할 수 없습니다.")
+            if linked.get("explanations"):
+                st.markdown("**충돌이 이어지는 근거**")
+                st.dataframe(pd.DataFrame(linked["explanations"]), use_container_width=True, hide_index=True)
+            if linked.get("facts"):
+                st.markdown("**앞 날짜의 인원을 채울 때 피할 수 없는 근무 / OFF**")
+                st.caption("반대 배치가 불가능하다고 별도 증명된 항목입니다. 아래 예시 한 개에서만 나온 결론이 아닙니다.")
+                st.dataframe(pd.DataFrame(linked["facts"]), use_container_width=True, hide_index=True)
+            with st.expander("최대로 채워도 부족한 배치 예시와 적용 조건"):
+                st.caption(
+                    "이 표는 충돌을 설명하는 부분 배치 예시이며 완성된 근무표가 아닙니다. "
+                    "N 담당자나 부족한 Duty는 다른 배치에서 달라질 수 있지만, 증명된 최대 충족 수를 넘을 수는 없습니다."
+                )
+                st.dataframe(pd.DataFrame(linked["schedule"]), use_container_width=True, hide_index=True)
+                st.dataframe(pd.DataFrame(linked["conditions"]), use_container_width=True, hide_index=True)
+        elif linked.get("status") == "PERSONAL_INFEASIBLE":
+            st.info("인원 배치 이전에 개인 규칙 자체의 충돌이 있습니다. 개인별 진단을 먼저 확인하세요.")
+        elif linked.get("status") == "NO_CONFLICT_FOUND":
+            st.info("개인 규칙과 날짜별 최소 인원 조합에서는 충돌을 찾지 못했습니다. Grade·Team 등 다른 집단 규칙은 별도 진단을 확인하세요.")
+        else:
+            st.info("제한 시간 안에 연쇄 충돌의 원인을 확정하지 못했습니다.")
+        if linked.get("incomplete"):
+            st.caption("일부 분석이 시간 내 완료되지 않았습니다. 증명된 결과만 표시하며 미완료 계산으로 충돌을 단정하지 않습니다.")
 
     exact_df = results.get("exact_conflicts_df", pd.DataFrame())
     exact_error = results.get("exact_conflicts_error", "")
